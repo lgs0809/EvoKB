@@ -1,0 +1,54 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.yml
+*.local.yaml
+*.local.properties
+
+# Java / Maven
+**/target/
+# Deployment runbooks are source files, not Maven output.
+!deploy/target/
+!deploy/target/*.md
+!deploy/target/*.sql
+*.jar
+*.class
+
+# Node / Vite
+**/node_modules/
+web/dist/
+*.tsbuildinfo
+
+# Test / tooling output
+coverage/
+reports/
+web/test-results/
+web/playwright-report/
+web/blob-report/
+*.log
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Runtime data
+*.db
+*.sqlite
+*.sqlite3
+.tmp/
+tmp/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local assistant/tool metadata
+.ai-bridge/
+.claude/
+.opencode/
+.mcp.json
+AGENTS.md
+CLAUDE.md

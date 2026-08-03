@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>cn.lgs.knowledgebase</groupId><artifactId>evokb</artifactId><version>0.1.0-SNAPSHOT</version></parent>
+  <artifactId>ekb-infrastructure</artifactId>
+  <dependencies>
+    <dependency><groupId>cn.lgs.knowledgebase</groupId><artifactId>ekb-application</artifactId><version>${project.version}</version></dependency>
+    <dependency><groupId>ai.djl.huggingface</groupId><artifactId>tokenizers</artifactId><version>0.32.0</version></dependency>
+    <dependency><groupId>org.apache.commons</groupId><artifactId>commons-csv</artifactId><version>1.14.1</version></dependency>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-jdbc</artifactId></dependency>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-redis</artifactId></dependency>
+    <dependency><groupId>org.redisson</groupId><artifactId>redisson</artifactId><version>3.27.2</version></dependency>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+    <dependency><groupId>org.springframework.retry</groupId><artifactId>spring-retry</artifactId><version>2.0.12</version></dependency>
+    <dependency><groupId>org.springframework.security</groupId><artifactId>spring-security-crypto</artifactId></dependency>
+    <dependency><groupId>org.springframework.ai</groupId><artifactId>spring-ai-model</artifactId></dependency>
+    <dependency><groupId>com.alibaba.cloud.ai</groupId><artifactId>spring-ai-alibaba-agent-framework</artifactId></dependency>
+    <dependency><groupId>io.minio</groupId><artifactId>minio</artifactId><version>8.5.17</version></dependency>
+    <dependency><groupId>io.milvus</groupId><artifactId>milvus-sdk-java</artifactId><version>2.6.22</version></dependency>
+    <dependency>
+      <groupId>org.opensearch.client</groupId><artifactId>opensearch-java</artifactId><version>3.2.0</version>
+      <exclusions><exclusion><groupId>commons-logging</groupId><artifactId>commons-logging</artifactId></exclusion></exclusions>
+    </dependency>
+    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><scope>test</scope></dependency>
+  </dependencies>
+</project>
