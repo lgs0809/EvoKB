@@ -79,8 +79,12 @@ class DomainParityTest {
 
     @Test
     void graphRelationCannotBePublishedWithoutEvidence() {
-        assertFalse(new CompilationDomain.Relation("rel", "a", "owns", "b", List.of(), 0.9, Map.of()).publishable());
-        assertTrue(new CompilationDomain.Relation("rel", "a", "owns", "b", List.of("ev1"), 0.9, Map.of()).publishable());
+        assertFalse(new CompilationDomain.Relation("rel", "a", "OWNS_IP", "b", null, null,
+                CompilationDomain.ConflictStatus.NONE, CompilationDomain.RelationLifecycle.ACTIVE,
+                List.of(), 0.9, Map.of()).publishable());
+        assertTrue(new CompilationDomain.Relation("rel", "a", "OWNS_IP", "b", null, null,
+                CompilationDomain.ConflictStatus.NONE, CompilationDomain.RelationLifecycle.ACTIVE,
+                List.of("ev1"), 0.9, Map.of()).publishable());
     }
 
     private static KnowledgeDomain.DocumentVersion version(String id, long no, KnowledgeDomain.VersionLifecycle lifecycle) {

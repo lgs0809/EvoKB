@@ -118,8 +118,9 @@ public final class Ports {
         List<Candidate> searchVector(List<Float> vector, SearchFilters filters, int limit);
     }
 
-    public record RawIndexDocument(String id, String content, List<String> headingPath,
-                                   Integer pageStart, Integer pageEnd, List<Float> embedding,
+    public record RawIndexDocument(String id, String content, String normalized, List<String> headingPath,
+                                   List<String> sourceBlockIds, Integer pageStart, Integer pageEnd,
+                                   String contentHash, List<Float> embedding,
                                    List<String> evidenceIds, Metadata metadata) {}
 
     public interface RetrievalLane {
@@ -147,11 +148,28 @@ public final class Ports {
     }
 
     public interface DerivedSearchIndex {
-        void indexSummary(SummaryArtifact summary, List<Float> embedding);
-        void indexWiki(WikiPage page, List<Float> embedding);
-        List<Candidate> searchSummary(String query, SearchFilters filters, int limit);
-        List<Candidate> searchWiki(String query, SearchFilters filters, int limit);
+        void ensureIndex(int embeddingDimensions);
+        void indexSummary(SummaryArtifact summary, DerivedContext context, List<Float> embedding);
+        void indexWiki(WikiPage page, DerivedContext context, List<Float> embedding);
+        List<Candidate> searchSummaryBm25(String query, SearchFilters filters, int limit);
+        List<Candidate> searchSummaryVector(List<Float> vector, SearchFilters filters, int limit);
+        List<Candidate> searchWikiBm25(String query, SearchFilters filters, int limit);
+        List<Candidate> searchWikiVector(List<Float> vector, SearchFilters filters, int limit);
         void deactivateVersion(String versionId);
+    }
+
+    public record DerivedContext(List<String> documentIds, List<String> versionIds,
+                                 List<String> sourceDepartments, List<String> materialCategories,
+                                 List<String> companies, List<String> documentTypes, List<String> manualTags) {
+        public DerivedContext {
+            documentIds = documentIds == null ? List.of() : List.copyOf(documentIds);
+            versionIds = versionIds == null ? List.of() : List.copyOf(versionIds);
+            sourceDepartments = sourceDepartments == null ? List.of() : List.copyOf(sourceDepartments);
+            materialCategories = materialCategories == null ? List.of() : List.copyOf(materialCategories);
+            companies = companies == null ? List.of() : List.copyOf(companies);
+            documentTypes = documentTypes == null ? List.of() : List.copyOf(documentTypes);
+            manualTags = manualTags == null ? List.of() : List.copyOf(manualTags);
+        }
     }
 
     public enum ModelRole { SMALL, LARGE }

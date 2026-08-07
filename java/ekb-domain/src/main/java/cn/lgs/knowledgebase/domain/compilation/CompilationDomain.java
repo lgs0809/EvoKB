@@ -58,23 +58,33 @@ public final class CompilationDomain {
         }
     }
 
-    public record Entity(String canonicalId, String canonicalName, List<String> aliases, Map<String, Object> attributes) {
+    public enum ConflictStatus { NONE, POTENTIAL, CONFIRMED }
+    public enum RelationLifecycle { ACTIVE, INACTIVE }
+
+    public record Entity(String canonicalId, String canonicalName, String entityType, String canonicalKey,
+                         List<String> aliases, Map<String, Object> attributes) {
         public Entity {
             require(canonicalId, "canonical id"); require(canonicalName, "canonical name");
+            require(entityType, "entity type"); require(canonicalKey, "canonical key");
             aliases = aliases == null ? List.of() : List.copyOf(aliases);
             attributes = attributes == null ? Map.of() : Map.copyOf(attributes);
         }
     }
 
     public record Relation(String id, String subjectEntityId, String predicate, String objectEntityId,
+                           Instant validFrom, Instant validTo, ConflictStatus conflictStatus, RelationLifecycle lifecycle,
                            List<String> evidenceIds, double confidence, Map<String, Object> qualifiers) {
         public Relation {
             require(id, "relation id"); require(subjectEntityId, "subject entity"); require(predicate, "predicate"); require(objectEntityId, "object entity");
+            if (subjectEntityId.equals(objectEntityId)) throw new IllegalArgumentException("self relation is not allowed");
+            if (validFrom != null && validTo != null && validTo.isBefore(validFrom)) throw new IllegalArgumentException("validTo cannot be before validFrom");
+            Objects.requireNonNull(conflictStatus, "conflictStatus");
+            Objects.requireNonNull(lifecycle, "lifecycle");
             evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
             qualifiers = qualifiers == null ? Map.of() : Map.copyOf(qualifiers);
             if (confidence < 0 || confidence > 1) throw new IllegalArgumentException("confidence must be in [0,1]");
         }
-        public boolean publishable() { return !evidenceIds.isEmpty(); }
+        public boolean publishable() { return lifecycle == RelationLifecycle.ACTIVE && !evidenceIds.isEmpty(); }
     }
 
     public record DistillationSignal(long accessCount, long queryHitCount, double evidenceUseRate, boolean manuallyPinned) {
