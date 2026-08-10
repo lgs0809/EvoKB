@@ -9,21 +9,32 @@ public final class IdentityDomain {
     public enum Role { ADMIN, USER }
     public enum UserStatus { ACTIVE, DISABLED }
 
-    public record User(String id, String username, Role role, UserStatus status, Instant createdAt) {
+    public record User(String id, String username, String displayName, Role role, UserStatus status,
+                       Instant lastLoginAt, Instant createdAt, Instant updatedAt) {
         public User {
             id = requireText(id, "user id");
             username = requireText(username, "username");
+            displayName = displayName == null || displayName.isBlank() ? username : displayName.trim();
+            if (displayName.length() > 128) throw new IllegalArgumentException("displayName is too long");
             Objects.requireNonNull(role, "role");
             Objects.requireNonNull(status, "status");
             Objects.requireNonNull(createdAt, "createdAt");
+            updatedAt = updatedAt == null ? createdAt : updatedAt;
         }
 
-        public boolean active() {
-            return status == UserStatus.ACTIVE;
+        public boolean active() { return status == UserStatus.ACTIVE; }
+        public boolean administrator() { return role == Role.ADMIN; }
+
+        public User withRoleAndStatus(Role nextRole, UserStatus nextStatus, Instant now) {
+            return new User(id, username, displayName, nextRole, nextStatus, lastLoginAt, createdAt, now);
         }
 
-        public boolean administrator() {
-            return role == Role.ADMIN;
+        public User withDisplayName(String nextDisplayName, Instant now) {
+            return new User(id, username, nextDisplayName, role, status, lastLoginAt, createdAt, now);
+        }
+
+        public User withLastLogin(Instant now) {
+            return new User(id, username, displayName, role, status, now, createdAt, now);
         }
     }
 

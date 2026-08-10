@@ -30,7 +30,11 @@ public final class Ports {
 
     public interface UserRepository {
         long count();
+        long countLocked();
+        long countActiveAdmins();
+        long countActiveAdminsLocked();
         Optional<User> findById(String id);
+        Optional<User> findByIdLocked(String id);
         Optional<User> findByUsername(String username);
         List<User> list(int offset, int limit);
         void save(User user, String passwordHash);
@@ -42,8 +46,17 @@ public final class Ports {
     public interface SessionRepository {
         void save(Session session);
         Optional<Session> findByTokenHash(String tokenHash);
+        void touch(String sessionId, Instant now);
         void delete(String sessionId);
+        void deleteByUser(String userId);
         int deleteExpired(Instant now);
+    }
+
+    public interface TransactionPort {
+        <T> T required(java.util.function.Supplier<T> work);
+        default void required(Runnable work) {
+            required(() -> { work.run(); return null; });
+        }
     }
 
     public interface PasswordHasher {
