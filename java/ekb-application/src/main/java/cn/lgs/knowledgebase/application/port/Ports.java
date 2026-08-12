@@ -73,10 +73,15 @@ public final class Ports {
         Batch create(Batch batch);
         Optional<Batch> findBatch(String batchId);
         Optional<FileItem> findFile(String fileId);
-        void saveBatch(Batch batch);
         void saveFile(FileItem file);
         List<Batch> listBatches(String actorId, boolean admin, int offset, int limit, String status, String query);
+        void queueBatch(String batchId, Instant now);
+        void retryFile(String fileId, Instant now);
+        void resetInterrupted(Instant now);
         List<FileItem> claimQueued(int limit, Instant now);
+        void updateProgress(String fileId, cn.lgs.knowledgebase.domain.ingestion.IngestionDomain.ProgressStage stage, Instant now);
+        void complete(String fileId, String documentId, String versionId, Instant now);
+        void fail(String fileId, String errorCode, String errorMessage, Instant now);
     }
 
     public interface ObjectStore {
@@ -114,11 +119,25 @@ public final class Ports {
         Optional<DocumentVersion> currentActiveVersion(String documentId);
         long nextVersionNo(String documentId);
         void createPendingVersion(Document document, DocumentVersion version, Metadata metadata);
+        void resetFailedVersion(String versionId, Metadata metadata);
         void saveParsed(String versionId, String markdownKey, String structuredKey,
                         String parserName, String parserVersion, List<RawBlock> blocks, List<Evidence> evidence);
         void activateVersion(String documentId, String versionId);
         void markVersionFailed(String versionId, String code, String message);
         List<Evidence> resolveEvidence(List<String> evidenceIds);
+    }
+
+    public interface FileSourcePort {
+        SourceFile inspect(String path);
+        InputStream open(String path);
+        boolean exists(String path);
+        void delete(String path);
+    }
+
+    public record SourceFile(String path, String filename, long size, String sha256, String mediaType) {}
+
+    public interface ParsedArtifactEncoder {
+        byte[] structuredArtifact(ParsedDocument parsed);
     }
 
     public interface RawSearchIndex {

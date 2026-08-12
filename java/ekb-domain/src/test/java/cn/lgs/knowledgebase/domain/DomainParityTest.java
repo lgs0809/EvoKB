@@ -26,19 +26,19 @@ class DomainParityTest {
     }
 
     @Test
-    void interruptedIngestionIsRecoverableAndFailedFileRetryIncrementsAttempt() {
+    void interruptedIngestionIsRecoverableAndRetryOnlyIncrementsAttemptWhenClaimed() {
         var metadata = new IngestionDomain.FileMetadata("report", null, null, null, null, null, List.of("a", "a"));
-        var running = new IngestionDomain.FileItem("f1", "b1", "a.pdf", "a.pdf", 1, "sha", metadata,
-                IngestionDomain.FileStatus.RUNNING, IngestionDomain.ProgressStage.PARSE, 1,
-                null, null, null, null, NOW, NOW);
+        var running = new IngestionDomain.FileItem("f1", "b1", "a.pdf", "a.pdf", "/staging/a.pdf", 1, "sha", metadata,
+                IngestionDomain.FileStatus.RUNNING, IngestionDomain.ProgressStage.PARSING, 1,
+                "", "", null, "", "", NOW, NOW, NOW, null);
         var recovered = running.recoverInterrupted(NOW.plusSeconds(1));
         assertEquals(IngestionDomain.FileStatus.QUEUED, recovered.status());
-        assertEquals("INTERRUPTED", recovered.errorCode());
+        assertEquals(IngestionDomain.ProgressStage.QUEUED, recovered.progressStage());
 
-        var failed = new IngestionDomain.FileItem("f2", "b1", "b.pdf", "b.pdf", 1, "sha2", metadata,
+        var failed = new IngestionDomain.FileItem("f2", "b1", "b.pdf", "b.pdf", "/staging/b.pdf", 1, "sha2", metadata,
                 IngestionDomain.FileStatus.FAILED, IngestionDomain.ProgressStage.FAILED, 2,
-                null, null, "X", "bad", NOW, NOW);
-        assertEquals(3, failed.retry(NOW.plusSeconds(1)).attempt());
+                "", "", null, "X", "bad", NOW, NOW, NOW, NOW);
+        assertEquals(2, failed.retry(NOW.plusSeconds(1)).attempt());
     }
 
     @Test
