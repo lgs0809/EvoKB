@@ -154,9 +154,10 @@ public final class SafeBatchUploadStager {
     static String normalizeRelative(String supplied, String fallback) {
         String value = supplied == null || supplied.isBlank() ? fallback : supplied;
         value = value.replace('\\', '/').trim();
-        while (value.startsWith("/")) value = value.substring(1);
+        if (value.indexOf('\0') >= 0 || value.startsWith("/") || value.matches("^[A-Za-z]:.*")) {
+            throw new UploadRejected("invalid upload path");
+        }
         if (value.isBlank()) value = fallback;
-        if (value.indexOf('\0') >= 0 || value.matches("^[A-Za-z]:.*")) throw new UploadRejected("invalid upload path");
         Path path = Path.of(value).normalize();
         if (path.isAbsolute() || path.startsWith("..") || path.toString().equals("..")) throw new UploadRejected("invalid upload path");
         String normalized = path.toString().replace('\\', '/');
