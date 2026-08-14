@@ -105,6 +105,21 @@ export function BatchUploadDialog({ onClose, onChanged, onError, initialBatchId 
     setDirty(new Set());
   };
 
+  const saveAndRefresh = async () => {
+    if (!batch || dirty.size === 0) return;
+    setBusy(true);
+    try {
+      await saveDirty();
+      hydrate(await fetchEnterpriseBatch(batch.batch_id));
+      onChanged();
+      onError('');
+    } catch (err) {
+      onError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const start = async () => {
     if (!batch) return;
     setBusy(true);
