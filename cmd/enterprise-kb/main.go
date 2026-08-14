@@ -18,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: enterprise-kb <ingest|search|summary|distill|eval|mcp|server> [flags]")
+		fatalf("usage: enterprise-kb <ingest|search|summary|distill|eval|artifact-eval|mcp|server> [flags]")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -34,6 +34,8 @@ func main() {
 		runDistill(ctx, os.Args[2:])
 	case "eval":
 		runEval(ctx, os.Args[2:])
+	case "artifact-eval":
+		runArtifactEval(ctx, os.Args[2:])
 	case "server":
 		runServer(ctx, os.Args[2:])
 	case "mcp":
@@ -163,17 +165,17 @@ func runSummary(ctx context.Context, args []string) {
 	judgeClient.SetCallTimeout(time.Duration(envPositiveInt("EKB_LLM_TIMEOUT_SECONDS", 600)) * time.Second)
 
 	generator := &enterprisesummary.WindowedGenerator{Base: &enterprisesummary.StructuredGenerator{
-		Client: generatorClient,
-		Model: generatorModel,
-		IdentityName: envOr("EKB_SUMMARY_GENERATOR_IDENTITY", "api:"+generatorModel),
-		MaxTokens: envPositiveInt("EKB_SUMMARY_GENERATOR_MAX_TOKENS", 1024),
+		Client:         generatorClient,
+		Model:          generatorModel,
+		IdentityName:   envOr("EKB_SUMMARY_GENERATOR_IDENTITY", "api:"+generatorModel),
+		MaxTokens:      envPositiveInt("EKB_SUMMARY_GENERATOR_MAX_TOKENS", 1024),
 		MaxSourceChars: envPositiveInt("EKB_SUMMARY_GENERATOR_MAX_SOURCE_CHARS", 160000),
 	}}
 	judge := &enterprisesummary.WindowedJudge{Base: &enterprisesummary.StructuredJudge{
-		Client: judgeClient,
-		Model: judgeModel,
-		IdentityName: envOr("EKB_SUMMARY_JUDGE_IDENTITY", "api:"+judgeModel),
-		MaxTokens: envPositiveInt("EKB_SUMMARY_JUDGE_MAX_TOKENS", 512),
+		Client:         judgeClient,
+		Model:          judgeModel,
+		IdentityName:   envOr("EKB_SUMMARY_JUDGE_IDENTITY", "api:"+judgeModel),
+		MaxTokens:      envPositiveInt("EKB_SUMMARY_JUDGE_MAX_TOKENS", 512),
 		MaxSourceChars: envPositiveInt("EKB_SUMMARY_JUDGE_MAX_SOURCE_CHARS", 160000),
 	}}
 	generator.WindowChars = envPositiveInt("EKB_SUMMARY_GENERATOR_WINDOW_CHARS", 12000)
@@ -228,8 +230,8 @@ func mustEngine(ctx context.Context, needParser, needReranker bool) (*raw.Engine
 		fatalf("derived opensearch: %v", err)
 	}
 	engine := &raw.Engine{
-		Objects:  objects,
-		Metadata: metadata,
+		Objects:       objects,
+		Metadata:      metadata,
 		DerivedSearch: derivedSearch,
 		Search: raw.NewOpenSearchStore(
 			mustEnv("EKB_OPENSEARCH_URL"),

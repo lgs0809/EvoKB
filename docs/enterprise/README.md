@@ -95,6 +95,18 @@ The direct retrieval harness reports Knowledge Recall@K, Evidence Recall@K, retr
 
 `eval/golden/enterprise_v1_smoke.jsonl` contains 30 smoke cases for the current acceptance sample. It validates the evaluation machinery and Raw baseline only. It is not the final enterprise-corpus benchmark and must not be used to claim Summary/Wiki/Graph uplift.
 
+### Compiled-artifact quality evaluation
+
+`enterprise-kb artifact-eval --cases <artifact-golden.jsonl>` reads the **actual persisted compiled artifacts from MySQL** for each exact Version scope and reports Summary Fact Precision/Recall, Graph Relation Precision/Recall, Entity Resolution Accuracy, Wiki Claim Precision/Recall, and Wiki Claim Grounding Rate. The Golden file contains expectations only; predicted facts, relations, mappings, and claims are never copied into the Golden input.
+
+One JSONL case has this shape:
+
+```json
+{"id":"case-001","version_ids":["<version-uuid>"],"expected_summary_facts":[{"text":"required fact","alternatives":["approved paraphrase"]}],"expected_relations":[{"source":"Canonical A","relation_type":"CONTROLS","target":"Canonical B"}],"expected_entity_mappings":[{"surface_form":"A Co.","entity_type":"COMPANY","canonical_name":"Canonical A"}],"expected_wiki_claims":[{"text":"required wiki claim"}]}
+```
+
+Text matching is deterministic after case/whitespace normalization. Human-approved paraphrases must be listed explicitly in `alternatives`; the evaluator does not call an LLM judge. A metric with no Golden expectation is serialized as `available=false` with null numeric values instead of a fabricated zero or one. Agent Task Success and average Retrieval Round are also explicitly unavailable in this artifact evaluator because they require an Agent-level benchmark.
+
 ## Current model policy
 
 Embedding and Reranker remain local by default. The previous local llama.cpp Summary Generator/Judge deployment was removed because CPU inference was not operationally useful. The compiler model interfaces remain OpenAI-compatible. Gate 2/3 quality acceptance must be repeated with the external provider before those gates are declared complete.

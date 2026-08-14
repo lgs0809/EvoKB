@@ -25,6 +25,19 @@ func TestNeo4jProjectionIntegration(t *testing.T) {
 	if err := client.EnsureSchema(ctx); err != nil {
 		t.Fatalf("ensure schema: %v", err)
 	}
+	fixtureNodeIDs := []string{"it-entity-source", "it-entity-target", "it-support-related", "it-evidence-related"}
+	cleanup := func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		if err := client.exec(cleanupCtx, neo4jStatement{
+			Statement:  "MATCH (n) WHERE n.id IN $ids DETACH DELETE n",
+			Parameters: map[string]any{"ids": fixtureNodeIDs},
+		}); err != nil {
+			t.Logf("neo4j integration cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
 
 	source := CanonicalEntity{ID: "it-entity-source", CanonicalName: "Integration Source", EntityType: EntityCompany, CanonicalKey: "integration source"}
 	target := CanonicalEntity{ID: "it-entity-target", CanonicalName: "Integration Target", EntityType: EntityCompany, CanonicalKey: "integration target"}
