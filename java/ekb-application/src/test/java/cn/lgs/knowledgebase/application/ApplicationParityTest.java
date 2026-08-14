@@ -75,6 +75,7 @@ class ApplicationParityTest {
     }
 
     private record StaticModel(String answer) implements Ports.KnowledgeModel {
+        @Override public String identity(Ports.ModelRole role) { return role.name().toLowerCase(); }
         @Override public String generate(Ports.ModelRole role, Ports.ModelTask task, String systemPrompt, String userPrompt) { return answer; }
         @Override public <T> T generateStructured(Ports.ModelRole role, Ports.ModelTask task, String systemPrompt, String userPrompt, Class<T> outputType) {
             throw new UnsupportedOperationException();

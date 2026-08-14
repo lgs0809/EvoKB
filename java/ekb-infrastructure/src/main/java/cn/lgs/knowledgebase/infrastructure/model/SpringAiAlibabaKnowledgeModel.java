@@ -24,6 +24,11 @@ public final class SpringAiAlibabaKnowledgeModel implements KnowledgeModel {
     }
 
     @Override
+    public String identity(ModelRole role) {
+        return role == ModelRole.LARGE ? largeModel : smallModel;
+    }
+
+    @Override
     public String generate(ModelRole role, ModelTask task, String systemPrompt, String userPrompt) {
         String content = chatClient.prompt()
                 .system(systemPrompt == null ? "" : systemPrompt)

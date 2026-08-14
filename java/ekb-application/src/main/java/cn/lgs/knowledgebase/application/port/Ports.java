@@ -209,6 +209,7 @@ public final class Ports {
 
     /** Framework-neutral LLM port. Spring AI Alibaba is an infrastructure adapter, never a domain dependency. */
     public interface KnowledgeModel {
+        String identity(ModelRole role);
         String generate(ModelRole role, ModelTask task, String systemPrompt, String userPrompt);
         <T> T generateStructured(ModelRole role, ModelTask task, String systemPrompt, String userPrompt, Class<T> outputType);
     }
