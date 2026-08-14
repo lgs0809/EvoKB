@@ -157,6 +157,21 @@ func (s *OpenSearchTextStore) IndexDocument(ctx context.Context, doc TextDocumen
 	return err
 }
 
+func (s *OpenSearchTextStore) DeactivateVersion(ctx context.Context, versionID string) error {
+	if strings.TrimSpace(versionID) == "" {
+		return nil
+	}
+	body := map[string]any{
+		"script": map[string]any{"lang": "painless", "source": "ctx._source.is_active = false"},
+		"query": map[string]any{"bool": map[string]any{"filter": []any{
+			map[string]any{"term": map[string]any{"version_id": versionID}},
+			map[string]any{"term": map[string]any{"is_active": true}},
+		}}},
+	}
+	_, err := s.doJSON(ctx, http.MethodPost, "/"+url.PathEscape(s.Index)+"/_update_by_query?refresh=true&conflicts=proceed", body)
+	return err
+}
+
 func (s *OpenSearchTextStore) DeactivateGroup(ctx context.Context, knowledgeType, groupID string) error {
 	if strings.TrimSpace(groupID) == "" {
 		return nil

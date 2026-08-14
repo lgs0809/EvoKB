@@ -100,6 +100,53 @@ services:
       retries: 30
       start_period: 15s
 
+  knowledge-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: enterprise-knowledge-base:server
+    container_name: ekb-knowledge-server
+    restart: unless-stopped
+    environment:
+      EKB_MYSQL_DSN: ${EKB_MYSQL_USER:-ekb}:${EKB_MYSQL_PASSWORD}@tcp(mysql:3306)/${EKB_MYSQL_DATABASE:-enterprise_kb}?parseTime=true
+      EKB_MINIO_ENDPOINT: minio:9000
+      EKB_MINIO_PUBLIC_ENDPOINT: ${EKB_MINIO_PUBLIC_ENDPOINT:-127.0.0.1:19000}
+      EKB_MINIO_ACCESS_KEY: ${EKB_MINIO_ROOT_USER}
+      EKB_MINIO_SECRET_KEY: ${EKB_MINIO_ROOT_PASSWORD}
+      EKB_MINIO_BUCKET: ${EKB_MINIO_BUCKET:-enterprise-kb}
+      EKB_OPENSEARCH_URL: http://opensearch:9200
+      EKB_RAW_INDEX: ${EKB_RAW_INDEX:-ekb_raw_v1}
+      EKB_DERIVED_INDEX: ${EKB_DERIVED_INDEX:-ekb_derived_v1}
+      EKB_MODELS_URL: http://models:8000
+      EKB_EMBED_DIMS: ${EKB_EMBED_DIMS:-1024}
+      EKB_NEO4J_URL: http://neo4j:7474
+      EKB_NEO4J_AUTH: ${EKB_NEO4J_AUTH}
+      EKB_SERVER_ADDR: 0.0.0.0:18080
+      EKB_WEB_DIR: /app/internal/web/dist
+      EKB_SERVER_TOKEN: ${EKB_SERVER_TOKEN:-}
+      EKB_RERANK_MAX_CHARS: ${EKB_RERANK_MAX_CHARS:-400}
+      EKB_RERANK_MAX_CANDIDATES: ${EKB_RERANK_MAX_CANDIDATES:-20}
+      EKB_DISTILL_EFFECTIVE_HIT_THRESHOLD: ${EKB_DISTILL_EFFECTIVE_HIT_THRESHOLD:-3}
+    ports:
+      - "127.0.0.1:${EKB_SERVER_PORT:-18080}:18080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      models:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:18080/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
   neo4j:
     image: neo4j:5.26.12-community
     container_name: ekb-neo4j

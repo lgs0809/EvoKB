@@ -14,14 +14,14 @@ import (
 
 // SearchHit is a bounded, evidence-backed graph retrieval result.
 type SearchHit struct {
-	RelationID     string
-	SourceEntityID string
-	SourceName     string
-	TargetEntityID string
-	TargetName     string
-	RelationType   string
-	EvidenceIDs    []string
-	Score          float64
+	RelationID     string   `json:"relation_id"`
+	SourceEntityID string   `json:"source_entity_id"`
+	SourceName     string   `json:"source_name"`
+	TargetEntityID string   `json:"target_entity_id"`
+	TargetName     string   `json:"target_name"`
+	RelationType   string   `json:"relation_type"`
+	EvidenceIDs    []string `json:"evidence_ids"`
+	Score          float64  `json:"score"`
 }
 
 // SearchBounded seeds traversal from the enterprise entity full-text index and

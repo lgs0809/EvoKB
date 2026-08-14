@@ -8,4 +8,5 @@ import (
 type Service struct {
 	SearchEngine  *retrieval.Service
 	SourcePackager *enterpriseevidence.Packager
+	SearchAudit    SearchAudit
 }

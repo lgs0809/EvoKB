@@ -310,6 +310,16 @@ CREATE TABLE IF NOT EXISTS search_result (
   CONSTRAINT fk_search_result_record FOREIGN KEY (search_id) REFERENCES search_record(search_id)
 ) ENGINE=InnoDB;
 
+CREATE TABLE IF NOT EXISTS effective_version_hit (
+  search_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  version_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (search_id, version_id),
+  KEY idx_effective_version_hit_version (version_id, created_at),
+  CONSTRAINT fk_effective_hit_search FOREIGN KEY (search_id) REFERENCES search_record(search_id),
+  CONSTRAINT fk_effective_hit_version FOREIGN KEY (version_id) REFERENCES document_version(version_id)
+) ENGINE=InnoDB;
+
 CREATE TABLE IF NOT EXISTS package_record (
   package_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
   object_key VARCHAR(2048) NOT NULL,

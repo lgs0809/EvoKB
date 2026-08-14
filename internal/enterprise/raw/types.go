@@ -171,6 +171,10 @@ type Reranker interface {
 	Rerank(ctx context.Context, query string, docs []string) ([]float64, error)
 }
 
+type DerivedSearchLifecycle interface {
+	DeactivateVersion(ctx context.Context, versionID string) error
+}
+
 type SearchStore interface {
 	EnsureRawIndex(ctx context.Context, dimensions int) error
 	IndexRaw(ctx context.Context, chunks []Chunk, evidenceByChunk map[string][]string) error

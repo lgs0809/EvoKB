@@ -22,6 +22,11 @@ func (s *Service) SearchKnowledge(ctx context.Context, req SearchKnowledgeReques
 	if err != nil {
 		return nil, err
 	}
+	if s.SearchAudit != nil {
+		if err := s.SearchAudit.RecordDeliveredSearch(ctx, req.Query, filters, result); err != nil {
+			return nil, fmt.Errorf("search_knowledge audit: %w", err)
+		}
+	}
 	out := &SearchKnowledgeResponse{SearchID: result.SearchID}
 	for _, item := range result.Results {
 		out.Results = append(out.Results, SearchKnowledgeResult{

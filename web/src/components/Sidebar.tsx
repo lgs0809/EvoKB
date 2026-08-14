@@ -56,6 +56,9 @@ export function Sidebar({ onNavigate, onHome, currentPath, theme, onToggleTheme,
           )}
         </button>
       </div>
+      <div class="px-3 pt-3">
+        <a href="/enterprise" class="block rounded-md border border-gray-200 dark:border-gray-700 px-3 py-2 text-sm font-medium text-blue-700 dark:text-blue-300 hover:bg-gray-50 dark:hover:bg-gray-800">Enterprise Evidence</a>
+      </div>
 
       {/* Search */}
       <div class="p-3">

@@ -73,3 +73,105 @@ export async function fetchStatus(): Promise<StatusData> {
   const res = await fetch(`${BASE}/api/status`, { headers: authHeaders() });
   return res.json();
 }
+
+export interface EnterpriseDocumentVersion {
+  document_id: string;
+  logical_name: string;
+  version_id: string;
+  version_no: number;
+  lifecycle: string;
+  original_filename: string;
+  source_department?: string;
+  material_category?: string;
+  company?: string;
+  document_type?: string;
+  document_date?: string;
+  parsed_at?: string;
+  summary_count: number;
+  grounded_summaries: number;
+  covered_summaries: number;
+  recommendation?: string;
+  recommendation_reason?: string;
+  effective_hits: number;
+}
+
+export interface EnterpriseEvidence {
+  evidence_id: string;
+  document_id: string;
+  version_id: string;
+  object_key: string;
+  raw_location: Record<string, unknown>;
+  raw_content: string;
+  content_hash: string;
+}
+
+export interface EnterpriseClaim {
+  claim_id: string;
+  section: string;
+  claim_text: string;
+  grounding_status: string;
+  temporal_status: string;
+  fact_ids: string[];
+  evidence_ids: string[];
+}
+
+export interface EnterpriseWiki {
+  wiki_id: string;
+  wiki_version: number;
+  wiki_type: string;
+  canonical_subject_id?: string;
+  title: string;
+  lifecycle: string;
+  claims?: EnterpriseClaim[];
+}
+
+export interface EnterpriseGraphRelation {
+  relation_id: string;
+  source_entity_id: string;
+  source_name: string;
+  target_entity_id: string;
+  target_name: string;
+  relation_type: string;
+  evidence_ids: string[];
+  score: number;
+}
+
+export async function fetchEnterpriseDocuments(): Promise<{ documents: EnterpriseDocumentVersion[]; total: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/documents`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Documents request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function recommendEnterpriseDistill(versionId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/distill`, {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ version_id: versionId, reason: 'user' }),
+  });
+  if (!res.ok) throw new Error(`Distill request failed: ${res.status}`);
+}
+
+export async function fetchEnterpriseWikis(): Promise<{ wikis: EnterpriseWiki[]; total: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/wikis`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Wiki list request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEnterpriseWiki(id: string, version?: number): Promise<EnterpriseWiki> {
+  const qs = new URLSearchParams({ id });
+  if (version) qs.set('version', String(version));
+  const res = await fetch(`${BASE}/api/enterprise/wiki?${qs}`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Wiki request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEnterpriseEvidence(id: string): Promise<EnterpriseEvidence> {
+  const res = await fetch(`${BASE}/api/enterprise/evidence?id=${encodeURIComponent(id)}`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Evidence request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEnterpriseGraph(query: string): Promise<{ relations: EnterpriseGraphRelation[]; total: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/graph?q=${encodeURIComponent(query)}&depth=2&limit=10`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Graph request failed: ${res.status}`);
+  return res.json();
+}

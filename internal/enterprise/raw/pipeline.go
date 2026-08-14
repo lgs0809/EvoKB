@@ -21,7 +21,8 @@ type Engine struct {
 	Parser   Parser
 	Search   SearchStore
 	Embedder Embedder
-	Reranker Reranker
+	Reranker     Reranker
+	DerivedSearch DerivedSearchLifecycle
 }
 
 type IngestRequest struct {
@@ -43,6 +44,7 @@ type IngestResult struct {
 	OriginalObjectKey   string
 	MarkdownObjectKey   string
 	StructuredObjectKey string
+	Warnings            []string
 }
 
 func (e *Engine) IngestPath(ctx context.Context, req IngestRequest) (*IngestResult, error) {
@@ -219,23 +221,32 @@ func (e *Engine) IngestPath(ctx context.Context, req IngestRequest) (*IngestResu
 	if err := e.Search.IndexRaw(ctx, chunks, evidenceByChunk); err != nil {
 		return fail("SEARCH_INDEX_FAILED", err)
 	}
-	if err := e.Metadata.ActivateVersion(ctx, doc.ID, versionID); err != nil {
-		_ = e.Search.DeactivateVersion(ctx, versionID)
-		return fail("METADATA_ACTIVATE_FAILED", err)
-	}
+	// Search is switched first. Until MySQL activation succeeds, the new Raw
+	// candidate cannot resolve to active Evidence, so it cannot escape the final
+	// Evidence gate. This ordering keeps a search activation failure from first
+	// staling valid Summary/Wiki/Graph support in the durable fact layer.
 	if err := e.Search.ActivateVersion(ctx, doc.ID, versionID); err != nil {
 		_ = e.Search.DeactivateVersion(ctx, versionID)
+		return fail("SEARCH_ACTIVATE_FAILED", err)
+	}
+	if err := e.Metadata.ActivateVersion(ctx, doc.ID, versionID); err != nil {
+		_ = e.Search.DeactivateVersion(ctx, versionID)
 		if previousActive != nil {
-			_ = e.Metadata.ActivateVersion(ctx, doc.ID, previousActive.ID)
 			_ = e.Search.ActivateVersion(ctx, doc.ID, previousActive.ID)
 		}
-		_ = e.Metadata.MarkVersionFailed(ctx, versionID, "SEARCH_ACTIVATE_FAILED", err.Error())
-		return nil, err
+		return fail("METADATA_ACTIVATE_FAILED", err)
+	}
+	var warnings []string
+	if previousActive != nil && e.DerivedSearch != nil {
+		if err := e.DerivedSearch.DeactivateVersion(ctx, previousActive.ID); err != nil {
+			warnings = append(warnings, "derived search cleanup failed: "+err.Error())
+		}
 	}
 	return &IngestResult{
 		DocumentID: doc.ID, VersionID: versionID, VersionNo: version.VersionNo, Retried: retryVersion != nil,
 		BlockCount: len(blocks), ChunkCount: len(chunks), EvidenceCount: len(evidence),
 		OriginalObjectKey: originalKey, MarkdownObjectKey: markdownKey, StructuredObjectKey: structuredKey,
+		Warnings: warnings,
 	}, nil
 }
 

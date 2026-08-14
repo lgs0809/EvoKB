@@ -11,13 +11,14 @@ import (
 	"time"
 
 	"github.com/xoai/sage-wiki/internal/enterprise/raw"
+	"github.com/xoai/sage-wiki/internal/enterprise/retrieval"
 	enterprisesummary "github.com/xoai/sage-wiki/internal/enterprise/summary"
 	"github.com/xoai/sage-wiki/internal/llm"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: enterprise-kb <ingest|search|summary|mcp> [flags]")
+		fatalf("usage: enterprise-kb <ingest|search|summary|distill|eval|mcp|server> [flags]")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -29,6 +30,12 @@ func main() {
 		runSearch(ctx, os.Args[2:])
 	case "summary":
 		runSummary(ctx, os.Args[2:])
+	case "distill":
+		runDistill(ctx, os.Args[2:])
+	case "eval":
+		runEval(ctx, os.Args[2:])
+	case "server":
+		runServer(ctx, os.Args[2:])
 	case "mcp":
 		runMCP(ctx, os.Args[2:])
 	default:
@@ -215,9 +222,15 @@ func mustEngine(ctx context.Context, needParser, needReranker bool) (*raw.Engine
 		fatalf("invalid EKB_EMBED_DIMS")
 	}
 	modelsURL := mustEnv("EKB_MODELS_URL")
+	derivedSearch := retrieval.NewOpenSearchTextStore(mustEnv("EKB_OPENSEARCH_URL"), envOr("EKB_DERIVED_INDEX", "ekb_derived_v1"))
+	if err := derivedSearch.EnsureIndex(ctx, dims); err != nil {
+		closeFn()
+		fatalf("derived opensearch: %v", err)
+	}
 	engine := &raw.Engine{
 		Objects:  objects,
 		Metadata: metadata,
+		DerivedSearch: derivedSearch,
 		Search: raw.NewOpenSearchStore(
 			mustEnv("EKB_OPENSEARCH_URL"),
 			envOr("EKB_RAW_INDEX", "ekb_raw_v1"),

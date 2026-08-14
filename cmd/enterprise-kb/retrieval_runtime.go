@@ -9,6 +9,7 @@ import (
 	enterpriseapi "github.com/xoai/sage-wiki/internal/enterprise/api"
 	enterpriseevidence "github.com/xoai/sage-wiki/internal/enterprise/evidence"
 	enterprisegraph "github.com/xoai/sage-wiki/internal/enterprise/graph"
+	enterprisepromotion "github.com/xoai/sage-wiki/internal/enterprise/promotion"
 	"github.com/xoai/sage-wiki/internal/enterprise/raw"
 	"github.com/xoai/sage-wiki/internal/enterprise/retrieval"
 )
@@ -25,20 +26,29 @@ type retrievalRuntime struct {
 	Search         *retrieval.Service
 	API            *enterpriseapi.Service
 	Publisher      *enterpriseevidence.Publisher
+	Promotion      *enterprisepromotion.MySQLStore
 }
 
 func openRetrievalRuntime(ctx context.Context) (*retrievalRuntime, error) {
-	metadata, err := raw.OpenMySQL(ctx, mustEnv("EKB_MYSQL_DSN"))
+	mysqlDSN := mustEnv("EKB_MYSQL_DSN")
+	metadata, err := raw.OpenMySQL(ctx, mysqlDSN)
 	if err != nil {
 		return nil, err
 	}
-	fail := func(err error) (*retrievalRuntime, error) {
+	promotionStore, err := enterprisepromotion.OpenMySQL(ctx, mysqlDSN, envPositiveInt("EKB_DISTILL_EFFECTIVE_HIT_THRESHOLD", 3))
+	if err != nil {
 		_ = metadata.Close()
 		return nil, err
 	}
-	objects, err := raw.NewMinIOStore(
+	fail := func(err error) (*retrievalRuntime, error) {
+		_ = promotionStore.Close()
+		_ = metadata.Close()
+		return nil, err
+	}
+	objects, err := raw.NewMinIOStoreWithPublicEndpoint(
 		ctx,
 		mustEnv("EKB_MINIO_ENDPOINT"),
+		os.Getenv("EKB_MINIO_PUBLIC_ENDPOINT"),
 		mustEnv("EKB_MINIO_ACCESS_KEY"),
 		mustEnv("EKB_MINIO_SECRET_KEY"),
 		envOr("EKB_MINIO_BUCKET", "enterprise-kb"),
@@ -105,19 +115,30 @@ func openRetrievalRuntime(ctx context.Context) (*retrievalRuntime, error) {
 	}
 	packager := &enterpriseevidence.Packager{Resolver: resolver, Objects: objects}
 	publisher := &enterpriseevidence.Publisher{Packager: packager, Objects: objects}
-	api := &enterpriseapi.Service{SearchEngine: search, SourcePackager: packager}
+	api := &enterpriseapi.Service{SearchEngine: search, SourcePackager: packager, SearchAudit: promotionStore}
 	return &retrievalRuntime{
 		Metadata: metadata, Objects: objects, Embedder: embedder, Reranker: reranker,
 		RawSearch: rawSearch, DerivedSearch: derivedSearch, DerivedIndexer: derivedIndexer,
-		Resolver: resolver, Search: search, API: api, Publisher: publisher,
+		Resolver: resolver, Search: search, API: api, Publisher: publisher, Promotion: promotionStore,
 	}, nil
 }
 
 func (r *retrievalRuntime) Close() error {
-	if r == nil || r.Metadata == nil {
+	if r == nil {
 		return nil
 	}
-	return r.Metadata.Close()
+	var firstErr error
+	if r.Promotion != nil {
+		if err := r.Promotion.Close(); err != nil {
+			firstErr = err
+		}
+	}
+	if r.Metadata != nil {
+		if err := r.Metadata.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func neo4jCredentials() (string, string) {

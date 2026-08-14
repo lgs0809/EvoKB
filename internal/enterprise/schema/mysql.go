@@ -26,6 +26,19 @@ var mysqlMigrations = []mysqlMigration{
   CONSTRAINT fk_wiki_claim_fact_fact FOREIGN KEY (fact_id) REFERENCES summary_fact(fact_id)
 ) ENGINE=InnoDB`,
 	},
+	{
+		Version: 3,
+		Name:    "effective_version_hit",
+		SQL: `CREATE TABLE IF NOT EXISTS effective_version_hit (
+  search_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  version_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (search_id, version_id),
+  KEY idx_effective_version_hit_version (version_id, created_at),
+  CONSTRAINT fk_effective_hit_search FOREIGN KEY (search_id) REFERENCES search_record(search_id),
+  CONSTRAINT fk_effective_hit_version FOREIGN KEY (version_id) REFERENCES document_version(version_id)
+) ENGINE=InnoDB`,
+	},
 }
 
 func ApplyMySQL(ctx context.Context, dsn string) error {

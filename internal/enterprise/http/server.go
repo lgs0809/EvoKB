@@ -1,0 +1,244 @@
+package enterprisehttp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	enterpriseadmin "github.com/xoai/sage-wiki/internal/enterprise/admin"
+	enterpriseapi "github.com/xoai/sage-wiki/internal/enterprise/api"
+	enterpriseevidence "github.com/xoai/sage-wiki/internal/enterprise/evidence"
+	enterprisegraph "github.com/xoai/sage-wiki/internal/enterprise/graph"
+	enterprisepromotion "github.com/xoai/sage-wiki/internal/enterprise/promotion"
+)
+
+type Server struct {
+	Admin     *enterpriseadmin.MySQLStore
+	API       *enterpriseapi.Service
+	Promotion *enterprisepromotion.MySQLStore
+	Resolver  *enterpriseevidence.Resolver
+	Publisher *enterpriseevidence.Publisher
+	Graph     *enterprisegraph.Neo4jClient
+	WebDir    string
+	Token     string
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/enterprise/documents", s.handleDocuments)
+	mux.HandleFunc("/api/enterprise/distill", s.handleDistill)
+	mux.HandleFunc("/api/enterprise/wikis", s.handleWikis)
+	mux.HandleFunc("/api/enterprise/wiki", s.handleWiki)
+	mux.HandleFunc("/api/enterprise/evidence", s.handleEvidence)
+	mux.HandleFunc("/api/enterprise/graph", s.handleGraph)
+	mux.HandleFunc("/api/enterprise/search", s.handleSearch)
+	mux.HandleFunc("/api/enterprise/package", s.handlePackage)
+	mux.HandleFunc("/", s.handleStatic)
+	return s.security(mux)
+}
+
+func (s *Server) Serve(ctx context.Context, addr string) error {
+	if strings.TrimSpace(addr) == "" {
+		addr = "127.0.0.1:18080"
+	}
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      15 * time.Minute,
+		IdleTimeout:       90 * time.Second,
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- httpServer.ListenAndServe() }()
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return httpServer.Shutdown(shutdownCtx)
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "service": "enterprise-knowledge-base"})
+}
+
+func (s *Server) handleDocuments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || s.Admin == nil {
+		if r.Method != http.MethodGet { methodNotAllowed(w) } else { writeError(w, http.StatusServiceUnavailable, "documents unavailable") }
+		return
+	}
+	items, err := s.Admin.ListDocumentVersions(r.Context(), queryInt(r, "limit", 200))
+	if err != nil { writeError(w, http.StatusInternalServerError, err.Error()); return }
+	writeJSON(w, http.StatusOK, map[string]any{"documents": items, "total": len(items)})
+}
+
+func (s *Server) handleDistill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || s.Promotion == nil {
+		if r.Method != http.MethodPost { methodNotAllowed(w) } else { writeError(w, http.StatusServiceUnavailable, "distill unavailable") }
+		return
+	}
+	var req struct { VersionID string `json:"version_id"`; Reason string `json:"reason"` }
+	if err := decodeJSON(w, r, &req); err != nil { return }
+	var err error
+	switch strings.ToLower(strings.TrimSpace(req.Reason)) {
+	case "", "user", "manual", "user-marked":
+		err = s.Promotion.RecommendManual(r.Context(), req.VersionID)
+	case "existing", "existing-question":
+		err = s.Promotion.RecommendExistingQuestion(r.Context(), req.VersionID)
+	default:
+		writeError(w, http.StatusBadRequest, "unsupported distill reason")
+		return
+	}
+	if err != nil { writeError(w, http.StatusBadRequest, err.Error()); return }
+	writeJSON(w, http.StatusOK, map[string]any{"version_id": req.VersionID, "status": "RECOMMENDED"})
+}
+
+func (s *Server) handleWikis(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || s.Admin == nil {
+		if r.Method != http.MethodGet { methodNotAllowed(w) } else { writeError(w, http.StatusServiceUnavailable, "wikis unavailable") }
+		return
+	}
+	items, err := s.Admin.ListWikis(r.Context(), queryInt(r, "limit", 200))
+	if err != nil { writeError(w, http.StatusInternalServerError, err.Error()); return }
+	writeJSON(w, http.StatusOK, map[string]any{"wikis": items, "total": len(items)})
+}
+
+func (s *Server) handleWiki(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || s.Admin == nil {
+		if r.Method != http.MethodGet { methodNotAllowed(w) } else { writeError(w, http.StatusServiceUnavailable, "wiki unavailable") }
+		return
+	}
+	wikiID := strings.TrimSpace(r.URL.Query().Get("id"))
+	if wikiID == "" { writeError(w, http.StatusBadRequest, "id is required"); return }
+	version := uint64(queryInt(r, "version", 0))
+	item, err := s.Admin.GetWiki(r.Context(), wikiID, version)
+	if err != nil { writeError(w, http.StatusNotFound, err.Error()); return }
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) handleEvidence(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || s.Resolver == nil {
+		if r.Method != http.MethodGet { methodNotAllowed(w) } else { writeError(w, http.StatusServiceUnavailable, "evidence unavailable") }
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" { writeError(w, http.StatusBadRequest, "id is required"); return }
+	items, err := s.Resolver.Resolve(r.Context(), []string{id})
+	if err != nil { writeError(w, http.StatusNotFound, err.Error()); return }
+	writeJSON(w, http.StatusOK, items[0])
+}
+
+func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || s.Graph == nil {
+		if r.Method != http.MethodGet { methodNotAllowed(w) } else { writeError(w, http.StatusServiceUnavailable, "graph unavailable") }
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" { writeJSON(w, http.StatusOK, map[string]any{"relations": []any{}}); return }
+	hits, err := s.Graph.SearchBounded(r.Context(), query, queryInt(r, "depth", 2), queryInt(r, "limit", 10))
+	if err != nil { writeError(w, http.StatusInternalServerError, err.Error()); return }
+	writeJSON(w, http.StatusOK, map[string]any{"relations": hits, "total": len(hits)})
+}
+
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || s.API == nil {
+		if r.Method != http.MethodPost { methodNotAllowed(w) } else { writeError(w, http.StatusServiceUnavailable, "search unavailable") }
+		return
+	}
+	var req enterpriseapi.SearchKnowledgeRequest
+	if err := decodeJSON(w, r, &req); err != nil { return }
+	result, err := s.API.SearchKnowledge(r.Context(), req)
+	if err != nil { writeError(w, http.StatusInternalServerError, err.Error()); return }
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handlePackage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || s.Publisher == nil {
+		if r.Method != http.MethodPost { methodNotAllowed(w) } else { writeError(w, http.StatusServiceUnavailable, "package unavailable") }
+		return
+	}
+	var req enterpriseapi.PackageSourcesRequest
+	if err := decodeJSON(w, r, &req); err != nil { return }
+	result, err := s.Publisher.Publish(r.Context(), req.EvidenceIDs)
+	if err != nil { writeError(w, http.StatusBadRequest, err.Error()); return }
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead { methodNotAllowed(w); return }
+	root := strings.TrimSpace(s.WebDir)
+	if root == "" { root = "internal/web/dist" }
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil { writeError(w, http.StatusInternalServerError, "web root unavailable"); return }
+	requestPath := strings.TrimPrefix(filepath.Clean("/"+r.URL.Path), "/")
+	candidate := filepath.Join(absoluteRoot, filepath.FromSlash(requestPath))
+	rel, err := filepath.Rel(absoluteRoot, candidate)
+	if err != nil || strings.HasPrefix(rel, "..") { writeError(w, http.StatusBadRequest, "invalid path"); return }
+	if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+		http.ServeFile(w, r, candidate)
+		return
+	}
+	index := filepath.Join(absoluteRoot, "index.html")
+	if _, err := os.Stat(index); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"service": "enterprise-knowledge-base", "ui": "not-built"})
+		return
+	}
+	http.ServeFile(w, r, index)
+}
+
+func (s *Server) security(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.Token != "" && r.URL.Path != "/health" {
+			if r.Header.Get("Authorization") != "Bearer "+s.Token {
+				writeError(w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, out any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return err
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) { writeJSON(w, status, map[string]any{"error": message}) }
+func methodNotAllowed(w http.ResponseWriter) { writeError(w, http.StatusMethodNotAllowed, "method not allowed") }
+
+func queryInt(r *http.Request, name string, fallback int) int {
+	value := strings.TrimSpace(r.URL.Query().Get(name))
+	if value == "" { return fallback }
+	parsed, err := strconv.Atoi(value)
+	if err != nil { return fallback }
+	return parsed
+}

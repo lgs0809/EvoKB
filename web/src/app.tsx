@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import { Sidebar } from './components/Sidebar';
 import { ArticleView } from './components/ArticleView';
 import { GraphView } from './components/GraphView';
+import { EnterpriseView } from './components/EnterpriseView';
 import { connectHotReload } from './lib/hotreload';
 import './style.css';
 
@@ -70,6 +71,10 @@ export function App() {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
+
+  if (window.location.pathname.startsWith('/enterprise')) {
+    return <EnterpriseView />;
+  }
 
   return (
     <div class="flex h-screen bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100">

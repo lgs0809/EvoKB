@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -12,11 +13,16 @@ import (
 )
 
 type MinIOStore struct {
-	client *minio.Client
-	bucket string
+	client        *minio.Client
+	presignClient *minio.Client
+	bucket        string
 }
 
 func NewMinIOStore(ctx context.Context, endpoint, accessKey, secretKey, bucket string, useTLS bool) (*MinIOStore, error) {
+	return NewMinIOStoreWithPublicEndpoint(ctx, endpoint, "", accessKey, secretKey, bucket, useTLS)
+}
+
+func NewMinIOStoreWithPublicEndpoint(ctx context.Context, endpoint, publicEndpoint, accessKey, secretKey, bucket string, useTLS bool) (*MinIOStore, error) {
 	client, err := minio.New(endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
 		Secure: useTLS,
@@ -33,7 +39,22 @@ func NewMinIOStore(ctx context.Context, endpoint, accessKey, secretKey, bucket s
 			return nil, fmt.Errorf("minio make bucket %q: %w", bucket, err)
 		}
 	}
-	return &MinIOStore{client: client, bucket: bucket}, nil
+	presignClient := client
+	if strings.TrimSpace(publicEndpoint) != "" && strings.TrimSpace(publicEndpoint) != strings.TrimSpace(endpoint) {
+		region, regionErr := client.GetBucketLocation(ctx, bucket)
+		if regionErr != nil {
+			return nil, fmt.Errorf("minio bucket location: %w", regionErr)
+		}
+		presignClient, err = minio.New(publicEndpoint, &minio.Options{
+			Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+			Secure: useTLS,
+			Region: region,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("minio public client: %w", err)
+		}
+	}
+	return &MinIOStore{client: client, presignClient: presignClient, bucket: bucket}, nil
 }
 
 func (s *MinIOStore) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
@@ -68,7 +89,11 @@ func (s *MinIOStore) PresignGet(ctx context.Context, key string, expiry time.Dur
 	if expiry <= 0 {
 		expiry = 15 * time.Minute
 	}
-	u, err := s.client.PresignedGetObject(ctx, s.bucket, key, expiry, url.Values{})
+	client := s.presignClient
+	if client == nil {
+		client = s.client
+	}
+	u, err := client.PresignedGetObject(ctx, s.bucket, key, expiry, url.Values{})
 	if err != nil {
 		return "", fmt.Errorf("minio presign %q: %w", key, err)
 	}
