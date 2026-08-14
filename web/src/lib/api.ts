@@ -229,7 +229,10 @@ export interface EnterpriseEvidenceListItem {
 }
 
 export interface EnterpriseCapabilities {
+  auth: boolean;
+  users: boolean;
   documents: boolean;
+  upload: boolean;
   tasks: boolean;
   evidence: boolean;
   search: boolean;
@@ -323,5 +326,155 @@ export async function packageEnterpriseSources(evidenceIds: string[]): Promise<E
     body: JSON.stringify({ evidence_ids: evidenceIds }),
   });
   if (!res.ok) throw new Error(`Source package request failed: ${res.status}`);
+  return res.json();
+}
+
+export type EnterpriseRole = 'ADMIN' | 'USER';
+
+export interface EnterpriseUser {
+  user_id: string;
+  username: string;
+  display_name: string;
+  role: EnterpriseRole;
+  status: 'ACTIVE' | 'DISABLED';
+  last_login_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EnterpriseAuthStatus {
+  setup_required: boolean;
+  users: number;
+}
+
+export interface EnterpriseUploadResult {
+  document_id: string;
+  version_id: string;
+  version_no: number;
+  reused: boolean;
+  retried: boolean;
+  block_count: number;
+  chunk_count: number;
+  evidence_count: number;
+  original_object_key: string;
+  warnings?: string[];
+}
+
+async function responseError(res: Response, fallback: string): Promise<Error> {
+  try {
+    const payload = await res.json();
+    if (payload?.error) return new Error(String(payload.error));
+  } catch {
+    // Fall through to the status-based message.
+  }
+  return new Error(`${fallback}: ${res.status}`);
+}
+
+export async function fetchEnterpriseAuthStatus(): Promise<EnterpriseAuthStatus> {
+  const res = await fetch(`${BASE}/api/enterprise/auth/status`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Authentication status failed');
+  return res.json();
+}
+
+export async function fetchEnterpriseMe(): Promise<EnterpriseUser> {
+  const res = await fetch(`${BASE}/api/enterprise/auth/me`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Session lookup failed');
+  const payload = await res.json();
+  return payload.user;
+}
+
+export async function setupEnterpriseAdmin(input: { username: string; display_name: string; password: string }): Promise<EnterpriseUser> {
+  const res = await fetch(`${BASE}/api/enterprise/auth/setup`, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...input, role: 'ADMIN' }),
+  });
+  if (!res.ok) throw await responseError(res, 'Initial admin setup failed');
+  const payload = await res.json();
+  return payload.user;
+}
+
+export async function loginEnterprise(username: string, password: string): Promise<EnterpriseUser> {
+  const res = await fetch(`${BASE}/api/enterprise/auth/login`, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!res.ok) throw await responseError(res, 'Login failed');
+  const payload = await res.json();
+  return payload.user;
+}
+
+export async function logoutEnterprise(): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/auth/logout`, { method: 'POST', headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Logout failed');
+}
+
+export async function changeEnterprisePassword(currentPassword: string, newPassword: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/auth/password`, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+  });
+  if (!res.ok) throw await responseError(res, 'Password change failed');
+}
+
+export async function fetchEnterpriseUsers(): Promise<{ users: EnterpriseUser[]; total: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/users`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'User list failed');
+  return res.json();
+}
+
+export async function createEnterpriseUser(input: { username: string; display_name: string; password: string; role: EnterpriseRole }): Promise<EnterpriseUser> {
+  const res = await fetch(`${BASE}/api/enterprise/users`, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await responseError(res, 'Create user failed');
+  const payload = await res.json();
+  return payload.user;
+}
+
+export async function updateEnterpriseUser(userId: string, input: { display_name?: string; role?: EnterpriseRole; status?: 'ACTIVE' | 'DISABLED' }): Promise<EnterpriseUser> {
+  const res = await fetch(`${BASE}/api/enterprise/user?id=${encodeURIComponent(userId)}`, {
+    method: 'PATCH',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await responseError(res, 'Update user failed');
+  const payload = await res.json();
+  return payload.user;
+}
+
+export async function resetEnterpriseUserPassword(userId: string, newPassword: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/user/password/reset`, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, new_password: newPassword }),
+  });
+  if (!res.ok) throw await responseError(res, 'Reset password failed');
+}
+
+export async function uploadEnterpriseDocument(file: File, metadata: {
+  logical_name?: string;
+  source_department?: string;
+  material_category?: string;
+  company?: string;
+  document_type?: string;
+  document_date?: string;
+  tags?: string;
+}): Promise<EnterpriseUploadResult> {
+  const form = new FormData();
+  form.append('file', file, file.name);
+  for (const [key, value] of Object.entries(metadata)) {
+    if (value?.trim()) form.append(key, value.trim());
+  }
+  const res = await fetch(`${BASE}/api/enterprise/upload`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: form,
+  });
+  if (!res.ok) throw await responseError(res, 'Document upload failed');
   return res.json();
 }

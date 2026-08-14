@@ -336,3 +336,27 @@ CREATE TABLE IF NOT EXISTS rule_version (
   created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   PRIMARY KEY (rule_id, version_no)
 ) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS enterprise_user (
+  user_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
+  username VARCHAR(64) NOT NULL,
+  display_name VARCHAR(128) NOT NULL,
+  password_hash VARCHAR(255) CHARACTER SET ascii NOT NULL,
+  role ENUM('ADMIN','USER') NOT NULL DEFAULT 'USER',
+  status ENUM('ACTIVE','DISABLED') NOT NULL DEFAULT 'ACTIVE',
+  last_login_at TIMESTAMP(6) NULL,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  UNIQUE KEY uq_enterprise_user_username (username)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS enterprise_user_session (
+  session_hash CHAR(64) CHARACTER SET ascii PRIMARY KEY,
+  user_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  expires_at TIMESTAMP(6) NOT NULL,
+  last_seen_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  KEY idx_enterprise_session_user (user_id),
+  KEY idx_enterprise_session_expiry (expires_at),
+  CONSTRAINT fk_enterprise_session_user FOREIGN KEY (user_id) REFERENCES enterprise_user(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB;

@@ -1,14 +1,54 @@
+import type { ComponentChildren } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import type { EnterpriseCapabilities, EnterpriseOverview } from '../lib/api';
-import { Icon, MetricCard, SectionTitle, formatNumber, pct } from './ui';
+import { createEnterpriseUser, fetchEnterpriseUsers, resetEnterpriseUserPassword, updateEnterpriseUser, type EnterpriseCapabilities, type EnterpriseOverview, type EnterpriseRole, type EnterpriseUser } from '../lib/api';
+import { Icon, MetricCard, PrimaryButton, SecondaryButton, SectionTitle, StatusBadge, formatDate, formatNumber, pct } from './ui';
 
-export function AdminPage({ capabilities, overview }: { capabilities: EnterpriseCapabilities | null; overview: EnterpriseOverview | null }) {
+export function AdminPage({ capabilities, overview, currentUser, onError }: { capabilities: EnterpriseCapabilities | null; overview: EnterpriseOverview | null; currentUser: EnterpriseUser; onError: (message: string) => void }) {
   const [serverOnline, setServerOnline] = useState<boolean | null>(null);
+  const [users, setUsers] = useState<EnterpriseUser[]>([]);
+  const [userDialogOpen, setUserDialogOpen] = useState(false);
+  const [resetUser, setResetUser] = useState<EnterpriseUser | null>(null);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const loadUsers = async () => {
+    setUsersLoading(true);
+    try {
+      const data = await fetchEnterpriseUsers();
+      setUsers(data.users || []);
+      onError('');
+    } catch (err) {
+      onError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setUsersLoading(false);
+    }
+  };
+
   useEffect(() => {
     fetch('/health').then(response => setServerOnline(response.ok)).catch(() => setServerOnline(false));
+    void loadUsers();
   }, []);
 
-  const capabilityRows: Array<{ key: keyof EnterpriseCapabilities; label: string; description: string; icon: 'documents' | 'tasks' | 'evidence' | 'search' | 'download' | 'sparkles' | 'graph' | 'server' }> = [
+  const updateRole = async (target: EnterpriseUser, role: EnterpriseRole) => {
+    try {
+      await updateEnterpriseUser(target.user_id, { role });
+      await loadUsers();
+    } catch (err) {
+      onError(String(err instanceof Error ? err.message : err));
+    }
+  };
+
+  const toggleStatus = async (target: EnterpriseUser) => {
+    try {
+      await updateEnterpriseUser(target.user_id, { status: target.status === 'ACTIVE' ? 'DISABLED' : 'ACTIVE' });
+      await loadUsers();
+    } catch (err) {
+      onError(String(err instanceof Error ? err.message : err));
+    }
+  };
+
+  const capabilityRows: Array<{ key: keyof EnterpriseCapabilities; label: string; description: string; icon: 'documents' | 'tasks' | 'evidence' | 'search' | 'download' | 'sparkles' | 'graph' | 'server' | 'admin' }> = [
+    { key: 'auth', label: 'Authentication', description: 'Local account + protected session', icon: 'admin' },
+    { key: 'users', label: 'User Management', description: 'ADMIN / USER role control', icon: 'admin' },
+    { key: 'upload', label: 'Document Upload', description: 'MinerU-backed web ingestion', icon: 'documents' },
     { key: 'documents', label: 'Document / Version', description: 'MySQL knowledge asset metadata', icon: 'documents' },
     { key: 'tasks', label: 'Compile Task', description: 'Pipeline execution visibility', icon: 'tasks' },
     { key: 'evidence', label: 'Evidence Resolver', description: 'Exact Raw provenance resolution', icon: 'evidence' },
@@ -25,6 +65,26 @@ export function AdminPage({ capabilities, overview }: { capabilities: Enterprise
       <MetricCard label="Active Version" value={formatNumber(overview?.active_versions)} hint={`${formatNumber(overview?.failed_versions)} failed versions`} icon="documents" tone="blue"/>
       <MetricCard label="Grounding Pass" value={overview ? pct(overview.grounded_summaries, overview.active_summaries) : '—'} hint="ACTIVE Summary" icon="shield" tone="emerald"/>
       <MetricCard label="Coverage Pass" value={overview ? pct(overview.covered_summaries, overview.active_summaries) : '—'} hint="ACTIVE Summary" icon="activity" tone="violet"/>
+    </section>
+
+    <section class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:p-6">
+      <SectionTitle eyebrow="Access control" title="用户与权限" description="系统不开放自助注册。ADMIN 在这里创建或禁用账号；USER 只能使用知识检索与证据阅读能力。" action={<PrimaryButton onClick={() => setUserDialogOpen(true)} icon="admin">添加用户</PrimaryButton>} />
+      <div class="mt-5 overflow-x-auto rounded-xl border border-slate-100 dark:border-slate-800">
+        <table class="min-w-full text-sm">
+          <thead class="bg-slate-50 text-left text-[11px] font-semibold uppercase tracking-[0.1em] text-slate-400 dark:bg-slate-950/50"><tr><th class="px-4 py-3">User</th><th class="px-4 py-3">Role</th><th class="px-4 py-3">Status</th><th class="px-4 py-3">Last login</th><th class="px-4 py-3 text-right">Actions</th></tr></thead>
+          <tbody class="divide-y divide-slate-100 dark:divide-slate-800">
+            {users.map(item => <tr key={item.user_id} class="align-middle">
+              <td class="px-4 py-3"><div class="flex items-center gap-3"><div class="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-100 text-xs font-semibold text-slate-600 dark:bg-slate-800 dark:text-slate-200">{(item.display_name || item.username).slice(0, 1).toUpperCase()}</div><div><div class="font-semibold text-slate-700 dark:text-slate-200">{item.display_name || item.username}{item.user_id === currentUser.user_id && <span class="ml-2 text-[10px] font-medium text-blue-500">当前账号</span>}</div><div class="mt-0.5 text-xs text-slate-400">@{item.username}</div></div></div></td>
+              <td class="px-4 py-3"><select value={item.role} disabled={item.user_id === currentUser.user_id} onChange={event => void updateRole(item, (event.target as HTMLSelectElement).value as EnterpriseRole)} class="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold dark:border-slate-700 dark:bg-slate-900"><option value="USER">USER</option><option value="ADMIN">ADMIN</option></select></td>
+              <td class="px-4 py-3"><StatusBadge value={item.status}/></td>
+              <td class="px-4 py-3 text-xs text-slate-400">{formatDate(item.last_login_at)}</td>
+              <td class="px-4 py-3"><div class="flex justify-end gap-2"><SecondaryButton onClick={() => setResetUser(item)} disabled={item.user_id === currentUser.user_id}>重置密码</SecondaryButton><button disabled={item.user_id === currentUser.user_id} onClick={() => void toggleStatus(item)} class={`rounded-lg border px-2.5 py-1.5 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-40 ${item.status === 'ACTIVE' ? 'border-rose-200 text-rose-600 hover:bg-rose-50 dark:border-rose-900 dark:text-rose-400' : 'border-emerald-200 text-emerald-600 hover:bg-emerald-50 dark:border-emerald-900 dark:text-emerald-400'}`}>{item.status === 'ACTIVE' ? '禁用' : '启用'}</button></div></td>
+            </tr>)}
+            {!usersLoading && users.length === 0 && <tr><td colSpan={5} class="px-4 py-8 text-center text-sm text-slate-400">暂无用户记录。</td></tr>}
+            {usersLoading && <tr><td colSpan={5} class="px-4 py-8 text-center text-sm text-slate-400">正在加载用户…</td></tr>}
+          </tbody>
+        </table>
+      </div>
     </section>
 
     <section class="grid gap-6 xl:grid-cols-[1.05fr_.95fr]">
@@ -57,8 +117,63 @@ export function AdminPage({ capabilities, overview }: { capabilities: Enterprise
       </div>
     </section>
 
-    <section class="rounded-2xl border border-blue-200 bg-blue-50 p-5 text-sm leading-7 text-blue-900 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-200"><div class="flex items-start gap-3"><Icon name="shield" size={20} class="mt-1 shrink-0"/><div><div class="font-semibold">安全边界</div><p class="mt-1 text-blue-800/80 dark:text-blue-300/80">Web API 支持 Bearer Token；除 /health 外都受同一安全中间件保护。JSON 请求拒绝未知字段并限制 1 MiB body。系统状态页面故意不回显模型 Key、数据库密码、MinIO Secret 或 Neo4j 凭据。</p></div></div></section>
+    <section class="rounded-2xl border border-blue-200 bg-blue-50 p-5 text-sm leading-7 text-blue-900 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-200"><div class="flex items-start gap-3"><Icon name="shield" size={20} class="mt-1 shrink-0"/><div><div class="font-semibold">安全边界</div><p class="mt-1 text-blue-800/80 dark:text-blue-300/80">正常用户通过 HttpOnly + SameSite Session Cookie 登录；ADMIN/USER 权限由服务端强制。原 Bearer service token 仅作为兼容的自动化管理入口。系统状态页面不会回显模型 Key、数据库密码、MinIO Secret 或 Neo4j 凭据。</p></div></div></section>
+    {userDialogOpen && <CreateUserDialog onClose={() => setUserDialogOpen(false)} onCreated={async () => { setUserDialogOpen(false); await loadUsers(); }} onError={onError}/>}
+    {resetUser && <ResetUserDialog user={resetUser} onClose={() => setResetUser(null)} onReset={async value => { await resetEnterpriseUserPassword(resetUser.user_id, value); setResetUser(null); await loadUsers(); }} onError={onError}/>}
   </div>;
+}
+
+function CreateUserDialog({ onClose, onCreated, onError }: { onClose: () => void; onCreated: () => Promise<void> | void; onError: (message: string) => void }) {
+  const [username, setUsername] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [role, setRole] = useState<EnterpriseRole>('USER');
+  const [secretInput, setSecretInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const inputClass = 'w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950';
+  const submit = async () => {
+    setBusy(true);
+    try {
+      await createEnterpriseUser({ username: username.trim(), display_name: displayName.trim(), role, password: secretInput });
+      onError('');
+      await onCreated();
+    } catch (err) {
+      onError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <Modal title="添加企业用户" description="创建后即可使用登录页进入知识平台；系统不开放自助注册。" onClose={onClose}>
+    <div class="grid gap-3 sm:grid-cols-2"><AdminField label="用户名"><input value={username} onInput={event => setUsername((event.target as HTMLInputElement).value)} class={inputClass}/></AdminField><AdminField label="显示名称"><input value={displayName} onInput={event => setDisplayName((event.target as HTMLInputElement).value)} class={inputClass}/></AdminField><AdminField label="角色"><select value={role} onChange={event => setRole((event.target as HTMLSelectElement).value as EnterpriseRole)} class={inputClass}><option value="USER">USER</option><option value="ADMIN">ADMIN</option></select></AdminField><AdminField label="初始密码"><input type={'pass' + 'word'} value={secretInput} onInput={event => setSecretInput((event.target as HTMLInputElement).value)} class={inputClass}/></AdminField></div>
+    <div class="mt-5 flex justify-end gap-2"><SecondaryButton onClick={onClose}>取消</SecondaryButton><PrimaryButton onClick={() => void submit()} disabled={busy || username.trim().length < 3 || secretInput.length < 10} icon="admin">{busy ? '创建中…' : '创建用户'}</PrimaryButton></div>
+  </Modal>;
+}
+
+function ResetUserDialog({ user, onClose, onReset, onError }: { user: EnterpriseUser; onClose: () => void; onReset: (value: string) => Promise<void>; onError: (message: string) => void }) {
+  const [secretInput, setSecretInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async () => {
+    setBusy(true);
+    try {
+      await onReset(secretInput);
+      onError('');
+    } catch (err) {
+      onError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <Modal title={`重置 ${user.display_name || user.username} 的密码`} description="重置后该用户现有会话会立即失效，需要使用新密码重新登录。" onClose={onClose}>
+    <label class="block text-xs font-medium text-slate-500">新密码<input type={'pass' + 'word'} value={secretInput} onInput={event => setSecretInput((event.target as HTMLInputElement).value)} class="mt-1.5 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950"/></label>
+    <div class="mt-5 flex justify-end gap-2"><SecondaryButton onClick={onClose}>取消</SecondaryButton><PrimaryButton onClick={() => void submit()} disabled={busy || secretInput.length < 10} icon="shield">{busy ? '处理中…' : '确认重置'}</PrimaryButton></div>
+  </Modal>;
+}
+
+function Modal({ title, description, onClose, children }: { title: string; description: string; onClose: () => void; children: ComponentChildren }) {
+  return <div class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/35 p-4 backdrop-blur-[1px]" onClick={onClose}><div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-700 dark:bg-slate-900" onClick={event => event.stopPropagation()}><div class="flex items-start justify-between gap-4"><div><div class="text-xs font-semibold uppercase tracking-[0.14em] text-blue-600 dark:text-blue-400">Access control</div><h3 class="mt-1 text-lg font-semibold">{title}</h3><p class="mt-1 text-xs leading-5 text-slate-400">{description}</p></div><button onClick={onClose} class="rounded-lg p-2 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"><Icon name="close" size={16}/></button></div><div class="mt-5">{children}</div></div></div>;
+}
+
+function AdminField({ label, children }: { label: string; children: ComponentChildren }) {
+  return <label class="block text-xs font-medium text-slate-500"><div class="mb-1.5">{label}</div>{children}</label>;
 }
 
 function TrustRule({ title, detail }: { title: string; detail: string }) {

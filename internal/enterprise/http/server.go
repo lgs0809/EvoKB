@@ -13,25 +13,41 @@ import (
 
 	enterpriseadmin "github.com/xoai/sage-wiki/internal/enterprise/admin"
 	enterpriseapi "github.com/xoai/sage-wiki/internal/enterprise/api"
+	enterpriseauth "github.com/xoai/sage-wiki/internal/enterprise/auth"
 	enterpriseevidence "github.com/xoai/sage-wiki/internal/enterprise/evidence"
 	enterprisegraph "github.com/xoai/sage-wiki/internal/enterprise/graph"
 	enterprisepromotion "github.com/xoai/sage-wiki/internal/enterprise/promotion"
+	"github.com/xoai/sage-wiki/internal/enterprise/raw"
 )
 
 type Server struct {
-	Admin     *enterpriseadmin.MySQLStore
-	API       *enterpriseapi.Service
-	Promotion *enterprisepromotion.MySQLStore
-	Resolver  *enterpriseevidence.Resolver
-	Publisher *enterpriseevidence.Publisher
-	Graph     *enterprisegraph.Neo4jClient
-	WebDir    string
-	Token     string
+	Admin               *enterpriseadmin.MySQLStore
+	API                 *enterpriseapi.Service
+	Auth                *enterpriseauth.Store
+	Promotion           *enterprisepromotion.MySQLStore
+	Resolver            *enterpriseevidence.Resolver
+	Publisher           *enterpriseevidence.Publisher
+	Graph               *enterprisegraph.Neo4jClient
+	Ingest              *raw.Engine
+	WebDir              string
+	Token               string
+	SessionCookieSecure bool
+	MaxUploadBytes      int64
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/enterprise/auth/status", s.handleAuthStatus)
+	mux.HandleFunc("/api/enterprise/auth/setup", s.handleAuthSetup)
+	mux.HandleFunc("/api/enterprise/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/enterprise/auth/me", s.handleAuthMe)
+	mux.HandleFunc("/api/enterprise/auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("/api/enterprise/auth/password", s.handleAuthPassword)
+	mux.HandleFunc("/api/enterprise/users", s.handleUsers)
+	mux.HandleFunc("/api/enterprise/user", s.handleUserUpdate)
+	mux.HandleFunc("/api/enterprise/user/password/reset", s.handleUserPasswordReset)
+	mux.HandleFunc("/api/enterprise/upload", s.handleUpload)
 	mux.HandleFunc("/api/enterprise/overview", s.handleOverview)
 	mux.HandleFunc("/api/enterprise/tasks", s.handleTasks)
 	mux.HandleFunc("/api/enterprise/evidences", s.handleEvidences)
@@ -56,8 +72,8 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 		Addr:              addr,
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      15 * time.Minute,
+		ReadTimeout:       10 * time.Minute,
+		WriteTimeout:      30 * time.Minute,
 		IdleTimeout:       90 * time.Second,
 	}
 	errCh := make(chan error, 1)
@@ -109,6 +125,9 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if !requireAdmin(w, r) {
+		return
+	}
 	items, err := s.Admin.ListCompileTasks(r.Context(), queryInt(r, "limit", 200))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -145,8 +164,14 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	if !requireAdmin(w, r) {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"auth":            s.Auth != nil,
+		"users":           s.Auth != nil,
 		"documents":       s.Admin != nil,
+		"upload":          s.Ingest != nil,
 		"tasks":           s.Admin != nil,
 		"evidence":        s.Resolver != nil,
 		"search":          s.API != nil,
@@ -184,6 +209,9 @@ func (s *Server) handleDistill(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeError(w, http.StatusServiceUnavailable, "distill unavailable")
 		}
+		return
+	}
+	if !requireAdmin(w, r) {
 		return
 	}
 	var req struct {
@@ -374,14 +402,48 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) security(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.Token != "" && r.URL.Path != "/health" {
-			if r.Header.Get("Authorization") != "Bearer "+s.Token {
-				writeError(w, http.StatusUnauthorized, "unauthorized")
-				return
-			}
+		path := r.URL.Path
+		if path == "/health" || !strings.HasPrefix(path, "/api/enterprise/") || isPublicAuthPath(path) {
+			next.ServeHTTP(w, r)
+			return
 		}
-		next.ServeHTTP(w, r)
+		if s.Token != "" && r.Header.Get("Authorization") == "Bearer "+s.Token {
+			user := enterpriseauth.User{
+				UserID:      "legacy-service-token",
+				Username:    "service-token",
+				DisplayName: "Service Token",
+				Role:        enterpriseauth.RoleAdmin,
+				Status:      "ACTIVE",
+			}
+			next.ServeHTTP(w, withPrincipal(r, user))
+			return
+		}
+		if s.Auth == nil {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		cookie, err := r.Cookie(sessionCookieName)
+		if err != nil || strings.TrimSpace(cookie.Value) == "" {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		user, err := s.Auth.Authenticate(r.Context(), cookie.Value)
+		if err != nil {
+			s.clearSessionCookie(w)
+			writeError(w, http.StatusUnauthorized, "session expired or invalid")
+			return
+		}
+		next.ServeHTTP(w, withPrincipal(r, user))
 	})
+}
+
+func isPublicAuthPath(path string) bool {
+	switch path {
+	case "/api/enterprise/auth/status", "/api/enterprise/auth/setup", "/api/enterprise/auth/login":
+		return true
+	default:
+		return false
+	}
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, out any) error {

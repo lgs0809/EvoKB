@@ -36,6 +36,21 @@ Embedding/Reranker  http://127.0.0.1:18081
 
 The Compose deployment does not require a local Summary LLM. Summary and Wiki compilers accept an OpenAI-compatible external provider when configured.
 
+### First login and access control
+
+Open `http://127.0.0.1:18080/enterprise`. If the user table is empty, the UI shows a one-time setup form that creates the first `ADMIN`. After that setup completes, public self-registration is closed: only an `ADMIN` can create, disable, re-enable, promote, demote, or reset another account from **System Management**.
+
+The normal browser login uses an HttpOnly, SameSite session cookie. Only a SHA-256 representation of the random session value is persisted in MySQL, and account passwords are stored as bcrypt hashes. Changing or administratively resetting a password invalidates existing sessions. The last active `ADMIN` cannot be disabled or demoted.
+
+Roles are intentionally small for V1:
+
+- `USER`: Dashboard, Knowledge Search, Documents read-only views, Wiki, Graph, Evidence Center, and `package_sources`.
+- `ADMIN`: everything above plus document upload/ingestion, Distillation recommendation, Tasks, System Management, and user administration.
+
+`EKB_SERVER_TOKEN` remains supported only as a compatibility service credential for automation and local operational smoke. It maps to an administrative service principal and is not the normal human login flow.
+
+Session and upload runtime options are non-secret configuration: `EKB_SESSION_TTL_HOURS` (default `12`), `EKB_SESSION_COOKIE_SECURE` (enable behind HTTPS), `EKB_MAX_UPLOAD_MIB` (default `512`), and `EKB_MINERU_URL`.
+
 ## CLI
 
 ```bash
@@ -67,12 +82,12 @@ Open `/enterprise` on the knowledge server. The existing Sage-Wiki Preact/Vite/T
 
 - Dashboard: real Document/Version, Raw Block, Evidence, Summary, Wiki, Graph, effective-hit, task, Grounding and Coverage health indicators. It does not invent a composite AI confidence score when no real sample exists.
 - Knowledge Search: Raw/Summary/Wiki/Graph results after the unified rerank, with Metadata Filters and a visible Raw Evidence chain. The page deliberately exposes Knowledge + Evidence rather than pretending the retrieval service produced the final Agent answer.
-- Documents: searchable Version lifecycle, metadata, Summary quality gates, effective usage, Version history, and manual high-value Distillation recommendation.
+- Documents: searchable Version lifecycle, metadata, Summary quality gates, effective usage, Version history, and ADMIN-only high-value Distillation recommendation. ADMIN can also upload a file with enterprise metadata; the Web path calls the real MinerU -> Raw Block -> Embedding -> OpenSearch ingestion pipeline rather than a browser-only staging flow.
 - Enterprise Wiki: encyclopedia-style Claim reading, section navigation, Fact references, Grounding/Temporal status, and Raw Evidence citations.
 - Graph: a relation browser plus a lightweight graph view over bounded 1-2 hop relations with ACTIVE Evidence Support.
 - Evidence Center: searchable Raw provenance, exact Version/location/excerpt, active-state filtering, and multi-Evidence source-package delivery.
-- Tasks: compile-task state, attempts, timestamps and failures. The V1 UI is intentionally read-only here rather than offering a retry action without an explicit idempotency contract.
-- System Status: safe runtime capability wiring, storage responsibilities, and trust-contract visibility. Secrets and connection credentials are never returned by this page.
+- Tasks: ADMIN-only compile-task state, attempts, timestamps and failures. The V1 UI is intentionally read-only here rather than offering a retry action without an explicit idempotency contract.
+- System Management: ADMIN-only account lifecycle, roles, runtime capability wiring, storage responsibilities, and trust-contract visibility. Secrets and connection credentials are never returned by this page.
 - Evidence drawer: exact document/version, object key, page/block/bbox location, Raw content, and copy support.
 
 Enterprise sub-routes (`/enterprise/search`, `/enterprise/documents`, `/enterprise/wiki`, `/enterprise/graph`, `/enterprise/evidence`, `/enterprise/tasks`, and `/enterprise/admin`) use the same SPA fallback and can be opened directly.

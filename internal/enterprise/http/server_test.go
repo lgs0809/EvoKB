@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	enterpriseauth "github.com/xoai/sage-wiki/internal/enterprise/auth"
 )
 
 func TestSecurityRequiresBearerTokenExceptHealth(t *testing.T) {
@@ -32,6 +34,46 @@ func TestSecurityRequiresBearerTokenExceptHealth(t *testing.T) {
 	handler.ServeHTTP(authorized, authorizedRequest)
 	if authorized.Code != http.StatusServiceUnavailable {
 		t.Fatalf("authorized status=%d want=%d", authorized.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestPublicAuthStatusIsNotBlockedBySecurity(t *testing.T) {
+	srv := &Server{Token: "test-token"}
+	recorder := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/enterprise/auth/status", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=%d", recorder.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestAnonymousEnterpriseAPIIsUnauthorizedWithoutLegacyToken(t *testing.T) {
+	srv := &Server{}
+	recorder := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/enterprise/capabilities", nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d want=%d", recorder.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestUserPrincipalCannotAccessAdminCapability(t *testing.T) {
+	srv := &Server{}
+	request := httptest.NewRequest(http.MethodGet, "/api/enterprise/capabilities", nil)
+	request = withPrincipal(request, enterpriseauth.User{UserID: "user-1", Role: enterpriseauth.RoleUser, Status: "ACTIVE"})
+	recorder := httptest.NewRecorder()
+	srv.handleCapabilities(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status=%d want=%d", recorder.Code, http.StatusForbidden)
+	}
+}
+
+func TestLegacyServiceTokenGetsAdminPrincipal(t *testing.T) {
+	srv := &Server{Token: "test-token"}
+	request := httptest.NewRequest(http.MethodGet, "/api/enterprise/capabilities", nil)
+	request.Header.Set("Authorization", "Bearer test-token")
+	recorder := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
 }
 

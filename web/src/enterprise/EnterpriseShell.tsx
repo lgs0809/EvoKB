@@ -1,18 +1,19 @@
 import type { ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
+import type { EnterpriseUser } from '../lib/api';
 import { Icon, type IconName } from './ui';
 
 export type EnterpriseSection = 'dashboard' | 'search' | 'documents' | 'wiki' | 'graph' | 'evidence' | 'tasks' | 'admin';
 
-const navigation: Array<{ id: EnterpriseSection; label: string; description: string; icon: IconName }> = [
+const navigation: Array<{ id: EnterpriseSection; label: string; description: string; icon: IconName; adminOnly?: boolean }> = [
   { id: 'dashboard', label: '总览', description: 'Knowledge health', icon: 'dashboard' },
   { id: 'search', label: '知识检索', description: 'Evidence-first search', icon: 'search' },
   { id: 'documents', label: '文档资产', description: 'Versions & lifecycle', icon: 'documents' },
   { id: 'wiki', label: '企业百科', description: 'Claims & citations', icon: 'wiki' },
   { id: 'graph', label: '关系图谱', description: 'Evidence-backed graph', icon: 'graph' },
   { id: 'evidence', label: '证据中心', description: 'Raw provenance', icon: 'evidence' },
-  { id: 'tasks', label: '任务中心', description: 'Compile pipeline', icon: 'tasks' },
-  { id: 'admin', label: '系统状态', description: 'Runtime capabilities', icon: 'admin' },
+  { id: 'tasks', label: '任务中心', description: 'Compile pipeline', icon: 'tasks', adminOnly: true },
+  { id: 'admin', label: '系统管理', description: 'Users & runtime', icon: 'admin', adminOnly: true },
 ];
 
 const pageMeta: Record<EnterpriseSection, { title: string; description: string }> = {
@@ -23,19 +24,24 @@ const pageMeta: Record<EnterpriseSection, { title: string; description: string }
   graph: { title: '关系图谱', description: '只浏览拥有 ACTIVE Evidence Support 的企业关系，支持 1–2 hop 有界扩展。' },
   evidence: { title: 'Evidence Center', description: '所有高阶知识的可信根：Document Version、原始位置与原始内容。' },
   tasks: { title: '知识编译任务', description: '查看解析、编译和知识更新任务的状态、耗时与失败原因。' },
-  admin: { title: '系统状态', description: '检查企业知识库运行能力与关键质量门，不展示任何敏感凭据。' },
+  admin: { title: '系统管理', description: '管理企业账号、运行能力与关键质量门，不展示任何敏感凭据。' },
 };
 
-export function EnterpriseShell({ section, onNavigate, children, error, busy, onRefresh }: {
+export function EnterpriseShell({ section, onNavigate, children, error, busy, onRefresh, user, onLogout, onChangePassword }: {
   section: EnterpriseSection;
   onNavigate: (section: EnterpriseSection) => void;
   children: ComponentChildren;
   error?: string;
   busy?: boolean;
   onRefresh?: () => void;
+  user: EnterpriseUser;
+  onLogout: () => void;
+  onChangePassword: () => void;
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
   const meta = pageMeta[section];
+  const visibleNavigation = navigation.filter(item => !item.adminOnly || user.role === 'ADMIN');
 
   const navigate = (next: EnterpriseSection) => {
     onNavigate(next);
@@ -57,7 +63,7 @@ export function EnterpriseShell({ section, onNavigate, children, error, busy, on
 
       <nav class="flex-1 space-y-1 overflow-y-auto px-3 py-5">
         <div class="mb-2 px-3 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400">Knowledge workspace</div>
-        {navigation.map(item => {
+        {visibleNavigation.map(item => {
           const active = item.id === section;
           return <button key={item.id} onClick={() => navigate(item.id)} class={`group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition ${active ? 'bg-slate-950 text-white shadow-sm dark:bg-white dark:text-slate-950' : 'text-slate-600 hover:bg-slate-100 hover:text-slate-950 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'}`}>
             <div class={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${active ? 'bg-white/10 dark:bg-slate-950/10' : 'bg-slate-100 text-slate-500 group-hover:bg-white dark:bg-slate-800 dark:text-slate-400 dark:group-hover:bg-slate-700'}`}><Icon name={item.icon} size={18} /></div>
@@ -80,6 +86,17 @@ export function EnterpriseShell({ section, onNavigate, children, error, busy, on
             {onRefresh && <button onClick={onRefresh} disabled={busy} title="刷新当前数据" class="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 shadow-sm transition hover:text-slate-900 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400 dark:hover:text-white"><Icon name="refresh" class={busy ? 'animate-spin' : ''} /></button>}
             <button onClick={toggleTheme} title="切换明暗主题" class="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 shadow-sm transition hover:text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400 dark:hover:text-white"><Icon name="sparkles" /></button>
             <button onClick={() => navigate('search')} class="hidden items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-950 sm:flex dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:text-white"><Icon name="search" size={16} />搜索知识</button>
+            <div class="relative">
+              <button onClick={() => setAccountOpen(value => !value)} class="flex items-center gap-2 rounded-xl border border-slate-200 bg-white p-1.5 pr-2.5 shadow-sm transition hover:border-slate-300 dark:border-slate-700 dark:bg-slate-900">
+                <div class="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-950 text-xs font-semibold text-white dark:bg-white dark:text-slate-950">{(user.display_name || user.username).slice(0, 1).toUpperCase()}</div>
+                <div class="hidden text-left md:block"><div class="max-w-28 truncate text-xs font-semibold text-slate-700 dark:text-slate-200">{user.display_name || user.username}</div><div class="text-[10px] uppercase tracking-wide text-slate-400">{user.role}</div></div>
+              </button>
+              {accountOpen && <div class="absolute right-0 top-12 z-50 w-56 overflow-hidden rounded-2xl border border-slate-200 bg-white p-2 shadow-xl shadow-slate-200/50 dark:border-slate-700 dark:bg-slate-900 dark:shadow-none">
+                <div class="border-b border-slate-100 px-3 py-2.5 dark:border-slate-800"><div class="truncate text-sm font-semibold">{user.display_name || user.username}</div><div class="mt-0.5 truncate text-xs text-slate-400">@{user.username} · {user.role}</div></div>
+                <button onClick={() => { setAccountOpen(false); onChangePassword(); }} class="mt-1 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-slate-600 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800"><Icon name="shield" size={15}/>修改密码</button>
+                <button onClick={() => { setAccountOpen(false); onLogout(); }} class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/30"><Icon name="arrow" size={15}/>退出登录</button>
+              </div>}
+            </div>
           </div>
         </div>
       </header>
