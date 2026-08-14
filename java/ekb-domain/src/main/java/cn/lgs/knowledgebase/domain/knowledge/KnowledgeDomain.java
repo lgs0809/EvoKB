@@ -128,13 +128,18 @@ public final class KnowledgeDomain {
         }
 
         public static Evidence fromBlock(String documentId, String objectKey, RawBlock block) {
-            String hash = sha256(block.content());
-            String id = "ev_" + sha256(documentId + "\u0000" + block.versionId() + "\u0000" + block.id() + "\u0000" + hash).substring(0, 32);
+            String id = deterministicUuid("evidence:" + block.versionId() + ":" + block.id());
+            Map<String, Object> location = new java.util.LinkedHashMap<>();
+            location.put("block_id", block.id());
+            location.put("block_no", block.blockNo());
+            location.put("block_type", block.blockType());
+            location.put("heading_path", block.headingPath());
+            location.put("page_start", block.pageStart());
+            location.put("page_end", block.pageEnd());
+            location.put("bbox", block.bbox());
+            location.put("page_size", block.pageSize());
             return new Evidence(id, documentId, block.versionId(), block.id(), objectKey,
-                    Map.of("page_start", block.pageStart() == null ? -1 : block.pageStart(),
-                           "page_end", block.pageEnd() == null ? -1 : block.pageEnd(),
-                           "bbox", block.bbox(), "page_size", block.pageSize()),
-                    block.content(), hash);
+                    location, block.content(), block.contentHash());
         }
     }
 
@@ -148,6 +153,20 @@ public final class KnowledgeDomain {
     public static String sha256(String value) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    public static String deterministicUuid(String seed) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(seed.getBytes(StandardCharsets.UTF_8));
+            byte[] bytes = java.util.Arrays.copyOf(digest, 16);
+            bytes[6] = (byte) ((bytes[6] & 0x0f) | 0x40);
+            bytes[8] = (byte) ((bytes[8] & 0x3f) | 0x80);
+            String hex = HexFormat.of().formatHex(bytes);
+            return hex.substring(0, 8) + "-" + hex.substring(8, 12) + "-" + hex.substring(12, 16) + "-"
+                    + hex.substring(16, 20) + "-" + hex.substring(20);
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e);
         }

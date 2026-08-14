@@ -81,6 +81,20 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
     }
 
     @Override
+    public void resetFailedVersion(String versionId, Metadata metadata) {
+        transactions.executeWithoutResult(status -> {
+            int rows = jdbc.update("UPDATE document_version SET lifecycle='PENDING',failure_code=NULL,failure_message=NULL," +
+                            "markdown_object_key=NULL,structured_object_key=NULL,parser_name=NULL,parser_version=NULL,parsed_at=NULL,activated_at=NULL " +
+                            "WHERE version_id=? AND lifecycle='FAILED'", versionId);
+            if (rows != 1) throw new IllegalStateException("version is not FAILED: " + versionId);
+            jdbc.update("UPDATE evidence SET active=FALSE WHERE version_id=?", versionId);
+            jdbc.update("UPDATE document_metadata SET source_department=?,material_category=?,manual_tags=?,company=?,document_date=?,auto_document_type=? WHERE version_id=?",
+                    nullable(metadata.sourceDepartment()), nullable(metadata.materialCategory()), json(metadata.manualTags()), nullable(metadata.company()),
+                    metadata.documentDate(), nullable(metadata.documentType()), versionId);
+        });
+    }
+
+    @Override
     public void saveParsed(String versionId, String markdownKey, String structuredKey, String parserName, String parserVersion,
                            List<RawBlock> blocks, List<Evidence> evidence) {
         transactions.executeWithoutResult(status -> {
