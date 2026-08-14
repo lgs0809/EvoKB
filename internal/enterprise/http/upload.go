@@ -23,7 +23,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if !requireAdmin(w, r) {
+	if !s.requireUploadPermission(w, r) {
 		return
 	}
 	maxBytes := s.MaxUploadBytes

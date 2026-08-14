@@ -44,6 +44,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/enterprise/auth/me", s.handleAuthMe)
 	mux.HandleFunc("/api/enterprise/auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("/api/enterprise/auth/password", s.handleAuthPassword)
+	mux.HandleFunc("/api/enterprise/access", s.handleAccess)
 	mux.HandleFunc("/api/enterprise/users", s.handleUsers)
 	mux.HandleFunc("/api/enterprise/user", s.handleUserUpdate)
 	mux.HandleFunc("/api/enterprise/user/password/reset", s.handleUserPasswordReset)

@@ -4,11 +4,12 @@ import { recommendEnterpriseDistill, uploadEnterpriseDocument, type EnterpriseDo
 import type { EnterpriseSection } from './EnterpriseShell';
 import { EmptyState, Icon, PrimaryButton, SecondaryButton, SectionTitle, StatusBadge, formatDate, shortID } from './ui';
 
-export function DocumentsPage({ documents, onReload, onNavigate, onError, isAdmin }: {
+export function DocumentsPage({ documents, onReload, onNavigate, onError, canUpload, isAdmin }: {
   documents: EnterpriseDocumentVersion[];
   onReload: () => Promise<void> | void;
   onNavigate: (section: EnterpriseSection) => void;
   onError: (message: string) => void;
+  canUpload: boolean;
   isAdmin: boolean;
 }) {
   const [query, setQuery] = useState('');
@@ -45,7 +46,7 @@ export function DocumentsPage({ documents, onReload, onNavigate, onError, isAdmi
 
   return <div class="space-y-6">
     <section class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-      <SectionTitle eyebrow="Knowledge assets" title="文档与版本" description="每个 Document 可以有多个 Version；只有 ACTIVE Version 的 Raw Evidence 进入当前可信知识链。" action={isAdmin ? <PrimaryButton onClick={() => { setUploadResult(null); setUploadOpen(true); }} icon="documents">添加文件</PrimaryButton> : undefined} />
+      <SectionTitle eyebrow="Knowledge assets" title="文档与版本" description="每个 Document 可以有多个 Version；只有 ACTIVE Version 的 Raw Evidence 进入当前可信知识链。" action={canUpload ? <PrimaryButton onClick={() => { setUploadResult(null); setUploadOpen(true); }} icon="documents">添加文件</PrimaryButton> : undefined} />
       <div class="mt-5 flex flex-col gap-3 md:flex-row">
         <div class="relative flex-1"><Icon name="search" size={16} class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"/><input value={query} onInput={event => setQuery((event.target as HTMLInputElement).value)} placeholder="搜索文件名、公司、文档类型或部门" class="w-full rounded-xl border border-slate-200 bg-slate-50 py-2.5 pl-9 pr-3 text-sm outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950"/></div>
         <div class="flex gap-2 overflow-x-auto">{['ALL', 'ACTIVE', 'PENDING', 'FAILED', 'INACTIVE'].map(item => <button key={item} onClick={() => setStatus(item)} class={`whitespace-nowrap rounded-xl px-3 py-2 text-xs font-semibold transition ${status === item ? 'bg-slate-950 text-white dark:bg-white dark:text-slate-950' : 'bg-slate-100 text-slate-500 hover:text-slate-900 dark:bg-slate-800 dark:text-slate-300'}`}>{item}</button>)}</div>
@@ -99,7 +100,7 @@ export function DocumentsPage({ documents, onReload, onNavigate, onError, isAdmi
         </div> : <EmptyState icon="documents" title="选择一个 Document Version" description="查看 Metadata、知识生命周期、版本历史与 Distillation 状态。" />}
       </aside>
     </section>
-    {uploadOpen && isAdmin && <UploadDialog result={uploadResult} onClose={() => setUploadOpen(false)} onUploaded={async result => { setUploadResult(result); await onReload(); }} onError={onError}/>}
+    {uploadOpen && canUpload && <UploadDialog result={uploadResult} onClose={() => setUploadOpen(false)} onUploaded={async result => { setUploadResult(result); await onReload(); }} onError={onError}/>}
   </div>;
 }
 

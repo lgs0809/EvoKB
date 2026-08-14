@@ -1,9 +1,9 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { createEnterpriseUser, fetchEnterpriseUsers, resetEnterpriseUserPassword, updateEnterpriseUser, type EnterpriseCapabilities, type EnterpriseOverview, type EnterpriseRole, type EnterpriseUser } from '../lib/api';
+import { createEnterpriseUser, fetchEnterpriseUsers, resetEnterpriseUserPassword, updateEnterpriseAccess, updateEnterpriseUser, type EnterpriseAccessPolicy, type EnterpriseCapabilities, type EnterpriseOverview, type EnterpriseRole, type EnterpriseUser } from '../lib/api';
 import { Icon, MetricCard, PrimaryButton, SecondaryButton, SectionTitle, StatusBadge, formatDate, formatNumber, pct } from './ui';
 
-export function AdminPage({ capabilities, overview, currentUser, onError }: { capabilities: EnterpriseCapabilities | null; overview: EnterpriseOverview | null; currentUser: EnterpriseUser; onError: (message: string) => void }) {
+export function AdminPage({ capabilities, overview, currentUser, access, onAccessChanged, onError }: { capabilities: EnterpriseCapabilities | null; overview: EnterpriseOverview | null; currentUser: EnterpriseUser; access: EnterpriseAccessPolicy | null; onAccessChanged: (access: EnterpriseAccessPolicy) => void; onError: (message: string) => void }) {
   const [serverOnline, setServerOnline] = useState<boolean | null>(null);
   const [users, setUsers] = useState<EnterpriseUser[]>([]);
   const [userDialogOpen, setUserDialogOpen] = useState(false);
@@ -45,6 +45,16 @@ export function AdminPage({ capabilities, overview, currentUser, onError }: { ca
     }
   };
 
+  const toggleUserUpload = async () => {
+    try {
+      const updated = await updateEnterpriseAccess(!access?.user_upload_enabled);
+      onAccessChanged(updated);
+      onError('');
+    } catch (err) {
+      onError(String(err instanceof Error ? err.message : err));
+    }
+  };
+
   const capabilityRows: Array<{ key: keyof EnterpriseCapabilities; label: string; description: string; icon: 'documents' | 'tasks' | 'evidence' | 'search' | 'download' | 'sparkles' | 'graph' | 'server' | 'admin' }> = [
     { key: 'auth', label: 'Authentication', description: 'Local account + protected session', icon: 'admin' },
     { key: 'users', label: 'User Management', description: 'ADMIN / USER role control', icon: 'admin' },
@@ -68,7 +78,11 @@ export function AdminPage({ capabilities, overview, currentUser, onError }: { ca
     </section>
 
     <section class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:p-6">
-      <SectionTitle eyebrow="Access control" title="用户与权限" description="系统不开放自助注册。ADMIN 在这里创建或禁用账号；USER 只能使用知识检索与证据阅读能力。" action={<PrimaryButton onClick={() => setUserDialogOpen(true)} icon="admin">添加用户</PrimaryButton>} />
+      <SectionTitle eyebrow="Access control" title="用户与权限" description="系统不开放自助注册。ADMIN 管理账号；USER 的上传入库能力由下面的全局开关控制。" action={<PrimaryButton onClick={() => setUserDialogOpen(true)} icon="admin">添加用户</PrimaryButton>} />
+      <div class="mt-5 flex items-center justify-between gap-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-950/50">
+        <div><div class="text-sm font-semibold text-slate-700 dark:text-slate-200">允许 USER 添加文件 / 入库</div><div class="mt-1 text-xs leading-5 text-slate-400">关闭时只有 ADMIN 可上传；打开后所有 ACTIVE USER 都可以使用 Documents 页的“添加文件”，后端权限立即生效。</div></div>
+        <button type="button" role="switch" aria-checked={Boolean(access?.user_upload_enabled)} onClick={() => void toggleUserUpload()} class={`relative h-7 w-12 shrink-0 rounded-full transition ${access?.user_upload_enabled ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-700'}`}><span class={`absolute top-1 h-5 w-5 rounded-full bg-white shadow transition ${access?.user_upload_enabled ? 'left-6' : 'left-1'}`}/></button>
+      </div>
       <div class="mt-5 overflow-x-auto rounded-xl border border-slate-100 dark:border-slate-800">
         <table class="min-w-full text-sm">
           <thead class="bg-slate-50 text-left text-[11px] font-semibold uppercase tracking-[0.1em] text-slate-400 dark:bg-slate-950/50"><tr><th class="px-4 py-3">User</th><th class="px-4 py-3">Role</th><th class="px-4 py-3">Status</th><th class="px-4 py-3">Last login</th><th class="px-4 py-3 text-right">Actions</th></tr></thead>

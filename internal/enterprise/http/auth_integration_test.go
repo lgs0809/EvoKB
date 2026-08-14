@@ -14,6 +14,7 @@ import (
 	"time"
 
 	enterpriseauth "github.com/xoai/sage-wiki/internal/enterprise/auth"
+	"github.com/xoai/sage-wiki/internal/enterprise/raw"
 )
 
 func TestAuthHTTPIntegration(t *testing.T) {
@@ -44,9 +45,10 @@ func TestAuthHTTPIntegration(t *testing.T) {
 	defer func() {
 		_, _ = cleanupDB.ExecContext(context.Background(), `DELETE ses FROM enterprise_user_session ses JOIN enterprise_user u ON u.user_id=ses.user_id WHERE u.username LIKE 'auth-http-it-%'`)
 		_, _ = cleanupDB.ExecContext(context.Background(), `DELETE FROM enterprise_user WHERE username LIKE 'auth-http-it-%'`)
+		_, _ = cleanupDB.ExecContext(context.Background(), `DELETE FROM enterprise_setting WHERE setting_key='user_upload_enabled'`)
 	}()
 
-	srv := httptest.NewServer((&Server{Auth: store}).Handler())
+	srv := httptest.NewServer((&Server{Auth: store, Ingest: &raw.Engine{}}).Handler())
 	defer srv.Close()
 	adminJar, _ := cookiejar.New(nil)
 	adminClient := &http.Client{Jar: adminJar, Timeout: 10 * time.Second}
@@ -90,6 +92,52 @@ func TestAuthHTTPIntegration(t *testing.T) {
 	resp = get(t, userClient, srv.URL+"/api/enterprise/auth/me")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("user me status=%d body=%s", resp.StatusCode, readBody(resp))
+	}
+	_ = resp.Body.Close()
+	resp = get(t, userClient, srv.URL+"/api/enterprise/access")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("user access status=%d body=%s", resp.StatusCode, readBody(resp))
+	}
+	var access struct {
+		UserUploadEnabled bool `json:"user_upload_enabled"`
+		CanUpload         bool `json:"can_upload"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&access); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if access.UserUploadEnabled || access.CanUpload {
+		t.Fatalf("default user access=%+v", access)
+	}
+	resp = postEmpty(t, userClient, srv.URL+"/api/enterprise/upload")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("user upload while disabled status=%d want=%d body=%s", resp.StatusCode, http.StatusForbidden, readBody(resp))
+	}
+	_ = resp.Body.Close()
+	resp = patchJSON(t, userClient, srv.URL+"/api/enterprise/access", map[string]bool{"user_upload_enabled": true})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("user access update status=%d want=%d body=%s", resp.StatusCode, http.StatusForbidden, readBody(resp))
+	}
+	_ = resp.Body.Close()
+	resp = patchJSON(t, adminClient, srv.URL+"/api/enterprise/access", map[string]bool{"user_upload_enabled": true})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin access update status=%d body=%s", resp.StatusCode, readBody(resp))
+	}
+	_ = resp.Body.Close()
+	resp = get(t, userClient, srv.URL+"/api/enterprise/access")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("user access after enable status=%d body=%s", resp.StatusCode, readBody(resp))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&access); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if !access.UserUploadEnabled || !access.CanUpload {
+		t.Fatalf("enabled user access=%+v", access)
+	}
+	resp = postEmpty(t, userClient, srv.URL+"/api/enterprise/upload")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("enabled user should pass upload authorization, status=%d body=%s", resp.StatusCode, readBody(resp))
 	}
 	_ = resp.Body.Close()
 	resp = get(t, userClient, srv.URL+"/api/enterprise/capabilities")
@@ -144,6 +192,37 @@ func postJSON(t *testing.T, client *http.Client, url string, value any) *http.Re
 func get(t *testing.T, client *http.Client, url string) *http.Response {
 	t.Helper()
 	resp, err := client.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func patchJSON(t *testing.T, client *http.Client, url string, value any) *http.Response {
+	t.Helper()
+	payload, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPatch, url, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func postEmpty(t *testing.T, client *http.Client, url string) *http.Response {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -69,6 +69,15 @@ var mysqlMigrations = []mysqlMigration{
   CONSTRAINT fk_enterprise_session_user FOREIGN KEY (user_id) REFERENCES enterprise_user(user_id) ON DELETE CASCADE
 ) ENGINE=InnoDB`,
 	},
+	{
+		Version: 6,
+		Name:    "enterprise_setting",
+		SQL: `CREATE TABLE IF NOT EXISTS enterprise_setting (
+  setting_key VARCHAR(128) CHARACTER SET ascii PRIMARY KEY,
+  setting_value VARCHAR(512) NOT NULL,
+  updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
+) ENGINE=InnoDB`,
+	},
 }
 
 func ApplyMySQL(ctx context.Context, dsn string) error {

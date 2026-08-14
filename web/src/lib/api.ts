@@ -347,6 +347,11 @@ export interface EnterpriseAuthStatus {
   users: number;
 }
 
+export interface EnterpriseAccessPolicy {
+  user_upload_enabled: boolean;
+  can_upload: boolean;
+}
+
 export interface EnterpriseUploadResult {
   document_id: string;
   version_id: string;
@@ -381,6 +386,22 @@ export async function fetchEnterpriseMe(): Promise<EnterpriseUser> {
   if (!res.ok) throw await responseError(res, 'Session lookup failed');
   const payload = await res.json();
   return payload.user;
+}
+
+export async function fetchEnterpriseAccess(): Promise<EnterpriseAccessPolicy> {
+  const res = await fetch(`${BASE}/api/enterprise/access`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Access policy request failed');
+  return res.json();
+}
+
+export async function updateEnterpriseAccess(userUploadEnabled: boolean): Promise<EnterpriseAccessPolicy> {
+  const res = await fetch(`${BASE}/api/enterprise/access`, {
+    method: 'PATCH',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_upload_enabled: userUploadEnabled }),
+  });
+  if (!res.ok) throw await responseError(res, 'Access policy update failed');
+  return res.json();
 }
 
 export async function setupEnterpriseAdmin(input: { username: string; display_name: string; password: string }): Promise<EnterpriseUser> {

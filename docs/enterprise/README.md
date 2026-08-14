@@ -44,8 +44,10 @@ The normal browser login uses an HttpOnly, SameSite session cookie. Only a SHA-2
 
 Roles are intentionally small for V1:
 
-- `USER`: Dashboard, Knowledge Search, Documents read-only views, Wiki, Graph, Evidence Center, and `package_sources`.
-- `ADMIN`: everything above plus document upload/ingestion, Distillation recommendation, Tasks, System Management, and user administration.
+- `USER`: Dashboard, Knowledge Search, Documents, Wiki, Graph, Evidence Center, and `package_sources`. Document upload is controlled by one global switch and is disabled by default.
+- `ADMIN`: everything above plus Distillation recommendation, Tasks, System Management, user administration, and document upload regardless of the USER upload switch.
+
+In **System Management -> Users & Access**, the `Allow USER file upload / ingestion` switch can be changed at runtime without restarting the server. When enabled, every ACTIVE `USER` gets the same Add File entry in Documents and the backend `/api/enterprise/upload` permission gate allows the request. When disabled, USER upload requests are rejected with HTTP 403 while existing documents remain unchanged. The setting is persisted in MySQL and defaults to `false` when no value has been written.
 
 `EKB_SERVER_TOKEN` remains supported only as a compatibility service credential for automation and local operational smoke. It maps to an administrative service principal and is not the normal human login flow.
 
@@ -82,7 +84,7 @@ Open `/enterprise` on the knowledge server. The existing Sage-Wiki Preact/Vite/T
 
 - Dashboard: real Document/Version, Raw Block, Evidence, Summary, Wiki, Graph, effective-hit, task, Grounding and Coverage health indicators. It does not invent a composite AI confidence score when no real sample exists.
 - Knowledge Search: Raw/Summary/Wiki/Graph results after the unified rerank, with Metadata Filters and a visible Raw Evidence chain. The page deliberately exposes Knowledge + Evidence rather than pretending the retrieval service produced the final Agent answer.
-- Documents: searchable Version lifecycle, metadata, Summary quality gates, effective usage, Version history, and ADMIN-only high-value Distillation recommendation. ADMIN can also upload a file with enterprise metadata; the Web path calls the real MinerU -> Raw Block -> Embedding -> OpenSearch ingestion pipeline rather than a browser-only staging flow.
+- Documents: searchable Version lifecycle, metadata, Summary quality gates, effective usage, Version history, and ADMIN-only high-value Distillation recommendation. ADMIN can always upload a file with enterprise metadata; USER gets the same upload entry when the global USER upload switch is enabled. The Web path calls the real MinerU -> Raw Block -> Embedding -> OpenSearch ingestion pipeline rather than a browser-only staging flow.
 - Enterprise Wiki: encyclopedia-style Claim reading, section navigation, Fact references, Grounding/Temporal status, and Raw Evidence citations.
 - Graph: a relation browser plus a lightweight graph view over bounded 1-2 hop relations with ACTIVE Evidence Support.
 - Evidence Center: searchable Raw provenance, exact Version/location/excerpt, active-state filtering, and multi-Evidence source-package delivery.

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import {
   changeEnterprisePassword,
+  fetchEnterpriseAccess,
   fetchEnterpriseAuthStatus,
   fetchEnterpriseCapabilities,
   fetchEnterpriseDocuments,
@@ -10,6 +11,7 @@ import {
   fetchEnterpriseTasks,
   fetchEnterpriseWikis,
   logoutEnterprise,
+  type EnterpriseAccessPolicy,
   type EnterpriseAuthStatus,
   type EnterpriseCapabilities,
   type EnterpriseDocumentVersion,
@@ -37,6 +39,7 @@ const sections: EnterpriseSection[] = ['dashboard', 'search', 'documents', 'wiki
 export function EnterpriseView() {
   const [section, setSection] = useState<EnterpriseSection>(() => sectionFromPath(window.location.pathname));
   const [authStatus, setAuthStatus] = useState<EnterpriseAuthStatus | null>(null);
+  const [access, setAccess] = useState<EnterpriseAccessPolicy | null>(null);
   const [user, setUser] = useState<EnterpriseUser | null>(null);
   const [authChecking, setAuthChecking] = useState(true);
   const [passwordOpen, setPasswordOpen] = useState(false);
@@ -53,16 +56,18 @@ export function EnterpriseView() {
   const loadAll = async (activeUser: EnterpriseUser) => {
     setBusy(true);
     try {
-      const [overviewData, documentData, wikiData, evidenceData] = await Promise.all([
+      const [overviewData, documentData, wikiData, evidenceData, accessData] = await Promise.all([
         fetchEnterpriseOverview(),
         fetchEnterpriseDocuments(),
         fetchEnterpriseWikis(),
         fetchEnterpriseEvidences(),
+        fetchEnterpriseAccess(),
       ]);
       setOverview(overviewData);
       setDocuments(documentData.documents || []);
       setWikis(wikiData.wikis || []);
       setEvidences(evidenceData.evidences || []);
+      setAccess(accessData);
       if (activeUser.role === 'ADMIN') {
         const [taskData, capabilityData] = await Promise.all([
           fetchEnterpriseTasks(),
@@ -149,6 +154,7 @@ export function EnterpriseView() {
     setEvidences([]);
     setTasks([]);
     setCapabilities(null);
+    setAccess(null);
     setSection('dashboard');
     window.history.replaceState({}, '', '/enterprise');
   };
@@ -159,12 +165,12 @@ export function EnterpriseView() {
   return <EnterpriseShell section={section} onNavigate={navigate} error={error} busy={busy} onRefresh={() => void loadAll(user)} user={user} onLogout={() => void logout()} onChangePassword={() => setPasswordOpen(true)}>
     {section === 'dashboard' && <DashboardPage overview={overview} documents={documents} wikis={wikis} tasks={tasks} onNavigate={navigate}/>}
     {section === 'search' && <SearchPage documents={documents} onOpenEvidence={setEvidence} onError={setError}/>}
-    {section === 'documents' && <DocumentsPage documents={documents} onReload={reloadDocuments} onNavigate={navigate} onError={setError} isAdmin={user.role === 'ADMIN'}/>}
+    {section === 'documents' && <DocumentsPage documents={documents} onReload={reloadDocuments} onNavigate={navigate} onError={setError} canUpload={Boolean(access?.can_upload)} isAdmin={user.role === 'ADMIN'}/>}
     {section === 'wiki' && <WikiPage wikis={wikis} onOpenEvidence={setEvidence} onError={setError}/>}
     {section === 'graph' && <GraphPage onOpenEvidence={setEvidence} onError={setError}/>}
     {section === 'evidence' && <EvidencePage evidences={evidences} overview={overview} onOpenEvidence={setEvidence} onError={setError}/>}
     {section === 'tasks' && user.role === 'ADMIN' && <TasksPage tasks={tasks} overview={overview}/>}
-    {section === 'admin' && user.role === 'ADMIN' && <AdminPage capabilities={capabilities} overview={overview} currentUser={user} onError={setError}/>}
+    {section === 'admin' && user.role === 'ADMIN' && <AdminPage capabilities={capabilities} overview={overview} currentUser={user} access={access} onAccessChanged={setAccess} onError={setError}/>}
     {evidence && <EvidenceDrawer evidence={evidence} onClose={() => setEvidence(null)}/>}
     {passwordOpen && <PasswordDialog onClose={() => setPasswordOpen(false)} onChanged={() => void logout()} onError={setError}/>}
   </EnterpriseShell>;

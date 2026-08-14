@@ -32,7 +32,24 @@ func TestAuthLifecycleIntegration(t *testing.T) {
 	defer func() {
 		_, _ = store.db.ExecContext(context.Background(), `DELETE ses FROM enterprise_user_session ses JOIN enterprise_user u ON u.user_id=ses.user_id WHERE u.username LIKE 'auth-it-%'`)
 		_, _ = store.db.ExecContext(context.Background(), `DELETE FROM enterprise_user WHERE username LIKE 'auth-it-%'`)
+		_, _ = store.db.ExecContext(context.Background(), `DELETE FROM enterprise_setting WHERE setting_key='user_upload_enabled'`)
 	}()
+
+	policy, err := store.AccessPolicy(ctx)
+	if err != nil || policy.UserUploadEnabled {
+		t.Fatalf("default access policy=%+v err=%v", policy, err)
+	}
+	policy, err = store.SetUserUploadEnabled(ctx, true)
+	if err != nil || !policy.UserUploadEnabled {
+		t.Fatalf("enable user upload policy=%+v err=%v", policy, err)
+	}
+	policy, err = store.AccessPolicy(ctx)
+	if err != nil || !policy.UserUploadEnabled {
+		t.Fatalf("persisted user upload policy=%+v err=%v", policy, err)
+	}
+	if _, err := store.SetUserUploadEnabled(ctx, false); err != nil {
+		t.Fatalf("disable user upload: %v", err)
+	}
 
 	adminSecret := strings.Repeat("a", 12)
 	userSecret := strings.Repeat("u", 12)
