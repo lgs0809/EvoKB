@@ -55,6 +55,13 @@ func (j testWikiJudge) SupportsClaim(context.Context, ProposedClaim, []enterpris
 	return false, "rejected", nil
 }
 
+type sameIdentityWikiJudge struct{}
+
+func (sameIdentityWikiJudge) Identity() string { return "writer-test" }
+func (sameIdentityWikiJudge) SupportsClaim(context.Context, ProposedClaim, []enterprisesummary.Fact) (bool, string, error) {
+	return true, "supported", nil
+}
+
 func eligibleSummary(id string, facts ...enterprisesummary.Fact) enterprisesummary.StoredSummary {
 	return enterprisesummary.StoredSummary{
 		ID: id, Lifecycle: "ACTIVE", GroundingStatus: "PASS", CoverageStatus: "PASS", Facts: facts,
@@ -67,10 +74,23 @@ func groundedFact(id, text string, evidence ...string) enterprisesummary.Fact {
 
 func newTestCompiler(store *testWikiStore, proposal Proposal, supported bool) *Compiler {
 	return &Compiler{
-		Store: store,
-		Objects: &testWikiObjectStore{},
+		Store:     store,
+		Objects:   &testWikiObjectStore{},
 		Generator: testWikiGenerator{proposal: proposal},
-		Judge: testWikiJudge{supported: supported},
+		Judge:     testWikiJudge{supported: supported},
+	}
+}
+
+func TestCompilerRequiresIndependentWriterAndJudge(t *testing.T) {
+	compiler := &Compiler{
+		Store:     &testWikiStore{},
+		Objects:   &testWikiObjectStore{},
+		Generator: testWikiGenerator{},
+		Judge:     sameIdentityWikiJudge{},
+	}
+	_, err := compiler.Compile(context.Background(), CompileRequest{WikiType: TypeCompany, Title: "Company A", SummaryIDs: []string{"s1"}})
+	if err == nil || !strings.Contains(err.Error(), "must be independent") {
+		t.Fatalf("expected independent writer/judge rejection, got %v", err)
 	}
 }
 
@@ -80,9 +100,9 @@ func TestCompilerRejectsUncoveredEligibleFact(t *testing.T) {
 		groundedFact("f2", "Company A has a board", "e2"),
 	)}}
 	compiler := newTestCompiler(store, Proposal{
-		WikiType: TypeCompany,
+		WikiType:      TypeCompany,
 		FactDecisions: []FactDecision{{FactID: "f1", WikiEligible: true}, {FactID: "f2", WikiEligible: true}},
-		Claims: []ProposedClaim{{Section: "Profile", ClaimText: "Company A exists", SupportingFactIDs: []string{"f1"}}},
+		Claims:        []ProposedClaim{{Section: "Profile", ClaimText: "Company A exists", SupportingFactIDs: []string{"f1"}}},
 	}, true)
 
 	_, err := compiler.Compile(context.Background(), CompileRequest{WikiType: TypeCompany, Title: "Company A", SummaryIDs: []string{"s1"}})
@@ -111,9 +131,9 @@ func TestCompilerRejectsIndependentJudgeFailure(t *testing.T) {
 		groundedFact("f1", "Company A exists", "e1"),
 	)}}
 	compiler := newTestCompiler(store, Proposal{
-		WikiType: TypeCompany,
+		WikiType:      TypeCompany,
 		FactDecisions: []FactDecision{{FactID: "f1", WikiEligible: true}},
-		Claims: []ProposedClaim{{Section: "Profile", ClaimText: "Company A exists", SupportingFactIDs: []string{"f1"}}},
+		Claims:        []ProposedClaim{{Section: "Profile", ClaimText: "Company A exists", SupportingFactIDs: []string{"f1"}}},
 	}, false)
 
 	_, err := compiler.Compile(context.Background(), CompileRequest{WikiType: TypeCompany, Title: "Company A", SummaryIDs: []string{"s1"}})
@@ -134,9 +154,9 @@ func TestCompilerUnionsEvidenceAcrossSourceFacts(t *testing.T) {
 	compiler := &Compiler{
 		Store: store, Objects: objects,
 		Generator: testWikiGenerator{proposal: Proposal{
-			WikiType: TypeCompany,
+			WikiType:      TypeCompany,
 			FactDecisions: []FactDecision{{FactID: "f1", WikiEligible: true}, {FactID: "f2", WikiEligible: true}},
-			Claims: []ProposedClaim{{Section: "Material Matters", ClaimText: "Company A and Company B signed the agreement", SupportingFactIDs: []string{"f1", "f2"}}},
+			Claims:        []ProposedClaim{{Section: "Material Matters", ClaimText: "Company A and Company B signed the agreement", SupportingFactIDs: []string{"f1", "f2"}}},
 		}},
 		Judge: testWikiJudge{supported: true},
 	}

@@ -15,6 +15,13 @@ func firstEnv(names ...string) string {
 	return ""
 }
 
+func firstEnvOr(fallback string, names ...string) string {
+	if value := firstEnv(names...); value != "" {
+		return value
+	}
+	return fallback
+}
+
 func mustFirstEnv(names ...string) string {
 	if value := firstEnv(names...); value != "" {
 		return value
@@ -33,4 +40,11 @@ func envPositiveInt(name string, fallback int) int {
 		fatalf("invalid positive integer %s=%q", name, value)
 	}
 	return parsed
+}
+
+func llmExtraParams(reasoningEnvNames ...string) map[string]interface{} {
+	if effort := firstEnv(reasoningEnvNames...); effort != "" {
+		return map[string]interface{}{"reasoning_effort": effort}
+	}
+	return nil
 }

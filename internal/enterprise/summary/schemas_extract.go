@@ -7,7 +7,7 @@ var classificationSchema = llm.JSONSchema{
 	Schema: map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"document_type": map[string]any{"type": "string"},
+			"document_type":  map[string]any{"type": "string"},
 			"structure_type": map[string]any{"type": "string"},
 			"units": map[string]any{
 				"type": "array",
@@ -23,7 +23,7 @@ var classificationSchema = llm.JSONSchema{
 				},
 			},
 		},
-		"required": []string{"document_type", "structure_type", "units"},
+		"required": []string{"document_type", "structure_type"},
 	},
 }
 

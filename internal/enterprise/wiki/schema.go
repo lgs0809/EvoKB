@@ -7,13 +7,13 @@ var proposalSchema = llm.JSONSchema{
 	Schema: map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"wiki_type": map[string]any{"type": "string"},
-			"title": map[string]any{"type": "string"},
+			"wiki_type": map[string]any{"type": "string", "enum": []any{TypeCompany, TypePerson, TypeContract, TypeLegalCase, TypeProject, TypeControlTopic, TypeEquityTopic, TypeGenericEntity, TypeGenericTopic}},
+			"title":     map[string]any{"type": "string"},
 			"claims": map[string]any{"type": "array", "items": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"section": map[string]any{"type": "string"},
-					"claim_text": map[string]any{"type": "string"},
+					"section":             map[string]any{"type": "string"},
+					"claim_text":          map[string]any{"type": "string"},
 					"supporting_fact_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 				},
 				"required": []string{"section", "claim_text", "supporting_fact_ids"},
@@ -21,9 +21,9 @@ var proposalSchema = llm.JSONSchema{
 			"fact_decisions": map[string]any{"type": "array", "items": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"fact_id": map[string]any{"type": "string"},
+					"fact_id":       map[string]any{"type": "string"},
 					"wiki_eligible": map[string]any{"type": "boolean"},
-					"skip_reason": map[string]any{"type": "string"},
+					"skip_reason":   map[string]any{"type": "string"},
 				},
 				"required": []string{"fact_id", "wiki_eligible", "skip_reason"},
 			}},
@@ -38,7 +38,7 @@ var claimSupportSchema = llm.JSONSchema{
 		"type": "object",
 		"properties": map[string]any{
 			"supported": map[string]any{"type": "boolean"},
-			"reason": map[string]any{"type": "string"},
+			"reason":    map[string]any{"type": "string"},
 		},
 		"required": []string{"supported", "reason"},
 	},

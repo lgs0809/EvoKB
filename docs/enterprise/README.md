@@ -109,7 +109,11 @@ Text matching is deterministic after case/whitespace normalization. Human-approv
 
 ## Current model policy
 
-Embedding and Reranker remain local by default. The previous local llama.cpp Summary Generator/Judge deployment was removed because CPU inference was not operationally useful. The compiler model interfaces remain OpenAI-compatible. Gate 2/3 quality acceptance must be repeated with the external provider before those gates are declared complete.
+Embedding and Reranker remain local by default. The previous local llama.cpp Summary Generator/Judge deployment was removed because CPU inference was not operationally useful. The compiler model interfaces support custom OpenAI Base URLs plus per-stage model/provider/reasoning settings.
+
+For a remote gateway that implements native OpenAI `response_format=json_schema`, set the enterprise LLM provider to `openai` even when the Base URL is not api.openai.com. Keep `openai-compatible` for self-hosted backends that intentionally use the plain JSON fallback path. Generator, Judge, Graph extractor, Wiki writer, and Wiki judge can override the provider independently; `reasoning_effort` is also configurable globally or per stage.
+
+The lightweight external-provider smoke currently verified `gpt-5.4-mini` as Generator/Writer and `gpt-5.4` as the independent Judge/strong Graph model. That smoke produced an ACTIVE Grounded+Covered Summary, evidence-backed Graph relations, an ACTIVE Claim-based Wiki, and a successful Full (D) unified-retrieval query. It proves runtime compatibility only, not production-corpus quality. `gpt-5.6-luna` appeared in the provider model list but the gateway returned transient `503 no available token` during this smoke, so it was not used to claim acceptance; it can be retried later, including a configured `reasoning_effort=max`, when gateway capacity is available.
 
 ## Verification commands
 

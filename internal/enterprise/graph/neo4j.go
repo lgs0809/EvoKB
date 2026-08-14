@@ -14,27 +14,36 @@ import (
 )
 
 type Neo4jClient struct {
-	BaseURL string
-	User string
+	BaseURL  string
+	User     string
 	Password string
 	Database string
-	Client *http.Client
+	Client   *http.Client
 }
 
 type neo4jStatement struct {
-	Statement string `json:"statement"`
+	Statement  string         `json:"statement"`
 	Parameters map[string]any `json:"parameters,omitempty"`
 }
 
-type neo4jRequest struct { Statements []neo4jStatement `json:"statements"` }
-type neo4jError struct { Code string `json:"code"`; Message string `json:"message"` }
-type neo4jResponse struct { Errors []neo4jError `json:"errors"` }
+type neo4jRequest struct {
+	Statements []neo4jStatement `json:"statements"`
+}
+type neo4jError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+type neo4jResponse struct {
+	Errors []neo4jError `json:"errors"`
+}
 
 func NewNeo4jClient(baseURL, user, password, database string) *Neo4jClient {
-	if strings.TrimSpace(database) == "" { database = "neo4j" }
+	if strings.TrimSpace(database) == "" {
+		database = "neo4j"
+	}
 	return &Neo4jClient{
 		BaseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		User: user, Password: password, Database: database,
+		User:    user, Password: password, Database: database,
 		Client: &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -54,7 +63,7 @@ func (n *Neo4jClient) UpsertEntity(ctx context.Context, entity CanonicalEntity) 
 		return fmt.Errorf("neo4j entity: id, name and type are required")
 	}
 	return n.exec(ctx, neo4jStatement{
-		Statement: "MERGE (n:Entity {id:$id}) SET n.name=$name,n.entity_type=$entity_type,n.canonical_key=$canonical_key,n.updated_at=datetime()",
+		Statement:  "MERGE (n:Entity {id:$id}) SET n.name=$name,n.entity_type=$entity_type,n.canonical_key=$canonical_key,n.updated_at=datetime()",
 		Parameters: map[string]any{"id": entity.ID, "name": entity.CanonicalName, "entity_type": entity.EntityType, "canonical_key": entity.CanonicalKey},
 	})
 }
@@ -79,7 +88,7 @@ func (n *Neo4jClient) UpsertRelation(ctx context.Context, relation RelationFact,
 		supportPayload = append(supportPayload, map[string]any{
 			"id": support.ID, "relation_id": support.RelationID, "origin": support.Origin,
 			"evidence_id": support.EvidenceID, "summary_id": support.SummaryID, "wiki_id": support.WikiID,
-			"confidence": support.Confidence, "active": support.Active,
+			"wiki_version": uint64Param(support.WikiVersion), "confidence": support.Confidence, "active": support.Active,
 		})
 	}
 	sort.Strings(evidenceIDs)
@@ -93,7 +102,7 @@ func (n *Neo4jClient) UpsertRelation(ctx context.Context, relation RelationFact,
 	}}}
 	if len(supportPayload) > 0 {
 		statements = append(statements, neo4jStatement{
-			Statement: "MATCH (source:Entity {id:$source_id}),(target:Entity {id:$target_id}) UNWIND $supports AS item MERGE (support:EvidenceSupport {id:item.id}) SET support.relation_id=item.relation_id,support.origin=item.origin,support.evidence_id=item.evidence_id,support.summary_id=item.summary_id,support.wiki_id=item.wiki_id,support.confidence=item.confidence,support.active=item.active,support.updated_at=datetime() MERGE (evidence:Evidence {id:item.evidence_id}) MERGE (support)-[:USES_EVIDENCE]->(evidence) MERGE (support)-[:SUPPORTS_SOURCE]->(source) MERGE (support)-[:SUPPORTS_TARGET]->(target)",
+			Statement:  "MATCH (source:Entity {id:$source_id}),(target:Entity {id:$target_id}) UNWIND $supports AS item MERGE (support:EvidenceSupport {id:item.id}) SET support.relation_id=item.relation_id,support.origin=item.origin,support.evidence_id=item.evidence_id,support.summary_id=item.summary_id,support.wiki_id=item.wiki_id,support.wiki_version=item.wiki_version,support.confidence=item.confidence,support.active=item.active,support.updated_at=datetime() MERGE (evidence:Evidence {id:item.evidence_id}) MERGE (support)-[:USES_EVIDENCE]->(evidence) MERGE (support)-[:SUPPORTS_SOURCE]->(source) MERGE (support)-[:SUPPORTS_TARGET]->(target)",
 			Parameters: map[string]any{"source_id": relation.SourceEntityID, "target_id": relation.TargetEntityID, "supports": supportPayload},
 		})
 	}
@@ -151,4 +160,11 @@ func timeParam(value *time.Time) any {
 		return nil
 	}
 	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func uint64Param(value *uint64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }

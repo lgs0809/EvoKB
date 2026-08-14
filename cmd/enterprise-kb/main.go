@@ -18,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: enterprise-kb <ingest|search|summary|distill|eval|artifact-eval|mcp|server> [flags]")
+		fatalf("usage: enterprise-kb <ingest|search|summary|graph|wiki|distill|eval|artifact-eval|mcp|server> [flags]")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -30,6 +30,10 @@ func main() {
 		runSearch(ctx, os.Args[2:])
 	case "summary":
 		runSummary(ctx, os.Args[2:])
+	case "graph":
+		runGraph(ctx, os.Args[2:])
+	case "wiki":
+		runWiki(ctx, os.Args[2:])
 	case "distill":
 		runDistill(ctx, os.Args[2:])
 	case "eval":
@@ -141,22 +145,26 @@ func runSummary(ctx context.Context, args []string) {
 
 	generatorURL := mustFirstEnv("EKB_SUMMARY_GENERATOR_URL", "EKB_LLM_BASE_URL")
 	generatorModel := mustFirstEnv("EKB_SUMMARY_GENERATOR_MODEL", "EKB_LLM_MODEL")
+	generatorProvider := firstEnvOr("openai-compatible", "EKB_SUMMARY_GENERATOR_PROVIDER", "EKB_LLM_PROVIDER")
 	generatorClient, err := llm.NewClient(
-		"openai-compatible",
+		generatorProvider,
 		firstEnv("EKB_SUMMARY_GENERATOR_API_KEY", "EKB_LLM_API_KEY"),
 		generatorURL,
 		-1,
+		llmExtraParams("EKB_SUMMARY_GENERATOR_REASONING_EFFORT", "EKB_LLM_REASONING_EFFORT"),
 	)
 	if err != nil {
 		fatalf("summary generator client: %v", err)
 	}
 	judgeURL := mustFirstEnv("EKB_SUMMARY_JUDGE_URL", "EKB_LLM_BASE_URL")
 	judgeModel := mustFirstEnv("EKB_SUMMARY_JUDGE_MODEL", "EKB_LLM_JUDGE_MODEL")
+	judgeProvider := firstEnvOr("openai-compatible", "EKB_SUMMARY_JUDGE_PROVIDER", "EKB_LLM_PROVIDER")
 	judgeClient, err := llm.NewClient(
-		"openai-compatible",
+		judgeProvider,
 		firstEnv("EKB_SUMMARY_JUDGE_API_KEY", "EKB_LLM_API_KEY"),
 		judgeURL,
 		-1,
+		llmExtraParams("EKB_SUMMARY_JUDGE_REASONING_EFFORT", "EKB_LLM_REASONING_EFFORT"),
 	)
 	if err != nil {
 		fatalf("summary judge client: %v", err)
