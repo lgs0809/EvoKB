@@ -103,7 +103,7 @@ func BuildRawBlocks(versionID string, parsed []ParsedBlock) []RawBlock {
 		blocks = append(blocks, RawBlock{
 			ID: id, VersionID: versionID, BlockNo: i, BlockType: p.Type,
 			Content: text, Normalized: norm, HeadingPath: append([]string(nil), headings...),
-			PageStart: ps, PageEnd: pe, BBox: append([]float64(nil), p.BBox...),
+			PageStart: ps, PageEnd: pe, BBox: append([]float64(nil), p.BBox...), PageSize: append([]float64(nil), p.PageSize...),
 			SourceBlockIDs: []string{id}, ContentHash: contentHash(text), TokenCount: estimateTokens(text),
 		})
 	}

@@ -27,9 +27,9 @@ SELECT
   (SELECT COUNT(*) FROM relation_evidence_support WHERE active=TRUE),
   (SELECT COUNT(*) FROM effective_version_hit),
   (SELECT COUNT(DISTINCT version_id) FROM distill_recommendation WHERE status='RECOMMENDED'),
-  (SELECT COUNT(*) FROM compile_task WHERE status='PENDING'),
-  (SELECT COUNT(*) FROM compile_task WHERE status='RUNNING'),
-  (SELECT COUNT(*) FROM compile_task WHERE status='FAILED')`).Scan(
+  ((SELECT COUNT(*) FROM compile_task WHERE status='PENDING') + (SELECT COUNT(*) FROM ingestion_file WHERE status IN ('STAGED','QUEUED'))),
+  ((SELECT COUNT(*) FROM compile_task WHERE status='RUNNING') + (SELECT COUNT(*) FROM ingestion_file WHERE status='RUNNING')),
+  ((SELECT COUNT(*) FROM compile_task WHERE status='FAILED') + (SELECT COUNT(*) FROM ingestion_file WHERE status='FAILED'))`).Scan(
 		&out.Documents,
 		&out.Versions,
 		&out.ActiveVersions,

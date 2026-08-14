@@ -42,6 +42,7 @@ func (s *Server) handleAccess(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		s.auditRequest(r, "access.user_upload.update", "setting", "user_upload_enabled", "USER upload permission", "SUCCESS", map[string]any{"enabled": policy.UserUploadEnabled})
 		writeJSON(w, http.StatusOK, map[string]any{
 			"user_upload_enabled": policy.UserUploadEnabled,
 			"can_upload":          true,

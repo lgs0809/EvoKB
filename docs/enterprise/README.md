@@ -44,14 +44,50 @@ The normal browser login uses an HttpOnly, SameSite session cookie. Only a SHA-2
 
 Roles are intentionally small for V1:
 
-- `USER`: Dashboard, Knowledge Search, Documents, Wiki, Graph, Evidence Center, and `package_sources`. Document upload is controlled by one global switch and is disabled by default.
-- `ADMIN`: everything above plus Distillation recommendation, Tasks, System Management, user administration, and document upload regardless of the USER upload switch.
+- `USER`: Dashboard, Enterprise Ask, Advanced Search, Documents, Wiki, Graph, Evidence Center, `package_sources`, and a Task Center limited to that user's own ingestion jobs. Document upload is controlled by one global switch and is disabled by default.
+- `ADMIN`: everything above plus global ingestion/compile Tasks, Audit Log, Distillation recommendation, System Management, user administration, and document upload regardless of the USER upload switch.
 
 In **System Management -> Users & Access**, the `Allow USER file upload / ingestion` switch can be changed at runtime without restarting the server. When enabled, every ACTIVE `USER` gets the same Add File entry in Documents and the backend `/api/enterprise/upload` permission gate allows the request. When disabled, USER upload requests are rejected with HTTP 403 while existing documents remain unchanged. The setting is persisted in MySQL and defaults to `false` when no value has been written.
 
 `EKB_SERVER_TOKEN` remains supported only as a compatibility service credential for automation and local operational smoke. It maps to an administrative service principal and is not the normal human login flow.
 
 Session and upload runtime options are non-secret configuration: `EKB_SESSION_TTL_HOURS` (default `12`), `EKB_SESSION_COOKIE_SECURE` (enable behind HTTPS), `EKB_MAX_UPLOAD_MIB` (default `512`), and `EKB_MINERU_URL`.
+
+## Managed batch ingestion
+
+The normal enterprise upload flow is asynchronous and two-stage. A user with upload permission may drag multiple files, choose a local folder, or upload a ZIP. ZIP archives are decompressed **inside the knowledge server**, with path traversal, expanded-size, supported-type, and file-count limits enforced before any parser runs. Staged files are stored in a persistent server volume so a server restart does not silently lose queued work.
+
+The first stage only uploads/decompresses files and creates one editable row per discovered document. Batch-level defaults for company, source department, document type, material category, document date, and tags are copied to each file, but every file can be adjusted independently before ingestion starts. The staging screen also checks existing Document/Version facts and shows one of four expected behaviors: `CREATE_DOCUMENT`, `CREATE_VERSION`, `REUSE_VERSION`, or `DUPLICATE_CONTENT`. Exact duplicate content can be switched to the existing knowledge name before the batch starts.
+
+After the user confirms the file-level metadata, the batch is queued and a background worker executes the real pipeline. Progress is persisted as `STORING -> PARSING -> EVIDENCE -> EMBEDDING -> INDEXING -> ACTIVATING`. A failed file retains its staging source and can be retried safely; a successful file removes only its staging copy after the durable Document Version is active. `USER` accounts can see only their own ingestion tasks, while `ADMIN` sees global ingestion plus compile tasks.
+
+Relevant non-secret limits are `EKB_MAX_BATCH_UPLOAD_MIB` (default `4096`), `EKB_MAX_BATCH_EXPANDED_MIB` (default `16384`), `EKB_MAX_BATCH_FILES` (default `2000`), and `EKB_STAGING_ROOT`. Compose mounts `/var/lib/enterprise-kb/staging` on the persistent `server-staging` volume.
+
+## Enterprise Ask and advanced retrieval
+
+`/enterprise/ask` is the employee-facing question-answering entry. It always runs the existing Raw/Summary/Wiki/Graph retrieval and final Evidence Resolver first; only Evidence-resolvable knowledge is eligible for answer generation. The answer model is optional: when no Ask model is configured, the endpoint remains usable in explicit `evidence_only` mode rather than pretending that a natural-language answer was generated.
+
+When an answer model is configured, every delivered factual answer must contain valid `[n]` citations referring to the supplied Evidence-backed source numbers. Citation validation is fail-closed: missing citations or out-of-range source numbers cause the natural-language answer to be withheld and the UI falls back to Evidence-only results. The model configuration is separate from retrieval: `EKB_ASK_PROVIDER`, `EKB_ASK_BASE_URL`, `EKB_ASK_MODEL`, `EKB_ASK_REASONING_EFFORT`, `EKB_ASK_MAX_TOKENS`, and the secret `EKB_ASK_API_KEY`. The project does not hardcode an expensive answer model.
+
+`/enterprise/search` remains the advanced diagnostic surface. It exposes knowledge type, unified rerank score, lexical hit explanations, Metadata Filters, and the exact Raw Evidence chain so retrieval quality can be inspected independently from the final answer model.
+
+## Source viewer, Wiki, and Graph visualization
+
+Evidence can open the exact original source through an authenticated same-origin stream. PDF sources are rendered with PDF.js and jump to the MinerU page. New PDF Evidence persists both `bbox` and `page_size` from the same MinerU coordinate system; only then does the viewer draw the Evidence highlight. Historical Evidence without `page_size` still opens the correct page but deliberately does not draw an unverified box.
+
+The rich Enterprise Wiki and Graph views remain first-class product surfaces. Wiki keeps the encyclopedia layout, Claim/Citation visualization, local favorites, version history, and a Claim-level `vN -> vN+1` diff. Graph keeps its evidence-backed relation browser and lightweight graph visualization with bounded expansion; it is not replaced by a plain table.
+
+## Audit trail
+
+`/enterprise/audit` follows a compact `actor -> action -> target -> outcome` audit model. Stable actions cover authentication, user administration, upload-policy changes, single and batch ingestion, file-level metadata changes, retries, Distillation marks, Evidence source access, Enterprise Ask, and source-package creation. The ADMIN UI supports pagination and actor/action/outcome/query filters.
+
+Audit records intentionally exclude passwords, session tokens, API keys, raw knowledge text, and the full Ask question body. Ask audit stores the search identifier and citation/evidence-only result metadata instead. Client proxy headers are ignored by default; set `EKB_TRUST_PROXY_HEADERS=true` only behind a trusted reverse proxy if the server should use `X-Forwarded-For` / `X-Real-IP` for audit IP attribution.
+
+## Large-corpus Web behavior
+
+Documents, Wiki, Evidence, Tasks, and Audit are server-side paginated and filtered instead of preloading hundreds of thousands of rows after login. Metadata facets are queried separately for Company / Department / Document Type / Material Category. Enterprise pages are lazy-loaded into separate frontend chunks; the heavy PDF viewer is downloaded only when a user opens an original PDF.
+
+The Dashboard includes a **Needs Attention** area for failed Document Versions, STALE Summary/Wiki assets, failed tasks, and high-value Distillation candidates. Search shows a visible “why this matched” lexical explanation where available. The browser also keeps small local recent-question and Wiki-favorite lists for convenience; these are not authoritative server-side knowledge state.
 
 ## CLI
 

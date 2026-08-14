@@ -55,6 +55,7 @@ type ParsedBlock struct {
 	TextLevel int
 	Page      int
 	BBox      []float64
+	PageSize  []float64
 	ImagePath string
 	TableHTML string
 	TableBody string
@@ -88,6 +89,7 @@ type RawBlock struct {
 	PageStart      *int
 	PageEnd        *int
 	BBox           []float64
+	PageSize       []float64
 	SourceBlockIDs []string
 	ContentHash    string
 	TokenCount     int

@@ -63,6 +63,7 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, login.Token, login.ExpiresAt)
+	s.auditIdentity(r, login.User.UserID, login.User.Username, string(login.User.Role), "auth.setup", "user", login.User.UserID, login.User.Username, "SUCCESS", nil)
 	writeJSON(w, http.StatusCreated, map[string]any{"user": login.User})
 }
 
@@ -85,6 +86,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	result, err := s.Auth.Login(r.Context(), req.Username, req.Password)
 	if err != nil {
 		if errors.Is(err, enterpriseauth.ErrInvalidCredentials) {
+			s.auditIdentity(r, "", strings.TrimSpace(req.Username), "UNKNOWN", "auth.login", "user", "", strings.TrimSpace(req.Username), "FAILURE", map[string]any{"reason": "invalid_credentials"})
 			writeError(w, http.StatusUnauthorized, "invalid username or password")
 			return
 		}
@@ -92,6 +94,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, result.Token, result.ExpiresAt)
+	s.auditIdentity(r, result.User.UserID, result.User.Username, string(result.User.Role), "auth.login", "user", result.User.UserID, result.User.Username, "SUCCESS", nil)
 	writeJSON(w, http.StatusOK, map[string]any{"user": result.User})
 }
 
@@ -118,6 +121,7 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 			_ = s.Auth.Logout(r.Context(), cookie.Value)
 		}
 	}
+	s.auditRequest(r, "auth.logout", "user", "", "", "SUCCESS", nil)
 	s.clearSessionCookie(w)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "logged_out"})
 }
@@ -147,6 +151,7 @@ func (s *Server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.auditRequest(r, "auth.password.change", "user", p.User.UserID, p.User.Username, "SUCCESS", nil)
 	s.clearSessionCookie(w)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "password_changed", "login_required": true})
 }
@@ -180,6 +185,7 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		s.auditRequest(r, "user.create", "user", user.UserID, user.Username, "SUCCESS", map[string]any{"role": user.Role})
 		writeJSON(w, http.StatusCreated, map[string]any{"user": user})
 	default:
 		methodNotAllowed(w)
@@ -208,6 +214,7 @@ func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.auditRequest(r, "user.update", "user", user.UserID, user.Username, "SUCCESS", map[string]any{"role": user.Role, "status": user.Status})
 	writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
@@ -234,6 +241,7 @@ func (s *Server) handleUserPasswordReset(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.auditRequest(r, "user.password.reset", "user", req.UserID, req.UserID, "SUCCESS", nil)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "password_reset"})
 }
 

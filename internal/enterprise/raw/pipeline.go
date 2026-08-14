@@ -16,12 +16,12 @@ import (
 )
 
 type Engine struct {
-	Objects  ObjectStore
-	Metadata MetadataStore
-	Parser   Parser
-	Search   SearchStore
-	Embedder Embedder
-	Reranker     Reranker
+	Objects       ObjectStore
+	Metadata      MetadataStore
+	Parser        Parser
+	Search        SearchStore
+	Embedder      Embedder
+	Reranker      Reranker
 	DerivedSearch DerivedSearchLifecycle
 }
 
@@ -30,6 +30,7 @@ type IngestRequest struct {
 	LogicalName string
 	SourcePath  string
 	Metadata    Metadata
+	Progress    func(stage string)
 }
 
 type IngestResult struct {
@@ -53,6 +54,11 @@ func (e *Engine) IngestPath(ctx context.Context, req IngestRequest) (*IngestResu
 	}
 	if strings.TrimSpace(req.Path) == "" {
 		return nil, fmt.Errorf("raw ingest: path is required")
+	}
+	progress := func(stage string) {
+		if req.Progress != nil {
+			req.Progress(stage)
+		}
 	}
 	filename := filepath.Base(req.Path)
 	logicalName := strings.TrimSpace(req.LogicalName)
@@ -126,6 +132,7 @@ func (e *Engine) IngestPath(ctx context.Context, req IngestRequest) (*IngestResu
 	markdownKey := fmt.Sprintf("parsed/%s/%s/markdown.md", doc.ID, versionID)
 	structuredKey := fmt.Sprintf("parsed/%s/%s/structured.json", doc.ID, versionID)
 
+	progress("STORING")
 	f, err := os.Open(req.Path)
 	if err != nil {
 		return nil, fmt.Errorf("raw ingest open: %w", err)
@@ -156,6 +163,7 @@ func (e *Engine) IngestPath(ctx context.Context, req IngestRequest) (*IngestResu
 		return nil, cause
 	}
 
+	progress("PARSING")
 	original, err := e.Objects.Get(ctx, originalKey)
 	if err != nil {
 		return fail("OBJECT_READ_FAILED", err)
@@ -179,11 +187,13 @@ func (e *Engine) IngestPath(ctx context.Context, req IngestRequest) (*IngestResu
 		return fail("PARSED_STRUCTURED_STORE_FAILED", err)
 	}
 
+	progress("EVIDENCE")
 	blocks := BuildRawBlocks(versionID, parsed.Blocks)
 	evidence := buildEvidence(doc.ID, versionID, originalKey, blocks)
 	if err := e.Metadata.SaveParsed(ctx, versionID, markdownKey, structuredKey, parsed.ParserName, parsed.ParserVersion, blocks, evidence); err != nil {
 		return fail("RAW_FACT_STORE_FAILED", err)
 	}
+	progress("EMBEDDING")
 	chunks := SmartChunks(doc.ID, versionID, req.Metadata, blocks)
 	texts := make([]string, len(chunks))
 	for i := range chunks {
@@ -199,6 +209,7 @@ func (e *Engine) IngestPath(ctx context.Context, req IngestRequest) (*IngestResu
 	for i := range chunks {
 		chunks[i].Embedding = vectors[i]
 	}
+	progress("INDEXING")
 	if err := e.Search.EnsureRawIndex(ctx, e.Embedder.Dimensions()); err != nil {
 		return fail("SEARCH_INDEX_INIT_FAILED", err)
 	}
@@ -225,6 +236,7 @@ func (e *Engine) IngestPath(ctx context.Context, req IngestRequest) (*IngestResu
 	// candidate cannot resolve to active Evidence, so it cannot escape the final
 	// Evidence gate. This ordering keeps a search activation failure from first
 	// staling valid Summary/Wiki/Graph support in the durable fact layer.
+	progress("ACTIVATING")
 	if err := e.Search.ActivateVersion(ctx, doc.ID, versionID); err != nil {
 		_ = e.Search.DeactivateVersion(ctx, versionID)
 		return fail("SEARCH_ACTIVATE_FAILED", err)
@@ -374,6 +386,7 @@ func buildEvidence(documentID, versionID, originalKey string, blocks []RawBlock)
 			"page_start":   b.PageStart,
 			"page_end":     b.PageEnd,
 			"bbox":         b.BBox,
+			"page_size":    b.PageSize,
 		}
 		id := deterministicID("evidence:" + versionID + ":" + b.ID)
 		out = append(out, Evidence{

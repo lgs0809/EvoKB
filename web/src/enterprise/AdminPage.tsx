@@ -55,13 +55,18 @@ export function AdminPage({ capabilities, overview, currentUser, access, onAcces
     }
   };
 
-  const capabilityRows: Array<{ key: keyof EnterpriseCapabilities; label: string; description: string; icon: 'documents' | 'tasks' | 'evidence' | 'search' | 'download' | 'sparkles' | 'graph' | 'server' | 'admin' }> = [
+  const capabilityRows: Array<{ key: keyof EnterpriseCapabilities; label: string; description: string; icon: 'documents' | 'tasks' | 'evidence' | 'search' | 'download' | 'sparkles' | 'graph' | 'server' | 'admin' | 'shield' }> = [
     { key: 'auth', label: 'Authentication', description: 'Local account + protected session', icon: 'admin' },
     { key: 'users', label: 'User Management', description: 'ADMIN / USER role control', icon: 'admin' },
     { key: 'upload', label: 'Document Upload', description: 'MinerU-backed web ingestion', icon: 'documents' },
+    { key: 'batch_ingestion', label: 'Batch Ingestion', description: 'Folder / ZIP staging + async worker', icon: 'documents' },
     { key: 'documents', label: 'Document / Version', description: 'MySQL knowledge asset metadata', icon: 'documents' },
-    { key: 'tasks', label: 'Compile Task', description: 'Pipeline execution visibility', icon: 'tasks' },
+    { key: 'tasks', label: 'Task Center', description: 'Ingest + compile stage visibility', icon: 'tasks' },
+    { key: 'audit', label: 'Audit Log', description: 'Actor / action / target trail', icon: 'shield' },
     { key: 'evidence', label: 'Evidence Resolver', description: 'Exact Raw provenance resolution', icon: 'evidence' },
+    { key: 'source_viewer', label: 'Source Viewer', description: 'Authenticated original-file viewer', icon: 'evidence' },
+    { key: 'ask', label: 'Enterprise Ask', description: 'Evidence-backed Ask entry', icon: 'sparkles' },
+    { key: 'ask_answering', label: 'Ask Answer Model', description: 'Luna / Terra / compatible model configured', icon: 'sparkles' },
     { key: 'search', label: 'Unified Retrieval', description: 'Raw / Summary / Wiki / Graph', icon: 'search' },
     { key: 'package_sources', label: 'Source Package', description: 'Version-deduplicated ZIP delivery', icon: 'download' },
     { key: 'promotion', label: 'Distillation Promotion', description: 'Final effective-hit recommendation', icon: 'sparkles' },

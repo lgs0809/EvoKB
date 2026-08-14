@@ -188,9 +188,14 @@ func (c *MinerUClient) taskResult(ctx context.Context, id string) (*ParsedDocume
 	if err := json.Unmarshal([]byte(contentList), &rawBlocks); err != nil {
 		return nil, fmt.Errorf("mineru content_list parse: %w", err)
 	}
+	pageSizes := minerUPageSizes(middle)
 	blocks := make([]ParsedBlock, 0, len(rawBlocks))
 	for _, rb := range rawBlocks {
-		blocks = append(blocks, parsedBlockFromMap(rb))
+		block := parsedBlockFromMap(rb)
+		if size, ok := pageSizes[block.Page]; ok {
+			block.PageSize = append([]float64(nil), size...)
+		}
+		blocks = append(blocks, block)
 	}
 	return &ParsedDocument{
 		Markdown:      fr.Markdown,
@@ -216,6 +221,25 @@ func normalizeJSONField(raw json.RawMessage) (string, error) {
 	}
 	b, err := json.Marshal(v)
 	return string(b), err
+}
+
+func minerUPageSizes(middle string) map[int][]float64 {
+	var envelope struct {
+		PDFInfo []struct {
+			PageIdx  int       `json:"page_idx"`
+			PageSize []float64 `json:"page_size"`
+		} `json:"pdf_info"`
+	}
+	if err := json.Unmarshal([]byte(middle), &envelope); err != nil {
+		return nil
+	}
+	out := make(map[int][]float64, len(envelope.PDFInfo))
+	for _, page := range envelope.PDFInfo {
+		if len(page.PageSize) >= 2 && page.PageSize[0] > 0 && page.PageSize[1] > 0 {
+			out[page.PageIdx] = append([]float64(nil), page.PageSize...)
+		}
+	}
+	return out
 }
 
 func parsedBlockFromMap(m map[string]any) ParsedBlock {

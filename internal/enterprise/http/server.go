@@ -13,26 +13,37 @@ import (
 
 	enterpriseadmin "github.com/xoai/sage-wiki/internal/enterprise/admin"
 	enterpriseapi "github.com/xoai/sage-wiki/internal/enterprise/api"
+	enterpriseask "github.com/xoai/sage-wiki/internal/enterprise/ask"
+	enterpriseaudit "github.com/xoai/sage-wiki/internal/enterprise/audit"
 	enterpriseauth "github.com/xoai/sage-wiki/internal/enterprise/auth"
 	enterpriseevidence "github.com/xoai/sage-wiki/internal/enterprise/evidence"
 	enterprisegraph "github.com/xoai/sage-wiki/internal/enterprise/graph"
+	enterpriseingest "github.com/xoai/sage-wiki/internal/enterprise/ingest"
 	enterprisepromotion "github.com/xoai/sage-wiki/internal/enterprise/promotion"
 	"github.com/xoai/sage-wiki/internal/enterprise/raw"
 )
 
 type Server struct {
-	Admin               *enterpriseadmin.MySQLStore
-	API                 *enterpriseapi.Service
-	Auth                *enterpriseauth.Store
-	Promotion           *enterprisepromotion.MySQLStore
-	Resolver            *enterpriseevidence.Resolver
-	Publisher           *enterpriseevidence.Publisher
-	Graph               *enterprisegraph.Neo4jClient
-	Ingest              *raw.Engine
-	WebDir              string
-	Token               string
-	SessionCookieSecure bool
-	MaxUploadBytes      int64
+	Admin                 *enterpriseadmin.MySQLStore
+	API                   *enterpriseapi.Service
+	Ask                   *enterpriseask.Service
+	Audit                 *enterpriseaudit.Store
+	Auth                  *enterpriseauth.Store
+	Batches               *enterpriseingest.Store
+	Promotion             *enterprisepromotion.MySQLStore
+	Resolver              *enterpriseevidence.Resolver
+	Publisher             *enterpriseevidence.Publisher
+	Graph                 *enterprisegraph.Neo4jClient
+	Ingest                *raw.Engine
+	WebDir                string
+	Token                 string
+	SessionCookieSecure   bool
+	TrustProxyHeaders     bool
+	MaxUploadBytes        int64
+	MaxBatchUploadBytes   int64
+	MaxBatchExpandedBytes int64
+	MaxBatchFiles         int
+	StagingRoot           string
 }
 
 func (s *Server) Handler() http.Handler {
@@ -49,16 +60,26 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/enterprise/user", s.handleUserUpdate)
 	mux.HandleFunc("/api/enterprise/user/password/reset", s.handleUserPasswordReset)
 	mux.HandleFunc("/api/enterprise/upload", s.handleUpload)
+	mux.HandleFunc("/api/enterprise/batches", s.handleBatches)
+	mux.HandleFunc("/api/enterprise/batch", s.handleBatch)
+	mux.HandleFunc("/api/enterprise/batch/file", s.handleBatchFile)
+	mux.HandleFunc("/api/enterprise/batch/start", s.handleBatchStart)
+	mux.HandleFunc("/api/enterprise/batch/file/retry", s.handleBatchRetry)
+	mux.HandleFunc("/api/enterprise/audit", s.handleAudit)
 	mux.HandleFunc("/api/enterprise/overview", s.handleOverview)
 	mux.HandleFunc("/api/enterprise/tasks", s.handleTasks)
 	mux.HandleFunc("/api/enterprise/evidences", s.handleEvidences)
+	mux.HandleFunc("/api/enterprise/facets", s.handleFacets)
 	mux.HandleFunc("/api/enterprise/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/enterprise/documents", s.handleDocuments)
 	mux.HandleFunc("/api/enterprise/distill", s.handleDistill)
 	mux.HandleFunc("/api/enterprise/wikis", s.handleWikis)
 	mux.HandleFunc("/api/enterprise/wiki", s.handleWiki)
 	mux.HandleFunc("/api/enterprise/evidence", s.handleEvidence)
+	mux.HandleFunc("/api/enterprise/evidence/source", s.handleEvidenceSource)
+	mux.HandleFunc("/api/enterprise/evidence/source/file", s.handleEvidenceSourceFile)
 	mux.HandleFunc("/api/enterprise/graph", s.handleGraph)
+	mux.HandleFunc("/api/enterprise/ask", s.handleAsk)
 	mux.HandleFunc("/api/enterprise/search", s.handleSearch)
 	mux.HandleFunc("/api/enterprise/package", s.handlePackage)
 	mux.HandleFunc("/", s.handleStatic)
@@ -129,7 +150,8 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
 	}
-	items, err := s.Admin.ListCompileTasks(r.Context(), queryInt(r, "limit", 200))
+	page, pageSize := queryInt(r, "page", 1), queryInt(r, "page_size", 30)
+	items, total, err := s.Admin.ListTasksPage(r.Context(), enterpriseadmin.PageQuery{Page: page, PageSize: pageSize, Query: r.URL.Query().Get("q"), Status: r.URL.Query().Get("status")})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -137,7 +159,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []enterpriseadmin.CompileTaskView{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"tasks": items, "total": len(items)})
+	writeJSON(w, http.StatusOK, map[string]any{"tasks": items, "total": total, "page": page, "page_size": pageSize})
 }
 
 func (s *Server) handleEvidences(w http.ResponseWriter, r *http.Request) {
@@ -149,7 +171,17 @@ func (s *Server) handleEvidences(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	items, err := s.Admin.ListEvidence(r.Context(), queryInt(r, "limit", 200))
+	page, pageSize := queryInt(r, "page", 1), queryInt(r, "page_size", 30)
+	var active *bool
+	if raw := strings.TrimSpace(r.URL.Query().Get("active")); raw != "" {
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "active must be true or false")
+			return
+		}
+		active = &value
+	}
+	items, total, err := s.Admin.ListEvidencePage(r.Context(), enterpriseadmin.PageQuery{Page: page, PageSize: pageSize, Query: r.URL.Query().Get("q"), Active: active})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -157,7 +189,24 @@ func (s *Server) handleEvidences(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []enterpriseadmin.EvidenceListView{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"evidences": items, "total": len(items)})
+	writeJSON(w, http.StatusOK, map[string]any{"evidences": items, "total": total, "page": page, "page_size": pageSize})
+}
+
+func (s *Server) handleFacets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || s.Admin == nil {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w)
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "metadata facets unavailable")
+		}
+		return
+	}
+	facets, err := s.Admin.Facets(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, facets)
 }
 
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
@@ -173,8 +222,13 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"users":           s.Auth != nil,
 		"documents":       s.Admin != nil,
 		"upload":          s.Ingest != nil,
+		"batch_ingestion": s.Batches != nil,
 		"tasks":           s.Admin != nil,
+		"audit":           s.Audit != nil,
 		"evidence":        s.Resolver != nil,
+		"source_viewer":   s.Resolver != nil && s.Publisher != nil,
+		"ask":             s.Ask != nil,
+		"ask_answering":   s.Ask != nil && s.Ask.Answerer != nil,
 		"search":          s.API != nil,
 		"package_sources": s.Publisher != nil,
 		"promotion":       s.Promotion != nil,
@@ -192,7 +246,12 @@ func (s *Server) handleDocuments(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	items, err := s.Admin.ListDocumentVersions(r.Context(), queryInt(r, "limit", 200))
+	page, pageSize := queryInt(r, "page", 1), queryInt(r, "page_size", 30)
+	items, total, err := s.Admin.ListDocumentVersionsPage(r.Context(), enterpriseadmin.PageQuery{
+		Page: page, PageSize: pageSize, Query: r.URL.Query().Get("q"), Lifecycle: r.URL.Query().Get("lifecycle"),
+		Company: r.URL.Query().Get("company"), SourceDepartment: r.URL.Query().Get("source_department"),
+		DocumentType: r.URL.Query().Get("document_type"), MaterialCategory: r.URL.Query().Get("material_category"), DocumentID: r.URL.Query().Get("document_id"),
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -200,7 +259,7 @@ func (s *Server) handleDocuments(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []enterpriseadmin.DocumentVersionView{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"documents": items, "total": len(items)})
+	writeJSON(w, http.StatusOK, map[string]any{"documents": items, "total": total, "page": page, "page_size": pageSize})
 }
 
 func (s *Server) handleDistill(w http.ResponseWriter, r *http.Request) {
@@ -236,6 +295,7 @@ func (s *Server) handleDistill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.auditRequest(r, "document.distill.mark", "document_version", req.VersionID, req.VersionID, "SUCCESS", map[string]any{"reason": req.Reason})
 	writeJSON(w, http.StatusOK, map[string]any{"version_id": req.VersionID, "status": "RECOMMENDED"})
 }
 
@@ -248,7 +308,8 @@ func (s *Server) handleWikis(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	items, err := s.Admin.ListWikis(r.Context(), queryInt(r, "limit", 200))
+	page, pageSize := queryInt(r, "page", 1), queryInt(r, "page_size", 30)
+	items, total, err := s.Admin.ListWikisPage(r.Context(), enterpriseadmin.PageQuery{Page: page, PageSize: pageSize, Query: r.URL.Query().Get("q"), Lifecycle: r.URL.Query().Get("lifecycle"), WikiType: r.URL.Query().Get("wiki_type"), WikiID: r.URL.Query().Get("wiki_id"), CanonicalSubjectID: r.URL.Query().Get("canonical_subject_id")})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -256,7 +317,7 @@ func (s *Server) handleWikis(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []enterpriseadmin.WikiView{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"wikis": items, "total": len(items)})
+	writeJSON(w, http.StatusOK, map[string]any{"wikis": items, "total": total, "page": page, "page_size": pageSize})
 }
 
 func (s *Server) handleWiki(w http.ResponseWriter, r *http.Request) {
@@ -304,6 +365,41 @@ func (s *Server) handleEvidence(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, items[0])
 }
 
+func (s *Server) handleEvidenceSource(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || s.Resolver == nil || s.Publisher == nil || s.Publisher.Objects == nil {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w)
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "evidence source unavailable")
+		}
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	items, err := s.Resolver.Resolve(r.Context(), []string{id})
+	if err != nil || len(items) != 1 {
+		writeError(w, http.StatusNotFound, "evidence unavailable")
+		return
+	}
+	item := items[0]
+	info, err := s.Publisher.Objects.Stat(r.Context(), item.ObjectKey)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "original source unavailable")
+		return
+	}
+	expiry := 10 * time.Minute
+	url, err := s.Publisher.Objects.PresignGet(r.Context(), item.ObjectKey, expiry)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.auditRequest(r, "evidence.source.open", "evidence", item.EvidenceID, item.ObjectKey, "SUCCESS", map[string]any{"document_id": item.DocumentID, "version_id": item.VersionID})
+	writeJSON(w, http.StatusOK, map[string]any{"evidence_id": item.EvidenceID, "document_id": item.DocumentID, "version_id": item.VersionID, "object_key": item.ObjectKey, "content_type": info.ContentType, "size_bytes": info.Size, "location": item.RawLocation, "view_url": "/api/enterprise/evidence/source/file?id=" + item.EvidenceID, "download_url": url, "expires_at": time.Now().UTC().Add(expiry)})
+}
+
 func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet || s.Graph == nil {
 		if r.Method != http.MethodGet {
@@ -324,6 +420,28 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"relations": hits, "total": len(hits)})
+}
+
+func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || s.Ask == nil {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w)
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "enterprise ask is unavailable")
+		}
+		return
+	}
+	var req enterpriseask.Request
+	if err := decodeJSON(w, r, &req); err != nil {
+		return
+	}
+	result, err := s.Ask.Ask(r.Context(), req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.auditRequest(r, "knowledge.ask", "search", result.SearchID, "enterprise ask", "SUCCESS", map[string]any{"citation_count": len(result.Citations), "evidence_only": result.EvidenceOnly})
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -365,6 +483,7 @@ func (s *Server) handlePackage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.auditRequest(r, "source_package.create", "source_package", result.PackageID, result.ObjectKey, "SUCCESS", map[string]any{"evidence_count": len(req.EvidenceIDs), "version_count": len(result.Manifest.Versions)})
 	writeJSON(w, http.StatusOK, result)
 }
 

@@ -3,27 +3,31 @@ import { useState } from 'preact/hooks';
 import type { EnterpriseUser } from '../lib/api';
 import { Icon, type IconName } from './ui';
 
-export type EnterpriseSection = 'dashboard' | 'search' | 'documents' | 'wiki' | 'graph' | 'evidence' | 'tasks' | 'admin';
+export type EnterpriseSection = 'dashboard' | 'ask' | 'search' | 'documents' | 'wiki' | 'graph' | 'evidence' | 'tasks' | 'audit' | 'admin';
 
 const navigation: Array<{ id: EnterpriseSection; label: string; description: string; icon: IconName; adminOnly?: boolean }> = [
   { id: 'dashboard', label: '总览', description: 'Knowledge health', icon: 'dashboard' },
-  { id: 'search', label: '知识检索', description: 'Evidence-first search', icon: 'search' },
+  { id: 'ask', label: '企业问答', description: 'Answer with citations', icon: 'sparkles' },
+  { id: 'search', label: '高级检索', description: 'Evidence-first search', icon: 'search' },
   { id: 'documents', label: '文档资产', description: 'Versions & lifecycle', icon: 'documents' },
   { id: 'wiki', label: '企业百科', description: 'Claims & citations', icon: 'wiki' },
   { id: 'graph', label: '关系图谱', description: 'Evidence-backed graph', icon: 'graph' },
   { id: 'evidence', label: '证据中心', description: 'Raw provenance', icon: 'evidence' },
-  { id: 'tasks', label: '任务中心', description: 'Compile pipeline', icon: 'tasks', adminOnly: true },
+  { id: 'tasks', label: '任务中心', description: 'My ingestion progress', icon: 'tasks' },
+  { id: 'audit', label: '审计日志', description: 'Actor · action · target', icon: 'shield', adminOnly: true },
   { id: 'admin', label: '系统管理', description: 'Users & runtime', icon: 'admin', adminOnly: true },
 ];
 
 const pageMeta: Record<EnterpriseSection, { title: string; description: string }> = {
   dashboard: { title: '企业知识总览', description: '把文档、事实、Wiki、Graph 与 Evidence 作为一套可追溯知识资产持续管理。' },
-  search: { title: '可信知识检索', description: '四路候选统一 Rerank，所有最终结果必须通过 Evidence Resolver 回到 Raw。' },
-  documents: { title: '文档知识资产', description: '从原始文件到 Summary / Wiki / Graph，查看每一个 Version 的知识生命周期。' },
-  wiki: { title: '企业百科', description: '以 Claim 为核心阅读知识，并直接查看支撑该 Claim 的事实与原始证据。' },
-  graph: { title: '关系图谱', description: '只浏览拥有 ACTIVE Evidence Support 的企业关系，支持 1–2 hop 有界扩展。' },
-  evidence: { title: 'Evidence Center', description: '所有高阶知识的可信根：Document Version、原始位置与原始内容。' },
-  tasks: { title: '知识编译任务', description: '查看解析、编译和知识更新任务的状态、耗时与失败原因。' },
+  ask: { title: '企业知识问答', description: '先检索可验证知识，再基于 Evidence 回答；每个引用都可以继续打开原文。' },
+  search: { title: '高级知识检索', description: '四路候选统一 Rerank，所有最终结果必须通过 Evidence Resolver 回到 Raw。' },
+  documents: { title: '文档知识资产', description: '批量上传、后台解压、逐文件 Metadata 调整，并跟踪每个 Version 的知识生命周期。' },
+  wiki: { title: '企业百科', description: '保留百科式可视化阅读，以 Claim 为核心查看事实、章节和原始证据。' },
+  graph: { title: '关系图谱', description: '保留 Evidence-backed Graph 可视化，支持关系浏览与 1–2 hop 有界扩展。' },
+  evidence: { title: 'Evidence Center', description: '所有高阶知识的可信根：Document Version、原始位置、原始内容和源文件定位。' },
+  tasks: { title: '知识处理任务', description: '统一查看文件解析、Embedding、索引、激活与知识编译的真实进度。' },
+  audit: { title: '审计日志', description: '按 actor / action / target / outcome 查看有业务和安全意义的操作历史。' },
   admin: { title: '系统管理', description: '管理企业账号、运行能力与关键质量门，不展示任何敏感凭据。' },
 };
 
@@ -85,7 +89,7 @@ export function EnterpriseShell({ section, onNavigate, children, error, busy, on
           <div class="flex items-center gap-2">
             {onRefresh && <button onClick={onRefresh} disabled={busy} title="刷新当前数据" class="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 shadow-sm transition hover:text-slate-900 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400 dark:hover:text-white"><Icon name="refresh" class={busy ? 'animate-spin' : ''} /></button>}
             <button onClick={toggleTheme} title="切换明暗主题" class="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 shadow-sm transition hover:text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400 dark:hover:text-white"><Icon name="sparkles" /></button>
-            <button onClick={() => navigate('search')} class="hidden items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-950 sm:flex dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:text-white"><Icon name="search" size={16} />搜索知识</button>
+            <button onClick={() => navigate('ask')} class="hidden items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-950 sm:flex dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:text-white"><Icon name="sparkles" size={16} />问知识</button>
             <div class="relative">
               <button onClick={() => setAccountOpen(value => !value)} class="flex items-center gap-2 rounded-xl border border-slate-200 bg-white p-1.5 pr-2.5 shadow-sm transition hover:border-slate-300 dark:border-slate-700 dark:bg-slate-900">
                 <div class="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-950 text-xs font-semibold text-white dark:bg-white dark:text-slate-950">{(user.display_name || user.username).slice(0, 1).toUpperCase()}</div>

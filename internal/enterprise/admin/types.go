@@ -70,17 +70,21 @@ type OverviewView struct {
 }
 
 type CompileTaskView struct {
-	TaskID       string     `json:"task_id"`
-	VersionID    string     `json:"version_id,omitempty"`
-	LogicalName  string     `json:"logical_name,omitempty"`
-	TaskType     string     `json:"task_type"`
-	Status       string     `json:"status"`
-	Attempt      uint64     `json:"attempt"`
-	ErrorCode    string     `json:"error_code,omitempty"`
-	ErrorMessage string     `json:"error_message,omitempty"`
-	StartedAt    *time.Time `json:"started_at,omitempty"`
-	FinishedAt   *time.Time `json:"finished_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
+	TaskID        string     `json:"task_id"`
+	Source        string     `json:"source,omitempty"`
+	BatchID       string     `json:"batch_id,omitempty"`
+	FileID        string     `json:"file_id,omitempty"`
+	VersionID     string     `json:"version_id,omitempty"`
+	LogicalName   string     `json:"logical_name,omitempty"`
+	TaskType      string     `json:"task_type"`
+	Status        string     `json:"status"`
+	ProgressStage string     `json:"progress_stage,omitempty"`
+	Attempt       uint64     `json:"attempt"`
+	ErrorCode     string     `json:"error_code,omitempty"`
+	ErrorMessage  string     `json:"error_message,omitempty"`
+	StartedAt     *time.Time `json:"started_at,omitempty"`
+	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
 }
 
 type EvidenceListView struct {

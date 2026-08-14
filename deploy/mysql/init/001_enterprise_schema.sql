@@ -366,3 +366,71 @@ CREATE TABLE IF NOT EXISTS enterprise_setting (
   setting_value VARCHAR(512) NOT NULL,
   updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS ingestion_batch (
+  batch_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
+  created_by CHAR(36) CHARACTER SET ascii NULL,
+  created_by_username VARCHAR(64) NOT NULL,
+  status ENUM('STAGED','QUEUED','RUNNING','SUCCEEDED','PARTIAL','FAILED') NOT NULL DEFAULT 'STAGED',
+  source_count INT UNSIGNED NOT NULL DEFAULT 0,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  started_at TIMESTAMP(6) NULL,
+  finished_at TIMESTAMP(6) NULL,
+  KEY idx_ingestion_batch_created (created_at),
+  KEY idx_ingestion_batch_actor (created_by, created_at),
+  KEY idx_ingestion_batch_status (status, updated_at)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS ingestion_file (
+  file_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
+  batch_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  relative_path VARCHAR(1024) NOT NULL,
+  original_filename VARCHAR(512) NOT NULL,
+  staging_path VARCHAR(2048) NOT NULL,
+  size_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  sha256 CHAR(64) CHARACTER SET ascii NOT NULL,
+  logical_name VARCHAR(512) NOT NULL,
+  source_department VARCHAR(255) NOT NULL DEFAULT '',
+  material_category VARCHAR(255) NOT NULL DEFAULT '',
+  company VARCHAR(255) NOT NULL DEFAULT '',
+  document_type VARCHAR(128) NOT NULL DEFAULT '',
+  document_date DATE NULL,
+  manual_tags JSON NULL,
+  status ENUM('STAGED','QUEUED','RUNNING','SUCCEEDED','FAILED') NOT NULL DEFAULT 'STAGED',
+  progress_stage VARCHAR(64) NOT NULL DEFAULT 'STAGED',
+  attempt INT UNSIGNED NOT NULL DEFAULT 0,
+  document_id CHAR(36) CHARACTER SET ascii NULL,
+  version_id CHAR(36) CHARACTER SET ascii NULL,
+  error_code VARCHAR(128) NOT NULL DEFAULT '',
+  error_message TEXT NULL,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  started_at TIMESTAMP(6) NULL,
+  finished_at TIMESTAMP(6) NULL,
+  KEY idx_ingestion_file_batch (batch_id, created_at),
+  KEY idx_ingestion_file_status (status, updated_at),
+  KEY idx_ingestion_file_sha (sha256),
+  CONSTRAINT fk_ingestion_file_batch FOREIGN KEY (batch_id) REFERENCES ingestion_batch(batch_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS audit_event (
+  event_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
+  actor_user_id CHAR(36) CHARACTER SET ascii NULL,
+  actor_username VARCHAR(64) NOT NULL,
+  actor_role VARCHAR(32) NOT NULL,
+  action VARCHAR(128) CHARACTER SET ascii NOT NULL,
+  target_type VARCHAR(64) CHARACTER SET ascii NOT NULL DEFAULT '',
+  target_id VARCHAR(255) CHARACTER SET ascii NOT NULL DEFAULT '',
+  target_name VARCHAR(512) NOT NULL DEFAULT '',
+  outcome ENUM('SUCCESS','FAILURE') NOT NULL DEFAULT 'SUCCESS',
+  request_id VARCHAR(64) CHARACTER SET ascii NOT NULL DEFAULT '',
+  ip_address VARCHAR(64) CHARACTER SET ascii NOT NULL DEFAULT '',
+  user_agent VARCHAR(512) NOT NULL DEFAULT '',
+  details_json JSON NULL,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  KEY idx_audit_created (created_at),
+  KEY idx_audit_actor (actor_username, created_at),
+  KEY idx_audit_action (action, created_at),
+  KEY idx_audit_target (target_type, target_id, created_at)
+) ENGINE=InnoDB;

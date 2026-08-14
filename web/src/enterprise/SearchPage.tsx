@@ -1,34 +1,30 @@
-import { useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
 import {
+  fetchEnterpriseFacets,
   packageEnterpriseSources,
   searchEnterpriseKnowledge,
-  type EnterpriseDocumentVersion,
   type EnterpriseEvidence,
+  type EnterpriseFacets,
   type EnterprisePublishedPackage,
   type EnterpriseSearchFilters,
   type EnterpriseSearchResponse,
 } from '../lib/api';
 import { EmptyState, Icon, PrimaryButton, SecondaryButton, SectionTitle, shortID } from './ui';
 
-export function SearchPage({ documents, onOpenEvidence, onError }: {
-  documents: EnterpriseDocumentVersion[];
+export function SearchPage({ onOpenEvidence, onError }: {
   onOpenEvidence: (evidence: EnterpriseEvidence) => void;
   onError: (message: string) => void;
 }) {
   const [query, setQuery] = useState('');
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [filters, setFilters] = useState<EnterpriseSearchFilters>({});
+  const [facets, setFacets] = useState<EnterpriseFacets>({ companies: [], source_departments: [], document_types: [], material_categories: [] });
   const [response, setResponse] = useState<EnterpriseSearchResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [packaging, setPackaging] = useState(false);
   const [published, setPublished] = useState<EnterprisePublishedPackage | null>(null);
 
-  const filterOptions = useMemo(() => ({
-    companies: unique(documents.map(item => item.company)),
-    departments: unique(documents.map(item => item.source_department)),
-    types: unique(documents.map(item => item.document_type)),
-    categories: unique(documents.map(item => item.material_category)),
-  }), [documents]);
+  useEffect(() => { fetchEnterpriseFacets().then(setFacets).catch(() => undefined); }, []);
 
   const evidence = useMemo(() => {
     const seen = new Set<string>();
@@ -90,10 +86,10 @@ export function SearchPage({ documents, onOpenEvidence, onError }: {
       <div class="px-5 py-4 sm:px-8">
         <button onClick={() => setFiltersOpen(value => !value)} class="inline-flex items-center gap-2 text-sm font-medium text-slate-600 hover:text-slate-950 dark:text-slate-300 dark:hover:text-white"><Icon name="filter" size={15}/>{filtersOpen ? '收起 Metadata Filter' : '展开 Metadata Filter'}<Icon name="chevron" size={13} class={filtersOpen ? 'rotate-90 transition-transform' : 'transition-transform'}/></button>
         {filtersOpen && <div class="mt-4 grid gap-3 rounded-2xl bg-slate-50 p-4 sm:grid-cols-2 xl:grid-cols-4 dark:bg-slate-950/60">
-          <FilterSelect label="Company" value={filters.company || ''} options={filterOptions.companies} onChange={value => setFilters(prev => ({ ...prev, company: value || undefined }))}/>
-          <FilterSelect label="Document Type" value={filters.document_type || ''} options={filterOptions.types} onChange={value => setFilters(prev => ({ ...prev, document_type: value || undefined }))}/>
-          <FilterSelect label="Department" value={filters.source_department || ''} options={filterOptions.departments} onChange={value => setFilters(prev => ({ ...prev, source_department: value || undefined }))}/>
-          <FilterSelect label="Material Category" value={filters.material_category || ''} options={filterOptions.categories} onChange={value => setFilters(prev => ({ ...prev, material_category: value || undefined }))}/>
+          <FilterSelect label="Company" value={filters.company || ''} options={facets.companies || []} onChange={value => setFilters(prev => ({ ...prev, company: value || undefined }))}/>
+          <FilterSelect label="Document Type" value={filters.document_type || ''} options={facets.document_types || []} onChange={value => setFilters(prev => ({ ...prev, document_type: value || undefined }))}/>
+          <FilterSelect label="Department" value={filters.source_department || ''} options={facets.source_departments || []} onChange={value => setFilters(prev => ({ ...prev, source_department: value || undefined }))}/>
+          <FilterSelect label="Material Category" value={filters.material_category || ''} options={facets.material_categories || []} onChange={value => setFilters(prev => ({ ...prev, material_category: value || undefined }))}/>
         </div>}
       </div>
     </section>
@@ -108,6 +104,7 @@ export function SearchPage({ documents, onOpenEvidence, onError }: {
             <div class="flex items-center gap-2"><ResultTypeBadge value={result.result_type}/><span class="text-xs text-slate-400">Rank #{index + 1}</span></div>
             <div class="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-300">Rerank {Number(result.score || 0).toFixed(4)}</div>
           </div>
+          {matchTerms(query, result.knowledge, result.evidence || []).length > 0 && <div class="mt-3 flex flex-wrap items-center gap-2"><span class="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">为什么命中</span>{matchTerms(query, result.knowledge, result.evidence || []).map(term => <span key={term} class="rounded-full bg-amber-50 px-2.5 py-1 text-[11px] font-medium text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">“{term}”</span>)}</div>}
           <div class="mt-4 whitespace-pre-wrap text-sm leading-7 text-slate-700 dark:text-slate-200">{result.knowledge}</div>
           <div class="mt-5 border-t border-slate-100 pt-4 dark:border-slate-800">
             <div class="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.12em] text-slate-400"><Icon name="shield" size={14}/>Raw Evidence</div>
@@ -124,7 +121,7 @@ export function SearchPage({ documents, onOpenEvidence, onError }: {
           {evidence.length > 0 && <div class="mt-4"><SecondaryButton onClick={() => void packageSources()} disabled={packaging} icon="download">{packaging ? '打包中…' : '打包本次使用资料'}</SecondaryButton></div>}
           {published && <div class="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300"><div class="font-semibold">资料包已生成</div><div class="mt-1">{published.manifest?.versions?.length || 0} 个精确 Document Version</div><a href={published.download_url} target="_blank" rel="noreferrer" class="mt-2 inline-flex items-center gap-1 font-semibold underline underline-offset-2"><Icon name="download" size={13}/>下载 ZIP</a></div>}
         </div>
-        <div class="rounded-2xl border border-blue-200 bg-blue-50 p-4 text-xs leading-6 text-blue-800 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-300"><div class="font-semibold">为什么这里不直接伪造“AI 最终答案”？</div><p class="mt-1">Knowledge Server 的职责是交付经过证据门的 Knowledge + Evidence。最终自然语言回答由上层 Agent 基于这些证据生成，避免把检索层和回答层混成不可审计的黑盒。</p></div>
+        <div class="rounded-2xl border border-blue-200 bg-blue-50 p-4 text-xs leading-6 text-blue-800 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-300"><div class="font-semibold">高级检索与企业问答分工</div><p class="mt-1">这里保留专业的 Raw / Summary / Wiki / Graph 检索结果、Rerank 分数和 Evidence 链，方便研究与排错；普通员工可以使用“企业问答”获得带 Citation 的自然语言答案。</p></div>
       </aside>
     </section>}
   </div>;
@@ -145,10 +142,23 @@ function ResultTypeBadge({ value }: { value: string }) {
   return <span class={`rounded-full px-2.5 py-1 text-[11px] font-semibold tracking-wide ${tones[normalized] || tones.RAW}`}>{normalized}</span>;
 }
 
-function unique(values: Array<string | undefined>) {
-  return Array.from(new Set(values.map(value => value?.trim()).filter((value): value is string => Boolean(value)))).sort((a, b) => a.localeCompare(b, 'zh-CN'));
-}
-
 function cleanFilters(filters: EnterpriseSearchFilters): EnterpriseSearchFilters {
   return Object.fromEntries(Object.entries(filters).filter(([, value]) => Array.isArray(value) ? value.length > 0 : Boolean(value))) as EnterpriseSearchFilters;
+}
+
+function matchTerms(query: string, knowledge: string, evidence: EnterpriseEvidence[]): string[] {
+  const text = `${knowledge}\n${evidence.map(item => item.raw_content || '').join('\n')}`.toLowerCase();
+  const raw = query.trim().toLowerCase();
+  const candidates: string[] = [];
+  if (raw.length >= 2 && raw.length <= 36) candidates.push(raw);
+  for (const token of raw.split(/[\s,，。；;：:！？!?、/\\()（）\[\]【】]+/)) {
+    const value = token.trim();
+    if (value.length >= 2) candidates.push(value);
+  }
+  const seen = new Set<string>();
+  return candidates.filter(term => {
+    if (seen.has(term) || !text.includes(term)) return false;
+    seen.add(term);
+    return true;
+  }).slice(0, 5);
 }

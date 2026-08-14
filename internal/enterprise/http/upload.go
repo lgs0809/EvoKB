@@ -110,6 +110,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.auditRequest(r, "document.upload.create", "document_version", result.VersionID, logicalName, "SUCCESS", map[string]any{"document_id": result.DocumentID, "filename": filename, "block_count": result.BlockCount, "evidence_count": result.EvidenceCount})
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"document_id":         result.DocumentID,
 		"version_id":          result.VersionID,

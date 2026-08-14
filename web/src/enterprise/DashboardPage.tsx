@@ -2,18 +2,26 @@ import type { EnterpriseDocumentVersion, EnterpriseOverview, EnterpriseTask, Ent
 import type { EnterpriseSection } from './EnterpriseShell';
 import { EmptyState, Icon, LoadingBlock, MetricCard, SectionTitle, StatusBadge, formatDate, formatNumber, pct } from './ui';
 
-export function DashboardPage({ overview, documents, wikis, tasks, onNavigate }: {
+export function DashboardPage({ overview, documents, wikis, tasks, onNavigate, isAdmin }: {
   overview: EnterpriseOverview | null;
   documents: EnterpriseDocumentVersion[];
   wikis: EnterpriseWiki[];
   tasks: EnterpriseTask[];
   onNavigate: (section: EnterpriseSection) => void;
+  isAdmin: boolean;
 }) {
   if (!overview) return <LoadingBlock rows={6} />;
   const recentDocuments = documents.slice(0, 6);
   const popular = [...documents].filter(item => item.effective_hits > 0).sort((a, b) => b.effective_hits - a.effective_hits).slice(0, 5);
   const recentTasks = tasks.slice(0, 5);
   const activeWiki = wikis.filter(item => item.lifecycle === 'ACTIVE').length;
+  const attention = [
+    { label: '失败的 Document Version', count: overview.failed_versions, section: 'documents' as EnterpriseSection, detail: '检查解析或索引失败原因', tone: 'rose' },
+    { label: 'STALE Summary', count: overview.stale_summaries, section: 'documents' as EnterpriseSection, detail: '源 Version 已变化，等待重新编译', tone: 'amber' },
+    { label: 'STALE Wiki', count: overview.stale_wikis, section: 'wiki' as EnterpriseSection, detail: '百科内容需要随新证据刷新', tone: 'violet' },
+    ...(isAdmin ? [{ label: '失败任务', count: overview.failed_tasks, section: 'tasks' as EnterpriseSection, detail: '查看失败阶段并按文件安全重试', tone: 'rose' }] : []),
+    { label: '高价值 Source', count: overview.recommended_sources, section: 'documents' as EnterpriseSection, detail: '已满足 Distillation 推荐条件', tone: 'blue' },
+  ].filter(item => item.count > 0);
 
   return <div class="space-y-8">
     <section class="relative overflow-hidden rounded-[28px] border border-slate-200/80 bg-slate-950 px-6 py-7 text-white shadow-xl shadow-slate-900/10 sm:px-8 sm:py-9 dark:border-slate-800">
@@ -25,7 +33,7 @@ export function DashboardPage({ overview, documents, wikis, tasks, onNavigate }:
           <h2 class="max-w-3xl text-3xl font-semibold tracking-tight sm:text-4xl">任何知识都能回到原始证据，<br class="hidden sm:block"/>任何变化都有清晰版本。</h2>
           <p class="mt-4 max-w-2xl text-sm leading-7 text-slate-300">当前知识库把 Raw、Summary、Wiki 与 Graph 统一到同一条 Evidence 链上。高阶知识无法解析回 Raw 时，不会进入最终可信结果。</p>
           <div class="mt-6 flex flex-wrap gap-3">
-            <button onClick={() => onNavigate('search')} class="inline-flex items-center gap-2 rounded-xl bg-white px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-slate-100"><Icon name="search" size={16}/>开始可信检索</button>
+            <button onClick={() => onNavigate('ask')} class="inline-flex items-center gap-2 rounded-xl bg-white px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-slate-100"><Icon name="sparkles" size={16}/>开始企业问答</button>
             <button onClick={() => onNavigate('documents')} class="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/5 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-white/10"><Icon name="documents" size={16}/>查看知识资产</button>
           </div>
         </div>
@@ -43,6 +51,11 @@ export function DashboardPage({ overview, documents, wikis, tasks, onNavigate }:
       <MetricCard label="Raw Knowledge Blocks" value={formatNumber(overview.raw_blocks)} hint={`${formatNumber(overview.active_evidence)} 条 ACTIVE Evidence`} icon="layers" tone="emerald" />
       <MetricCard label="企业 Wiki" value={formatNumber(overview.active_wikis || activeWiki)} hint={`${formatNumber(overview.stale_wikis)} 个待更新版本`} icon="wiki" tone="violet" />
       <MetricCard label="Evidence-backed Relations" value={formatNumber(overview.active_relations)} hint={`${formatNumber(overview.effective_hits)} 次最终有效引用`} icon="graph" tone="amber" />
+    </section>
+
+    <section class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:p-6">
+      <SectionTitle eyebrow="Attention" title="需要关注" description="不是只展示数字大屏；这里把当前真正需要处理的知识状态直接变成工作入口。" />
+      {attention.length > 0 ? <div class="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-5">{attention.map(item => <button key={item.label} onClick={() => onNavigate(item.section)} class="group rounded-2xl border border-slate-200 p-4 text-left transition hover:-translate-y-0.5 hover:border-blue-300 hover:shadow-sm dark:border-slate-800"><div class="flex items-start justify-between gap-3"><div class={`flex h-9 w-9 items-center justify-center rounded-xl ${attentionTone(item.tone)}`}><Icon name={item.tone === 'rose' ? 'warning' : item.tone === 'violet' ? 'wiki' : item.tone === 'blue' ? 'sparkles' : 'clock'} size={17}/></div><span class="text-2xl font-semibold">{formatNumber(item.count)}</span></div><div class="mt-3 text-sm font-semibold text-slate-700 dark:text-slate-200">{item.label}</div><div class="mt-1 text-xs leading-5 text-slate-400">{item.detail}</div><div class="mt-3 flex items-center gap-1 text-[11px] font-semibold text-blue-600 opacity-0 transition group-hover:opacity-100 dark:text-blue-400">立即处理 <Icon name="arrow" size={12}/></div></button>)}</div> : <div class="mt-5 flex items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-300"><Icon name="check" size={18}/><div><div class="font-semibold">当前没有需要立即处理的知识状态</div><div class="mt-0.5 text-xs opacity-80">失败 Version、STALE Wiki/Summary、失败任务和高价值 Source 均无待办。</div></div></div>}
     </section>
 
     <section class="grid gap-6 xl:grid-cols-[1.2fr_.8fr]">
@@ -112,4 +125,14 @@ function HealthBar({ label, value, total }: { label: string; value: number; tota
 
 function MiniStat({ label, value, danger }: { label: string; value: number; danger?: boolean }) {
   return <div><div class={`text-lg font-semibold ${danger ? 'text-rose-600 dark:text-rose-400' : 'text-slate-800 dark:text-slate-100'}`}>{formatNumber(value)}</div><div class="mt-1 text-[10px] uppercase tracking-wide text-slate-400">{label}</div></div>;
+}
+
+function attentionTone(tone: string) {
+  switch (tone) {
+    case 'rose': return 'bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300';
+    case 'amber': return 'bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300';
+    case 'violet': return 'bg-violet-50 text-violet-600 dark:bg-violet-950/40 dark:text-violet-300';
+    case 'blue': return 'bg-blue-50 text-blue-600 dark:bg-blue-950/40 dark:text-blue-300';
+    default: return 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-300';
+  }
 }

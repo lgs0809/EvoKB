@@ -78,6 +78,88 @@ var mysqlMigrations = []mysqlMigration{
   updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB`,
 	},
+	{
+		Version: 7,
+		Name:    "ingestion_batch",
+		SQL: `CREATE TABLE IF NOT EXISTS ingestion_batch (
+  batch_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
+  created_by CHAR(36) CHARACTER SET ascii NULL,
+  created_by_username VARCHAR(64) NOT NULL,
+  status ENUM('STAGED','QUEUED','RUNNING','SUCCEEDED','PARTIAL','FAILED') NOT NULL DEFAULT 'STAGED',
+  source_count INT UNSIGNED NOT NULL DEFAULT 0,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  started_at TIMESTAMP(6) NULL,
+  finished_at TIMESTAMP(6) NULL,
+  KEY idx_ingestion_batch_created (created_at),
+  KEY idx_ingestion_batch_actor (created_by, created_at),
+  KEY idx_ingestion_batch_status (status, updated_at)
+) ENGINE=InnoDB`,
+	},
+	{
+		Version: 8,
+		Name:    "ingestion_file",
+		SQL: `CREATE TABLE IF NOT EXISTS ingestion_file (
+  file_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
+  batch_id CHAR(36) CHARACTER SET ascii NOT NULL,
+  relative_path VARCHAR(1024) NOT NULL,
+  original_filename VARCHAR(512) NOT NULL,
+  staging_path VARCHAR(2048) NOT NULL,
+  size_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  sha256 CHAR(64) CHARACTER SET ascii NOT NULL,
+  logical_name VARCHAR(512) NOT NULL,
+  source_department VARCHAR(255) NOT NULL DEFAULT '',
+  material_category VARCHAR(255) NOT NULL DEFAULT '',
+  company VARCHAR(255) NOT NULL DEFAULT '',
+  document_type VARCHAR(128) NOT NULL DEFAULT '',
+  document_date DATE NULL,
+  manual_tags JSON NULL,
+  status ENUM('STAGED','QUEUED','RUNNING','SUCCEEDED','FAILED') NOT NULL DEFAULT 'STAGED',
+  progress_stage VARCHAR(64) NOT NULL DEFAULT 'STAGED',
+  attempt INT UNSIGNED NOT NULL DEFAULT 0,
+  document_id CHAR(36) CHARACTER SET ascii NULL,
+  version_id CHAR(36) CHARACTER SET ascii NULL,
+  error_code VARCHAR(128) NOT NULL DEFAULT '',
+  error_message TEXT NULL,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  started_at TIMESTAMP(6) NULL,
+  finished_at TIMESTAMP(6) NULL,
+  KEY idx_ingestion_file_batch (batch_id, created_at),
+  KEY idx_ingestion_file_status (status, updated_at),
+  KEY idx_ingestion_file_sha (sha256),
+  CONSTRAINT fk_ingestion_file_batch FOREIGN KEY (batch_id) REFERENCES ingestion_batch(batch_id) ON DELETE CASCADE
+) ENGINE=InnoDB`,
+	},
+	{
+		Version: 9,
+		Name:    "audit_event",
+		SQL: `CREATE TABLE IF NOT EXISTS audit_event (
+  event_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
+  actor_user_id CHAR(36) CHARACTER SET ascii NULL,
+  actor_username VARCHAR(64) NOT NULL,
+  actor_role VARCHAR(32) NOT NULL,
+  action VARCHAR(128) CHARACTER SET ascii NOT NULL,
+  target_type VARCHAR(64) CHARACTER SET ascii NOT NULL DEFAULT '',
+  target_id VARCHAR(255) CHARACTER SET ascii NOT NULL DEFAULT '',
+  target_name VARCHAR(512) NOT NULL DEFAULT '',
+  outcome ENUM('SUCCESS','FAILURE') NOT NULL DEFAULT 'SUCCESS',
+  request_id VARCHAR(64) CHARACTER SET ascii NOT NULL DEFAULT '',
+  ip_address VARCHAR(64) CHARACTER SET ascii NOT NULL DEFAULT '',
+  user_agent VARCHAR(512) NOT NULL DEFAULT '',
+  details_json JSON NULL,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  KEY idx_audit_created (created_at),
+  KEY idx_audit_actor (actor_username, created_at),
+  KEY idx_audit_action (action, created_at),
+  KEY idx_audit_target (target_type, target_id, created_at)
+) ENGINE=InnoDB`,
+	},
+	{
+		Version: 10,
+		Name:    "document_version_sha_index",
+		SQL:     `ALTER TABLE document_version ADD KEY idx_document_version_sha (sha256, created_at)`,
+	},
 }
 
 func ApplyMySQL(ctx context.Context, dsn string) error {
@@ -96,7 +178,26 @@ func ApplyMySQLDB(ctx context.Context, db *sql.DB) error {
 	if db == nil {
 		return fmt.Errorf("enterprise schema mysql db is required")
 	}
-	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS enterprise_schema_migration (
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("enterprise schema mysql connection: %w", err)
+	}
+	defer conn.Close()
+
+	const migrationLock = "enterprise_kb_schema_migration"
+	var acquired sql.NullInt64
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, 30)`, migrationLock).Scan(&acquired); err != nil {
+		return fmt.Errorf("enterprise schema migration lock: %w", err)
+	}
+	if !acquired.Valid || acquired.Int64 != 1 {
+		return fmt.Errorf("enterprise schema migration lock timeout")
+	}
+	defer func() {
+		var released sql.NullInt64
+		_ = conn.QueryRowContext(context.Background(), `SELECT RELEASE_LOCK(?)`, migrationLock).Scan(&released)
+	}()
+
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS enterprise_schema_migration (
   version INT NOT NULL PRIMARY KEY,
   name VARCHAR(255) NOT NULL,
   applied_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
@@ -105,19 +206,26 @@ func ApplyMySQLDB(ctx context.Context, db *sql.DB) error {
 	}
 	for _, migration := range mysqlMigrations {
 		var count int
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM enterprise_schema_migration WHERE version=?`, migration.Version).Scan(&count); err != nil {
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM enterprise_schema_migration WHERE version=?`, migration.Version).Scan(&count); err != nil {
 			return fmt.Errorf("enterprise schema migration %d check: %w", migration.Version, err)
 		}
 		if count > 0 {
 			continue
 		}
-		tx, err := db.BeginTx(ctx, nil)
+
+		present, err := migrationObjectAlreadyPresent(ctx, conn, migration)
+		if err != nil {
+			return fmt.Errorf("enterprise schema migration %d inspect: %w", migration.Version, err)
+		}
+		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("enterprise schema migration %d begin: %w", migration.Version, err)
 		}
-		if _, err := tx.ExecContext(ctx, migration.SQL); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("enterprise schema migration %d %s: %w", migration.Version, migration.Name, err)
+		if !present {
+			if _, err := tx.ExecContext(ctx, migration.SQL); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("enterprise schema migration %d %s: %w", migration.Version, migration.Name, err)
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO enterprise_schema_migration(version,name) VALUES(?,?)`, migration.Version, migration.Name); err != nil {
 			_ = tx.Rollback()
@@ -128,4 +236,18 @@ func ApplyMySQLDB(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+func migrationObjectAlreadyPresent(ctx context.Context, conn *sql.Conn, migration mysqlMigration) (bool, error) {
+	if migration.Name != "document_version_sha_index" {
+		return false, nil
+	}
+	var count int
+	if err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM information_schema.statistics
+WHERE table_schema=DATABASE() AND table_name='document_version' AND index_name='idx_document_version_sha'`).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }

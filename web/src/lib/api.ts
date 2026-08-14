@@ -74,6 +74,30 @@ export async function fetchStatus(): Promise<StatusData> {
   return res.json();
 }
 
+export interface EnterprisePageResponse<T> {
+  total: number;
+  page: number;
+  page_size: number;
+  items?: T[];
+}
+
+export interface EnterprisePageParams {
+  page?: number;
+  page_size?: number;
+  q?: string;
+  lifecycle?: string;
+  status?: string;
+  active?: boolean;
+  company?: string;
+  source_department?: string;
+  document_type?: string;
+  material_category?: string;
+  document_id?: string;
+  wiki_type?: string;
+  wiki_id?: string;
+  canonical_subject_id?: string;
+}
+
 export interface EnterpriseDocumentVersion {
   document_id: string;
   logical_name: string;
@@ -136,8 +160,8 @@ export interface EnterpriseGraphRelation {
   score: number;
 }
 
-export async function fetchEnterpriseDocuments(): Promise<{ documents: EnterpriseDocumentVersion[]; total: number }> {
-  const res = await fetch(`${BASE}/api/enterprise/documents`, { headers: authHeaders() });
+export async function fetchEnterpriseDocuments(params: EnterprisePageParams = {}): Promise<{ documents: EnterpriseDocumentVersion[]; total: number; page: number; page_size: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/documents?${pageQuery(params)}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Documents request failed: ${res.status}`);
   return res.json();
 }
@@ -150,8 +174,8 @@ export async function recommendEnterpriseDistill(versionId: string): Promise<voi
   if (!res.ok) throw new Error(`Distill request failed: ${res.status}`);
 }
 
-export async function fetchEnterpriseWikis(): Promise<{ wikis: EnterpriseWiki[]; total: number }> {
-  const res = await fetch(`${BASE}/api/enterprise/wikis`, { headers: authHeaders() });
+export async function fetchEnterpriseWikis(params: EnterprisePageParams = {}): Promise<{ wikis: EnterpriseWiki[]; total: number; page: number; page_size: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/wikis?${pageQuery(params)}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Wiki list request failed: ${res.status}`);
   return res.json();
 }
@@ -201,10 +225,14 @@ export interface EnterpriseOverview {
 
 export interface EnterpriseTask {
   task_id: string;
+  source?: 'COMPILE' | 'INGEST' | string;
+  batch_id?: string;
+  file_id?: string;
   version_id?: string;
   logical_name?: string;
   task_type: string;
   status: string;
+  progress_stage?: string;
   attempt: number;
   error_code?: string;
   error_message?: string;
@@ -233,8 +261,13 @@ export interface EnterpriseCapabilities {
   users: boolean;
   documents: boolean;
   upload: boolean;
+  batch_ingestion: boolean;
   tasks: boolean;
+  audit: boolean;
   evidence: boolean;
+  source_viewer: boolean;
+  ask: boolean;
+  ask_answering: boolean;
   search: boolean;
   package_sources: boolean;
   promotion: boolean;
@@ -287,14 +320,14 @@ export async function fetchEnterpriseOverview(): Promise<EnterpriseOverview> {
   return res.json();
 }
 
-export async function fetchEnterpriseTasks(limit = 200): Promise<{ tasks: EnterpriseTask[]; total: number }> {
-  const res = await fetch(`${BASE}/api/enterprise/tasks?limit=${limit}`, { headers: authHeaders() });
+export async function fetchEnterpriseTasks(params: EnterprisePageParams = {}): Promise<{ tasks: EnterpriseTask[]; total: number; page: number; page_size: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/tasks?${pageQuery(params)}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Tasks request failed: ${res.status}`);
   return res.json();
 }
 
-export async function fetchEnterpriseEvidences(limit = 200): Promise<{ evidences: EnterpriseEvidenceListItem[]; total: number }> {
-  const res = await fetch(`${BASE}/api/enterprise/evidences?limit=${limit}`, { headers: authHeaders() });
+export async function fetchEnterpriseEvidences(params: EnterprisePageParams = {}): Promise<{ evidences: EnterpriseEvidenceListItem[]; total: number; page: number; page_size: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/evidences?${pageQuery(params)}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Evidence list request failed: ${res.status}`);
   return res.json();
 }
@@ -498,4 +531,185 @@ export async function uploadEnterpriseDocument(file: File, metadata: {
   });
   if (!res.ok) throw await responseError(res, 'Document upload failed');
   return res.json();
+}
+
+export interface EnterpriseFacets {
+  companies: string[];
+  source_departments: string[];
+  document_types: string[];
+  material_categories: string[];
+}
+
+export interface EnterpriseIngestionFile {
+  file_id: string;
+  batch_id: string;
+  relative_path: string;
+  original_filename: string;
+  size_bytes: number;
+  sha256: string;
+  logical_name: string;
+  source_department?: string;
+  material_category?: string;
+  company?: string;
+  document_type?: string;
+  document_date?: string;
+  manual_tags?: string[];
+  status: string;
+  progress_stage: string;
+  attempt: number;
+  document_id?: string;
+  version_id?: string;
+  expected_behavior?: 'CREATE_DOCUMENT' | 'CREATE_VERSION' | 'REUSE_VERSION' | 'DUPLICATE_CONTENT' | string;
+  existing_document_id?: string;
+  existing_version_no?: number;
+  duplicate_document_id?: string;
+  duplicate_version_id?: string;
+  duplicate_logical_name?: string;
+  duplicate_version_lifecycle?: string;
+  error_code?: string;
+  error_message?: string;
+  created_at: string;
+  updated_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
+export interface EnterpriseIngestionBatch {
+  batch_id: string;
+  created_by?: string;
+  created_by_username: string;
+  status: string;
+  source_count: number;
+  file_count: number;
+  staged_count: number;
+  queued_count: number;
+  running_count: number;
+  succeeded_count: number;
+  failed_count: number;
+  created_at: string;
+  updated_at: string;
+  started_at?: string;
+  finished_at?: string;
+  files?: EnterpriseIngestionFile[];
+}
+
+export interface EnterpriseAuditEvent {
+  event_id: string;
+  actor_user_id?: string;
+  actor_username: string;
+  actor_role: string;
+  action: string;
+  target_type?: string;
+  target_id?: string;
+  target_name?: string;
+  outcome: 'SUCCESS' | 'FAILURE';
+  request_id?: string;
+  ip_address?: string;
+  user_agent?: string;
+  details?: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface EnterpriseEvidenceSource {
+  evidence_id: string;
+  document_id: string;
+  version_id: string;
+  object_key: string;
+  content_type?: string;
+  size_bytes: number;
+  location: Record<string, unknown>;
+  view_url: string;
+  download_url: string;
+  expires_at: string;
+}
+
+export interface EnterpriseAskCitation {
+  index: number;
+  result_type: string;
+  evidence: EnterpriseEvidence;
+}
+
+export interface EnterpriseAskResponse {
+  search_id: string;
+  answer: string;
+  citations: EnterpriseAskCitation[];
+  evidence_only: boolean;
+}
+
+export async function fetchEnterpriseFacets(): Promise<EnterpriseFacets> {
+  const res = await fetch(`${BASE}/api/enterprise/facets`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Metadata facets failed');
+  return res.json();
+}
+
+export async function createEnterpriseBatch(files: Array<{ file: File; relativePath?: string }>, metadata: Record<string, string> = {}): Promise<{ batch: EnterpriseIngestionBatch; rejected: string[] }> {
+  const form = new FormData();
+  for (const item of files) {
+    form.append('files', item.file, item.file.name);
+    form.append('relative_paths', item.relativePath || item.file.name);
+  }
+  for (const [key, value] of Object.entries(metadata)) if (value?.trim()) form.append(key, value.trim());
+  const res = await fetch(`${BASE}/api/enterprise/batches`, { method: 'POST', headers: authHeaders(), body: form });
+  if (!res.ok) throw await responseError(res, 'Batch upload failed');
+  return res.json();
+}
+
+export async function fetchEnterpriseBatches(params: EnterprisePageParams = {}): Promise<{ batches: EnterpriseIngestionBatch[]; total: number; page: number; page_size: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/batches?${pageQuery(params)}`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Batch list failed');
+  return res.json();
+}
+
+export async function fetchEnterpriseBatch(batchId: string): Promise<EnterpriseIngestionBatch> {
+  const res = await fetch(`${BASE}/api/enterprise/batch?id=${encodeURIComponent(batchId)}`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Batch lookup failed');
+  return res.json();
+}
+
+export async function updateEnterpriseBatchFile(fileId: string, input: { logical_name: string; source_department: string; material_category: string; company: string; document_type: string; document_date: string; manual_tags: string[] }): Promise<EnterpriseIngestionFile> {
+  const res = await fetch(`${BASE}/api/enterprise/batch/file?id=${encodeURIComponent(fileId)}`, { method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
+  if (!res.ok) throw await responseError(res, 'Batch file update failed');
+  const payload = await res.json();
+  return payload.file;
+}
+
+export async function startEnterpriseBatch(batchId: string): Promise<EnterpriseIngestionBatch> {
+  const res = await fetch(`${BASE}/api/enterprise/batch/start`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ batch_id: batchId }) });
+  if (!res.ok) throw await responseError(res, 'Batch start failed');
+  const payload = await res.json();
+  return payload.batch;
+}
+
+export async function retryEnterpriseBatchFile(fileId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/batch/file/retry`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ file_id: fileId }) });
+  if (!res.ok) throw await responseError(res, 'Ingestion retry failed');
+}
+
+export async function fetchEnterpriseAudit(params: EnterprisePageParams & { actor?: string; action?: string; outcome?: string } = {}): Promise<{ events: EnterpriseAuditEvent[]; total: number; page: number; page_size: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/audit?${pageQuery(params)}`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Audit request failed');
+  return res.json();
+}
+
+export async function fetchEnterpriseEvidenceSource(evidenceId: string): Promise<EnterpriseEvidenceSource> {
+  const res = await fetch(`${BASE}/api/enterprise/evidence/source?id=${encodeURIComponent(evidenceId)}`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Evidence source request failed');
+  return res.json();
+}
+
+export async function askEnterpriseKnowledge(question: string, filters: EnterpriseSearchFilters = {}, limit = 8): Promise<EnterpriseAskResponse> {
+  const res = await fetch(`${BASE}/api/enterprise/ask`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ question, filters, limit }) });
+  if (!res.ok) throw await responseError(res, 'Enterprise Ask failed');
+  return res.json();
+}
+
+function pageQuery(params: object): string {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === '' || value === 'ALL') continue;
+    query.set(key, String(value));
+  }
+  if (!query.has('page')) query.set('page', '1');
+  if (!query.has('page_size')) query.set('page_size', '30');
+  return query.toString();
 }

@@ -7,9 +7,11 @@ import (
 	"time"
 
 	enterpriseadmin "github.com/xoai/sage-wiki/internal/enterprise/admin"
+	enterpriseaudit "github.com/xoai/sage-wiki/internal/enterprise/audit"
 	enterpriseauth "github.com/xoai/sage-wiki/internal/enterprise/auth"
 	enterprisegraph "github.com/xoai/sage-wiki/internal/enterprise/graph"
 	enterprisehttp "github.com/xoai/sage-wiki/internal/enterprise/http"
+	enterpriseingest "github.com/xoai/sage-wiki/internal/enterprise/ingest"
 )
 
 func runServer(ctx context.Context, args []string) {
@@ -37,8 +39,20 @@ func runServer(ctx context.Context, args []string) {
 		fatalf("server auth store: %v", err)
 	}
 	defer authStore.Close()
+	auditStore, err := enterpriseaudit.OpenMySQL(ctx, mustEnv("EKB_MYSQL_DSN"))
+	if err != nil {
+		fatalf("server audit store: %v", err)
+	}
+	defer auditStore.Close()
+	batchStore, err := enterpriseingest.OpenMySQL(ctx, mustEnv("EKB_MYSQL_DSN"))
+	if err != nil {
+		fatalf("server ingestion store: %v", err)
+	}
+	defer batchStore.Close()
 	ingestEngine, closeIngest := mustEngine(ctx, true, false)
 	defer closeIngest()
+	worker := &enterpriseingest.Worker{Store: batchStore, Engine: ingestEngine, PollInterval: time.Second}
+	go func() { _ = worker.Run(ctx) }()
 
 	var graphClient *enterprisegraph.Neo4jClient
 	if envBool("EKB_RETRIEVAL_ENABLE_GRAPH", true) {
@@ -51,18 +65,26 @@ func runServer(ctx context.Context, args []string) {
 		)
 	}
 	server := &enterprisehttp.Server{
-		Admin:               adminStore,
-		API:                 runtime.API,
-		Auth:                authStore,
-		Promotion:           runtime.Promotion,
-		Resolver:            runtime.Resolver,
-		Publisher:           runtime.Publisher,
-		Graph:               graphClient,
-		Ingest:              ingestEngine,
-		WebDir:              *webDir,
-		Token:               os.Getenv("EKB_SERVER_TOKEN"),
-		SessionCookieSecure: envBool("EKB_SESSION_COOKIE_SECURE", false),
-		MaxUploadBytes:      int64(envPositiveInt("EKB_MAX_UPLOAD_MIB", 512)) << 20,
+		Admin:                 adminStore,
+		API:                   runtime.API,
+		Ask:                   openAskService(ctx, runtime.API),
+		Audit:                 auditStore,
+		Auth:                  authStore,
+		Batches:               batchStore,
+		Promotion:             runtime.Promotion,
+		Resolver:              runtime.Resolver,
+		Publisher:             runtime.Publisher,
+		Graph:                 graphClient,
+		Ingest:                ingestEngine,
+		WebDir:                *webDir,
+		Token:                 os.Getenv("EKB_SERVER_TOKEN"),
+		SessionCookieSecure:   envBool("EKB_SESSION_COOKIE_SECURE", false),
+		TrustProxyHeaders:     envBool("EKB_TRUST_PROXY_HEADERS", false),
+		MaxUploadBytes:        int64(envPositiveInt("EKB_MAX_UPLOAD_MIB", 512)) << 20,
+		MaxBatchUploadBytes:   int64(envPositiveInt("EKB_MAX_BATCH_UPLOAD_MIB", 4096)) << 20,
+		MaxBatchExpandedBytes: int64(envPositiveInt("EKB_MAX_BATCH_EXPANDED_MIB", 16384)) << 20,
+		MaxBatchFiles:         envPositiveInt("EKB_MAX_BATCH_FILES", 2000),
+		StagingRoot:           envOr("EKB_STAGING_ROOT", "/var/lib/enterprise-kb/staging"),
 	}
 	if err := server.Serve(ctx, *addr); err != nil {
 		fatalf("server: %v", err)
