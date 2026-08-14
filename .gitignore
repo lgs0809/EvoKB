@@ -36,6 +36,8 @@ dist-test/
 *.egg-info/
 
 # Local deployment secrets
+/.env
+/.env.local
 deploy/.env
 deploy/.env.local
 .pytest_cache/

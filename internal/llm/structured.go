@@ -264,6 +264,22 @@ func (c *Client) StructuredCompletion(ctx context.Context, messages []Message, s
 		return nil, "", fmt.Errorf("llm: structured completion: empty payload")
 	}
 
+	validated, verr := validateStructuredPayload(schema, payload)
+	if verr == nil {
+		return validated, "", nil
+	}
+
+	// Some OpenAI-compatible gateways accept response_format/json_schema but
+	// only treat it as a hint. Keep the canonical schema fail-closed, but allow
+	// one explicit repair turn before rejecting a semantically-close payload.
+	repaired, rerr := c.repairStructuredPayload(ctx, messages, schema, opts, payload, verr)
+	if rerr != nil {
+		return nil, "", fmt.Errorf("structured: schema validation failed: %v; repair failed: %w", verr, rerr)
+	}
+	return repaired, "", nil
+}
+
+func validateStructuredPayload(schema JSONSchema, payload json.RawMessage) (json.RawMessage, error) {
 	// Validate: envelope first, then the bare array schema (tolerant of
 	// providers and test doubles that answer the envelope-shaped request
 	// with the bare array — both are schema-validated; no silent pass).
@@ -273,19 +289,81 @@ func (c *Client) StructuredCompletion(ctx context.Context, messages []Message, s
 				Items json.RawMessage `json:"items"`
 			}
 			if uerr := json.Unmarshal(payload, &env); uerr != nil {
-				return nil, "", fmt.Errorf("structured: envelope unwrap: %w", uerr)
+				return nil, fmt.Errorf("structured: envelope unwrap: %w", uerr)
 			}
-			return env.Items, "", nil
+			return env.Items, nil
 		}
 		if err := ValidateJSON(schema.Schema, payload); err != nil {
-			return nil, "", err // content-invalid: constraint worked, shape wrong — NO fallback
+			return nil, err
 		}
-		return payload, "", nil
+		return payload, nil
 	}
 	if err := ValidateJSON(schema.Schema, payload); err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	return payload, "", nil
+	return payload, nil
+}
+
+func (c *Client) repairStructuredPayload(ctx context.Context, messages []Message, schema JSONSchema, opts CallOpts, invalid json.RawMessage, validationErr error) (json.RawMessage, error) {
+	wireSchema := schema.Schema
+	if schema.IsArray {
+		wireSchema = schema.Envelope()
+	}
+	schemaJSON, err := json.Marshal(wireSchema)
+	if err != nil {
+		return nil, fmt.Errorf("marshal repair schema: %w", err)
+	}
+	previous := strings.TrimSpace(string(invalid))
+	if runes := []rune(previous); len(runes) > 12000 {
+		previous = string(runes[:12000]) + "…"
+	}
+	repairInstruction := "Your previous structured JSON did not satisfy the required schema. Correct the shape and return ONLY valid JSON; do not add markdown or explanation. Preserve only claims supported by the original input.\nValidation error: " + validationErr.Error() + "\nRequired JSON Schema:\n" + string(schemaJSON)
+	if previous != "" {
+		repairInstruction += "\nPrevious JSON:\n" + previous
+	}
+	repairMessages := append(append([]Message(nil), messages...), Message{Role: "user", Content: repairInstruction})
+
+	// Force JSON syntax on the one repair turn without trusting the gateway to
+	// enforce field-level json_schema constraints. The canonical schema is still
+	// validated locally below; a second mismatch is a hard failure.
+	repairSchema := schema
+	repairSchema.Degraded = true
+	buildReq, ok, err := c.provider.FormatStructuredRequest(repairMessages, repairSchema, opts)
+	if err != nil {
+		return nil, fmt.Errorf("format repair request: %w", err)
+	}
+	if !ok {
+		payload, _, ferr := c.structuredFallback(ctx, repairMessages, schema, opts)
+		if ferr != nil {
+			return nil, ferr
+		}
+		return payload, nil
+	}
+
+	var repaired json.RawMessage
+	validate := func(body []byte) error {
+		payload, perr := c.provider.ParseStructuredResponse(body)
+		if perr != nil {
+			return perr
+		}
+		repaired = payload
+		return nil
+	}
+	body, err := c.doWithRetry(ctx, buildReq, validate, "parse repair structured response")
+	if err != nil {
+		return nil, err
+	}
+	if resp, rerr := c.provider.ParseResponse(body); rerr == nil && resp != nil {
+		c.trackUsage(ctx, resp.Model, resp.Usage)
+	}
+	if len(strings.TrimSpace(string(repaired))) == 0 {
+		return nil, fmt.Errorf("empty repair payload")
+	}
+	validated, err := validateStructuredPayload(schema, repaired)
+	if err != nil {
+		return nil, fmt.Errorf("validate repaired JSON: %w", err)
+	}
+	return validated, nil
 }
 
 // structuredFallback is the plain-completion + fence-strip path (used

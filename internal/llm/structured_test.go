@@ -11,16 +11,27 @@ import (
 type structuredStubProvider struct {
 	mechanismOK bool
 	body        []byte
+	repairBody  []byte
 	calls       *int32
+	parseCalls  *int32
+	plainCalls  *int32
+	plainBody   string
 	url         string
 }
 
 func (p structuredStubProvider) Name() string { return "stub" }
 func (p structuredStubProvider) FormatRequest(messages []Message, opts CallOpts) (*http.Request, error) {
-	return nil, nil
+	if p.plainCalls != nil {
+		atomic.AddInt32(p.plainCalls, 1)
+	}
+	return http.NewRequest("POST", p.url, nil)
 }
 func (p structuredStubProvider) ParseResponse(body []byte) (*Response, error) {
-	return &Response{Content: "plain", Model: "stub-model", Usage: Usage{InputTokens: 1, OutputTokens: 1}}, nil
+	content := p.plainBody
+	if content == "" {
+		content = "plain"
+	}
+	return &Response{Content: content, Model: "stub-model", Usage: Usage{InputTokens: 1, OutputTokens: 1}}, nil
 }
 func (p structuredStubProvider) SupportsVision() bool { return false }
 
@@ -35,6 +46,12 @@ func (p structuredStubProvider) FormatStructuredRequest(messages []Message, sche
 }
 
 func (p structuredStubProvider) ParseStructuredResponse(body []byte) (json.RawMessage, error) {
+	if p.parseCalls != nil {
+		call := atomic.AddInt32(p.parseCalls, 1)
+		if call > 1 && len(p.repairBody) > 0 {
+			return p.repairBody, nil
+		}
+	}
 	return p.body, nil
 }
 
@@ -101,6 +118,83 @@ func TestStructuredCompletionValidationErrorNoFallback(t *testing.T) {
 	}}
 	_, _, err := c.StructuredCompletion(t.Context(), []Message{{Role: "user", Content: "x"}}, schema, CallOpts{Model: "m"})
 	if err == nil {
-		t.Fatal("expected validation error (minItems), got nil — and it must NOT fall back")
+		t.Fatal("expected validation error (minItems), got nil — and it must NOT silently pass")
+	}
+}
+
+func TestStructuredCompletionRepairsGatewaySchemaDriftOnce(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok": true}`))
+	}))
+	defer server.Close()
+	var nativeCalls, parseCalls, plainCalls int32
+	validRepair := `{"facts":[{"section":"Overview","fact_text":"Amount is 3 million.","evidence_block_ids":["b1"]}]}`
+	p := structuredStubProvider{
+		mechanismOK: true,
+		body:        []byte(`{"facts":[{"source":"b1","fact":"Amount is 3 million."}]}`),
+		repairBody:  []byte(validRepair),
+		calls:       &nativeCalls,
+		parseCalls:  &parseCalls,
+		plainCalls:  &plainCalls,
+		url:         server.URL,
+	}
+	c := newStructuredClient(p, server)
+	schema := JSONSchema{Name: "facts", Schema: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"facts": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"section":            map[string]any{"type": "string"},
+						"fact_text":          map[string]any{"type": "string"},
+						"evidence_block_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					},
+					"required": []string{"section", "fact_text", "evidence_block_ids"},
+				},
+			},
+		},
+		"required": []string{"facts"},
+	}}
+	payload, _, err := c.StructuredCompletion(t.Context(), []Message{{Role: "user", Content: "x"}}, schema, CallOpts{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(payload) != validRepair {
+		t.Fatalf("payload = %s", payload)
+	}
+	if nativeCalls != 2 || parseCalls != 2 || plainCalls != 0 {
+		t.Fatalf("calls native=%d parse=%d plain=%d, want 2/2/0", nativeCalls, parseCalls, plainCalls)
+	}
+}
+
+func TestStructuredCompletionRejectsInvalidRepair(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok": true}`))
+	}))
+	defer server.Close()
+	var nativeCalls, parseCalls, plainCalls int32
+	p := structuredStubProvider{
+		mechanismOK: true,
+		body:        []byte(`{"value":"wrong"}`),
+		repairBody:  []byte(`{"value":"still-wrong"}`),
+		calls:       &nativeCalls,
+		parseCalls:  &parseCalls,
+		plainCalls:  &plainCalls,
+		url:         server.URL,
+	}
+	c := newStructuredClient(p, server)
+	schema := JSONSchema{Name: "required", Schema: map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"required_value": map[string]any{"type": "string"}},
+		"required":   []string{"required_value"},
+	}}
+	_, _, err := c.StructuredCompletion(t.Context(), []Message{{Role: "user", Content: "x"}}, schema, CallOpts{Model: "m"})
+	if err == nil {
+		t.Fatal("expected repaired payload to remain fail-closed")
+	}
+	if nativeCalls != 2 || parseCalls != 2 || plainCalls != 0 {
+		t.Fatalf("calls native=%d parse=%d plain=%d, want 2/2/0", nativeCalls, parseCalls, plainCalls)
 	}
 }
