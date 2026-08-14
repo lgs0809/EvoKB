@@ -61,14 +61,21 @@ package_sources
 
 `package_sources` receives Evidence IDs and creates a version-deduplicated ZIP containing the exact original source files plus `manifest.json`. Its download link is short-lived.
 
-## Web evidence workbench
+## Enterprise knowledge workspace
 
-Open `/enterprise` on the knowledge server. The existing Sage-Wiki Preact/Vite frontend is reused; the enterprise additions are deliberately limited to evidence-oriented V1 views.
+Open `/enterprise` on the knowledge server. The existing Sage-Wiki Preact/Vite/Tailwind frontend is reused; no second frontend stack is introduced. The enterprise workspace is organized around knowledge assets and provenance instead of raw database tables.
 
-- Documents: Document/Version lifecycle, metadata, Summary Grounding/Coverage state, effective-hit count, and manual Distillation recommendation.
-- Wiki Evidence: Wiki Claim -> Summary Fact -> Raw Evidence references.
-- Graph Evidence: bounded 1-2 hop Relation results with ACTIVE Evidence Support.
-- Evidence drawer: exact document/version, object key, page/block/bbox location, and Raw content.
+- Dashboard: real Document/Version, Raw Block, Evidence, Summary, Wiki, Graph, effective-hit, task, Grounding and Coverage health indicators. It does not invent a composite AI confidence score when no real sample exists.
+- Knowledge Search: Raw/Summary/Wiki/Graph results after the unified rerank, with Metadata Filters and a visible Raw Evidence chain. The page deliberately exposes Knowledge + Evidence rather than pretending the retrieval service produced the final Agent answer.
+- Documents: searchable Version lifecycle, metadata, Summary quality gates, effective usage, Version history, and manual high-value Distillation recommendation.
+- Enterprise Wiki: encyclopedia-style Claim reading, section navigation, Fact references, Grounding/Temporal status, and Raw Evidence citations.
+- Graph: a relation browser plus a lightweight graph view over bounded 1-2 hop relations with ACTIVE Evidence Support.
+- Evidence Center: searchable Raw provenance, exact Version/location/excerpt, active-state filtering, and multi-Evidence source-package delivery.
+- Tasks: compile-task state, attempts, timestamps and failures. The V1 UI is intentionally read-only here rather than offering a retry action without an explicit idempotency contract.
+- System Status: safe runtime capability wiring, storage responsibilities, and trust-contract visibility. Secrets and connection credentials are never returned by this page.
+- Evidence drawer: exact document/version, object key, page/block/bbox location, Raw content, and copy support.
+
+Enterprise sub-routes (`/enterprise/search`, `/enterprise/documents`, `/enterprise/wiki`, `/enterprise/graph`, `/enterprise/evidence`, `/enterprise/tasks`, and `/enterprise/admin`) use the same SPA fallback and can be opened directly.
 
 ## Distillation recommendation
 

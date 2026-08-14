@@ -175,3 +175,153 @@ export async function fetchEnterpriseGraph(query: string): Promise<{ relations: 
   if (!res.ok) throw new Error(`Graph request failed: ${res.status}`);
   return res.json();
 }
+
+export interface EnterpriseOverview {
+  documents: number;
+  versions: number;
+  active_versions: number;
+  pending_versions: number;
+  failed_versions: number;
+  raw_blocks: number;
+  active_evidence: number;
+  active_summaries: number;
+  stale_summaries: number;
+  grounded_summaries: number;
+  covered_summaries: number;
+  active_wikis: number;
+  stale_wikis: number;
+  active_relations: number;
+  active_graph_supports: number;
+  effective_hits: number;
+  recommended_sources: number;
+  pending_tasks: number;
+  running_tasks: number;
+  failed_tasks: number;
+}
+
+export interface EnterpriseTask {
+  task_id: string;
+  version_id?: string;
+  logical_name?: string;
+  task_type: string;
+  status: string;
+  attempt: number;
+  error_code?: string;
+  error_message?: string;
+  started_at?: string;
+  finished_at?: string;
+  created_at: string;
+}
+
+export interface EnterpriseEvidenceListItem {
+  evidence_id: string;
+  document_id: string;
+  logical_name: string;
+  version_id: string;
+  version_no: number;
+  original_filename: string;
+  block_id: string;
+  block_type: string;
+  raw_location: Record<string, unknown>;
+  excerpt: string;
+  active: boolean;
+  created_at: string;
+}
+
+export interface EnterpriseCapabilities {
+  documents: boolean;
+  tasks: boolean;
+  evidence: boolean;
+  search: boolean;
+  package_sources: boolean;
+  promotion: boolean;
+  graph: boolean;
+  web: boolean;
+}
+
+export interface EnterpriseSearchFilters {
+  source_department?: string;
+  material_category?: string;
+  company?: string;
+  document_type?: string;
+  version_ids?: string[];
+}
+
+export interface EnterpriseSearchResult {
+  result_type: 'RAW' | 'SUMMARY' | 'WIKI' | 'GRAPH' | string;
+  knowledge: string;
+  score: number;
+  evidence: EnterpriseEvidence[];
+}
+
+export interface EnterpriseSearchResponse {
+  search_id: string;
+  results: EnterpriseSearchResult[];
+}
+
+export interface EnterprisePublishedPackage {
+  package_id: string;
+  object_key: string;
+  download_url: string;
+  expires_at: string;
+  manifest: {
+    generated_at: string;
+    evidence_ids: string[];
+    versions: Array<{
+      version_id: string;
+      document_id: string;
+      original_filename: string;
+      object_key: string;
+      archive_path: string;
+      evidence_ids: string[];
+    }>;
+  };
+}
+
+export async function fetchEnterpriseOverview(): Promise<EnterpriseOverview> {
+  const res = await fetch(`${BASE}/api/enterprise/overview`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Overview request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEnterpriseTasks(limit = 200): Promise<{ tasks: EnterpriseTask[]; total: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/tasks?limit=${limit}`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Tasks request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEnterpriseEvidences(limit = 200): Promise<{ evidences: EnterpriseEvidenceListItem[]; total: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/evidences?limit=${limit}`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Evidence list request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEnterpriseCapabilities(): Promise<EnterpriseCapabilities> {
+  const res = await fetch(`${BASE}/api/enterprise/capabilities`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Capabilities request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function searchEnterpriseKnowledge(
+  query: string,
+  filters: EnterpriseSearchFilters = {},
+  limit = 8,
+): Promise<EnterpriseSearchResponse> {
+  const res = await fetch(`${BASE}/api/enterprise/search`, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, filters, limit }),
+  });
+  if (!res.ok) throw new Error(`Knowledge search failed: ${res.status}`);
+  return res.json();
+}
+
+export async function packageEnterpriseSources(evidenceIds: string[]): Promise<EnterprisePublishedPackage> {
+  const res = await fetch(`${BASE}/api/enterprise/package`, {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ evidence_ids: evidenceIds }),
+  });
+  if (!res.ok) throw new Error(`Source package request failed: ${res.status}`);
+  return res.json();
+}
