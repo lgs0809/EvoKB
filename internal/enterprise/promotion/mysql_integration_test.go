@@ -48,7 +48,7 @@ func TestPromotionUsesOnlyDistinctDeliveredSearches(t *testing.T) {
 	makeResult := func(searchID string) *retrieval.SearchResult {
 		return &retrieval.SearchResult{SearchID: searchID, Results: []retrieval.Result{{
 			Candidate: retrieval.Candidate{ID: "raw-result", ResultType: retrieval.TypeRaw, Knowledge: "delivered", Score: 0.9},
-			Evidence: []enterpriseevidence.Resolved{{EvidenceID: newUUID(), DocumentID: docID, VersionID: versionID, ObjectKey: "raw/source.pdf", RawContent: "source"}},
+			Evidence:  []enterpriseevidence.Resolved{{EvidenceID: newUUID(), DocumentID: docID, VersionID: versionID, ObjectKey: "raw/source.pdf", RawContent: "source"}},
 		}}}
 	}
 	for i := 0; i < 2; i++ {
@@ -81,5 +81,14 @@ func TestPromotionUsesOnlyDistinctDeliveredSearches(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("manual recommendation missing: %d", count)
+	}
+	if err := store.RecommendExistingQuestion(ctx, versionID); err != nil {
+		t.Fatalf("existing-question recommendation: %v", err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM distill_recommendation WHERE version_id=? AND reason='EXISTING_QUESTION_EVIDENCE' AND status='RECOMMENDED'`, versionID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("existing-question recommendation missing: %d", count)
 	}
 }
