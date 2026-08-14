@@ -197,9 +197,13 @@ func (c *Client) SetTransport(t http.RoundTripper) {
 // Shorter caller context deadlines always win (context nesting takes the
 // minimum). Zero or negative disables the extra bound.
 func (c *Client) SetCallTimeout(d time.Duration) {
-	if d > 0 {
-		c.callTimeout = d
+	if d <= 0 {
+		c.callTimeout = 0
+		c.client.Timeout = 0
+		return
 	}
+	c.callTimeout = d
+	c.client.Timeout = d
 }
 
 // ChatCompletion sends a chat completion request with retry on rate limits.

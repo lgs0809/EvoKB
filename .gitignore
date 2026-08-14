@@ -34,6 +34,10 @@ node_modules/
 dist/
 dist-test/
 *.egg-info/
+
+# Local deployment secrets
+deploy/.env
+deploy/.env.local
 .pytest_cache/
 examples/langgraph/__pycache__/
 skillgen

@@ -78,3 +78,21 @@ func TestFastCallSucceedsWithTimeout(t *testing.T) {
 		t.Error("empty response content")
 	}
 }
+
+func TestSetCallTimeoutKeepsHTTPClientAligned(t *testing.T) {
+	c := timeoutTestClient(t, "http://127.0.0.1")
+	c.SetCallTimeout(10 * time.Minute)
+	if c.callTimeout != 10*time.Minute {
+		t.Fatalf("callTimeout = %v, want 10m", c.callTimeout)
+	}
+	if c.client.Timeout != 10*time.Minute {
+		t.Fatalf("http timeout = %v, want 10m", c.client.Timeout)
+	}
+	c.SetCallTimeout(0)
+	if c.callTimeout != 0 {
+		t.Fatalf("callTimeout = %v, want disabled", c.callTimeout)
+	}
+	if c.client.Timeout != 0 {
+		t.Fatalf("http timeout = %v, want disabled", c.client.Timeout)
+	}
+}
