@@ -18,8 +18,8 @@ class DomainParityTest {
 
     @Test
     void adminCanUploadWhileUserIsControlledByRuntimePolicy() {
-        var admin = new IdentityDomain.User("u1", "admin", IdentityDomain.Role.ADMIN, IdentityDomain.UserStatus.ACTIVE, NOW);
-        var user = new IdentityDomain.User("u2", "reader", IdentityDomain.Role.USER, IdentityDomain.UserStatus.ACTIVE, NOW);
+        var admin = new IdentityDomain.User("u1", "admin", "Admin", IdentityDomain.Role.ADMIN, IdentityDomain.UserStatus.ACTIVE, null, NOW, NOW);
+        var user = new IdentityDomain.User("u2", "reader", "Reader", IdentityDomain.Role.USER, IdentityDomain.UserStatus.ACTIVE, null, NOW, NOW);
         assertTrue(new IdentityDomain.AccessPolicy(false).canUpload(admin));
         assertFalse(new IdentityDomain.AccessPolicy(false).canUpload(user));
         assertTrue(new IdentityDomain.AccessPolicy(true).canUpload(user));
