@@ -5,18 +5,20 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM golang:1.26-alpine AS go-build
+FROM maven:3.9.11-eclipse-temurin-17 AS java-build
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -o /out/enterprise-kb ./cmd/enterprise-kb
+COPY java ./java
+RUN mvn -f java/pom.xml -DskipTests package \
+    && cp java/ekb-bootstrap/target/enterprise-knowledge-base.jar /out.jar
 
-FROM alpine:3.23
-RUN apk add --no-cache ca-certificates tzdata
+FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
-COPY --from=go-build /out/enterprise-kb /usr/local/bin/enterprise-kb
-COPY --from=web-build /src/internal/web/dist /app/internal/web/dist
+RUN useradd --system --uid 10001 --create-home ekb \
+    && mkdir -p /app/web /var/lib/enterprise-kb/staging \
+    && chown -R ekb:ekb /app /var/lib/enterprise-kb
+COPY --from=java-build --chown=ekb:ekb /out.jar /app/app.jar
+COPY --from=web-build --chown=ekb:ekb /src/web/dist/ /app/web/
+USER ekb
 EXPOSE 18080
-ENTRYPOINT ["/usr/local/bin/enterprise-kb"]
-CMD ["server", "--addr", "0.0.0.0:18080", "--web-dir", "/app/internal/web/dist"]
+ENV EKB_WEB_DIR=/app/web
+ENTRYPOINT ["java","-jar","/app/app.jar"]
