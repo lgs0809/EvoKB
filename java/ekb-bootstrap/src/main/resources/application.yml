@@ -1,0 +1,56 @@
+server:
+  port: ${EKB_SERVER_PORT:18080}
+  address: ${EKB_SERVER_HOST:0.0.0.0}
+  forward-headers-strategy: ${EKB_FORWARD_HEADERS_STRATEGY:none}
+
+spring:
+  application:
+    name: enterprise-knowledge-base-java
+  datasource:
+    url: ${EKB_JDBC_URL:jdbc:mysql://127.0.0.1:23316/enterprise_kb?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC}
+    username: ${EKB_MYSQL_USER:ekb}
+    password: ${EKB_MYSQL_PASSWORD:}
+    hikari:
+      maximum-pool-size: ${EKB_MYSQL_POOL_SIZE:20}
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+    default-property-inclusion: non_null
+    time-zone: UTC
+  servlet:
+    multipart:
+      max-file-size: ${EKB_MAX_BATCH_UPLOAD_MIB:4096}MB
+      max-request-size: ${EKB_MAX_BATCH_UPLOAD_MIB:4096}MB
+  flyway:
+    enabled: false
+  ai:
+    openai:
+      base-url: ${EKB_ASK_BASE_URL:https://api.openai.com}
+      api-key: ${EKB_ASK_API_KEY:missing}
+    mcp:
+      server:
+        enabled: true
+        name: enterprise-knowledge-base
+        version: 1.0.0
+        type: SYNC
+        instructions: Search enterprise knowledge with raw evidence and package cited source files.
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+ekb:
+  auth:
+    secure-cookie: ${EKB_SESSION_COOKIE_SECURE:false}
+  upload:
+    max-single-bytes: ${EKB_MAX_UPLOAD_BYTES:536870912}
+
+logging:
+  level:
+    root: INFO
+    cn.lgs.knowledgebase: INFO
