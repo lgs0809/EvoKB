@@ -51,6 +51,16 @@ class DomainParityTest {
     }
 
     @Test
+    void pagelessEvidenceOmitsPageCoordinatesInsteadOfPersistingNulls() {
+        var block = new KnowledgeDomain.RawBlock("b1", "v1", 0, "text", "plain text", "plain text",
+                List.of("Heading"), null, null, List.of(), List.of(), List.of("b1"), "hash", 2);
+        var evidence = KnowledgeDomain.Evidence.fromBlock("doc", "original/doc/v1/note.md", block);
+        assertFalse(evidence.location().containsKey("page_start"));
+        assertFalse(evidence.location().containsKey("page_end"));
+        assertEquals("b1", evidence.location().get("block_id"));
+    }
+
+    @Test
     void rerankPoolIsBalancedAcrossRawSummaryWikiAndGraph() {
         var candidates = List.of(
                 candidate("r1", RetrievalDomain.LaneType.RAW), candidate("r2", RetrievalDomain.LaneType.RAW),

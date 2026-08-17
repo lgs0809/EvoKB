@@ -4,15 +4,18 @@ import cn.lgs.knowledgebase.application.port.Ports.EmbeddingPort;
 import cn.lgs.knowledgebase.application.port.Ports.RerankerPort;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
 public final class OpenAiCompatibleModelServingAdapter implements EmbeddingPort, RerankerPort {
-    private final RestClient client;
+    private final RestClient embeddingClient;
+    private final RestClient rerankClient;
     private final String embeddingModel;
     private final String rerankModel;
     private final int dimensions;
@@ -20,9 +23,16 @@ public final class OpenAiCompatibleModelServingAdapter implements EmbeddingPort,
 
     public OpenAiCompatibleModelServingAdapter(String baseUrl, String apiKey, String embeddingModel,
                                                String rerankModel, int dimensions, int batchSize) {
-        RestClient.Builder builder = RestClient.builder().baseUrl(trimSlash(baseUrl));
-        if (apiKey != null && !apiKey.isBlank()) builder.defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey.trim());
-        this.client = builder.build();
+        this(baseUrl, apiKey, embeddingModel, rerankModel, dimensions, batchSize,
+                Duration.ofSeconds(120), Duration.ofSeconds(30));
+    }
+
+    public OpenAiCompatibleModelServingAdapter(String baseUrl, String apiKey, String embeddingModel,
+                                               String rerankModel, int dimensions, int batchSize,
+                                               Duration embeddingTimeout, Duration rerankTimeout) {
+        String normalizedBaseUrl = trimSlash(baseUrl);
+        this.embeddingClient = client(normalizedBaseUrl, apiKey, positive(embeddingTimeout, Duration.ofSeconds(120)));
+        this.rerankClient = client(normalizedBaseUrl, apiKey, positive(rerankTimeout, Duration.ofSeconds(30)));
         this.embeddingModel = requireText(embeddingModel, "embedding model");
         this.rerankModel = requireText(rerankModel, "rerank model");
         if (dimensions <= 0) throw new IllegalArgumentException("embedding dimensions must be positive");
@@ -39,7 +49,7 @@ public final class OpenAiCompatibleModelServingAdapter implements EmbeddingPort,
         List<List<Float>> all = new ArrayList<>(texts.size());
         for (int from = 0; from < texts.size(); from += batchSize) {
             int to = Math.min(texts.size(), from + batchSize);
-            EmbeddingResponse response = client.post().uri("/v1/embeddings")
+            EmbeddingResponse response = embeddingClient.post().uri("/v1/embeddings")
                     .body(Map.of("model", embeddingModel, "input", texts.subList(from, to)))
                     .retrieve().body(EmbeddingResponse.class);
             if (response == null || response.data() == null || response.data().size() != to - from) {
@@ -61,7 +71,7 @@ public final class OpenAiCompatibleModelServingAdapter implements EmbeddingPort,
     @Override
     public List<Double> rerank(String query, List<String> documents) {
         if (documents == null || documents.isEmpty()) return List.of();
-        RerankResponse response = client.post().uri("/v1/rerank")
+        RerankResponse response = rerankClient.post().uri("/v1/rerank")
                 .body(Map.of("model", rerankModel, "query", query, "documents", documents, "top_n", documents.size()))
                 .retrieve().body(RerankResponse.class);
         if (response == null || response.results() == null || response.results().isEmpty()) {
@@ -84,6 +94,21 @@ public final class OpenAiCompatibleModelServingAdapter implements EmbeddingPort,
     public record EmbeddingItem(int index, List<Float> embedding) {}
     public record RerankResponse(List<RerankItem> results) {}
     public record RerankItem(int index, @JsonProperty("relevance_score") double relevanceScore) {}
+
+    private static RestClient client(String baseUrl, String apiKey, Duration readTimeout) {
+        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
+        requestFactory.setConnectTimeout(Duration.ofSeconds(10));
+        requestFactory.setReadTimeout(readTimeout);
+        RestClient.Builder builder = RestClient.builder().baseUrl(baseUrl).requestFactory(requestFactory);
+        if (apiKey != null && !apiKey.isBlank()) {
+            builder.defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey.trim());
+        }
+        return builder.build();
+    }
+
+    private static Duration positive(Duration value, Duration fallback) {
+        return value == null || value.isZero() || value.isNegative() ? fallback : value;
+    }
 
     private static String trimSlash(String value) {
         String text = requireText(value, "base URL");

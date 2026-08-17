@@ -45,6 +45,9 @@ public final class CompilationContracts {
         }
     }
 
+    public record EntityResolution(String sourceEntityId, String versionId, String surfaceForm, String entityType,
+                                   String evidenceId, String canonicalEntityId, double confidence, String decidedBy) {}
+
     public record WikiClaim(String id, String wikiId, long wikiVersion, String section, String claimText,
                             List<String> factIds, List<String> evidenceIds,
                             String groundingStatus, String temporalStatus) {
@@ -71,7 +74,7 @@ public final class CompilationContracts {
         Optional<SummaryRecord> findSummary(String summaryId);
         List<SummaryRecord> loadSummaries(List<String> summaryIds);
         Entity resolveEntity(String name, String entityType);
-        void saveGraph(String summaryId, List<Entity> entities, List<Relation> relations);
+        void saveGraph(String summaryId, List<Entity> entities, List<Relation> relations, List<EntityResolution> resolutions);
         long nextWikiVersion(String wikiId);
         void saveWiki(WikiRecord wiki);
         DerivedContext derivedContextForSummaries(List<String> summaryIds);

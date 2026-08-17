@@ -20,17 +20,23 @@ spring:
     multipart:
       max-file-size: ${EKB_MAX_BATCH_UPLOAD_MIB:4096}MB
       max-request-size: ${EKB_MAX_BATCH_UPLOAD_MIB:4096}MB
+  web:
+    resources:
+      static-locations:
+        - "file:${EKB_WEB_DIR:./internal/web/dist}/"
+        - "classpath:/static/"
   flyway:
     enabled: false
   ai:
     openai:
-      base-url: ${EKB_ASK_BASE_URL:https://api.openai.com}
-      api-key: ${EKB_ASK_API_KEY:missing}
+      base-url: ${EKB_ASK_BASE_URL:${EKB_LLM_BASE_URL:https://api.openai.com}}
+      api-key: ${EKB_ASK_API_KEY:${EKB_LLM_API_KEY:missing}}
     mcp:
       server:
         enabled: true
         name: enterprise-knowledge-base
         version: 1.0.0
+        protocol: STREAMABLE
         type: SYNC
         instructions: Search enterprise knowledge with raw evidence and package cited source files.
 

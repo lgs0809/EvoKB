@@ -81,6 +81,11 @@ public final class EnterpriseAuditInterceptor implements HandlerInterceptor {
             case "POST /api/enterprise/distill" -> "distill.recommend";
             case "GET /api/enterprise/evidence/source", "GET /api/enterprise/evidence/source/file" -> "evidence.source.view";
             case "POST /api/enterprise/package" -> "evidence.package.create";
+            case "POST /api/enterprise/evaluation/artifacts" -> "evaluation.artifact.run";
+            case "POST /api/enterprise/compilation/summary" -> "compilation.summary.run";
+            case "POST /api/enterprise/compilation/graph" -> "compilation.graph.run";
+            case "POST /api/enterprise/compilation/wiki" -> "compilation.wiki.run";
+            case "POST /api/enterprise/compilation/wiki-keywords" -> "compilation.wiki_keyword.run";
             default -> "";
         };
     }
@@ -92,6 +97,8 @@ public final class EnterpriseAuditInterceptor implements HandlerInterceptor {
         if (action.startsWith("document.")) return "document_version";
         if (action.startsWith("distill.")) return "document_version";
         if (action.startsWith("evidence.")) return "evidence";
+        if (action.startsWith("evaluation.")) return "evaluation";
+        if (action.startsWith("compilation.")) return "knowledge_artifact";
         if (action.startsWith("access.")) return "settings";
         return "auth";
     }

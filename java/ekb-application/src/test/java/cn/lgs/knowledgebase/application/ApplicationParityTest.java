@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -22,18 +23,44 @@ class ApplicationParityTest {
             lanes.add(new FakeLane(type));
         }
         AtomicInteger rerankCalls = new AtomicInteger();
+        AtomicInteger resolverCalls = new AtomicInteger();
         Ports.RerankerPort reranker = (query, docs) -> {
             rerankCalls.incrementAndGet();
             return java.util.stream.IntStream.range(0, docs.size()).mapToObj(i -> 1.0 - i * 0.01).toList();
         };
-        Ports.EvidenceResolver resolver = ids -> ids.contains("missing") ? List.of() : List.of(evidence(ids.get(0)));
+        Ports.EvidenceResolver resolver = ids -> {
+            resolverCalls.incrementAndGet();
+            return ids.stream().filter(id -> !"missing".equals(id)).map(ApplicationParityTest::evidence).toList();
+        };
         var service = new RetrievalApplicationService(lanes, reranker, resolver, RetrievalDomain.Quotas.defaults(), 20, 400);
 
         var response = service.search("question", new KnowledgeDomain.SearchFilters(null, null, null, null, List.of()), 10);
 
         assertEquals(1, rerankCalls.get());
+        assertEquals(1, resolverCalls.get());
+        assertEquals(36, response.searchId().length());
+        assertDoesNotThrow(() -> UUID.fromString(response.searchId()));
         assertEquals(4, response.results().size());
         assertTrue(response.results().stream().allMatch(r -> !r.evidence().isEmpty()));
+    }
+
+    @Test
+    void retrievalFallsBackToFusedCandidatesWhenRerankerIsUnavailable() {
+        Ports.RetrievalLane raw = new FakeLane(RetrievalDomain.LaneType.RAW);
+        AtomicInteger resolverCalls = new AtomicInteger();
+        var service = new RetrievalApplicationService(List.of(raw), (query, docs) -> {
+            throw new IllegalStateException("reranker unavailable");
+        }, ids -> {
+            resolverCalls.incrementAndGet();
+            return ids.stream().map(ApplicationParityTest::evidence).toList();
+        }, RetrievalDomain.Quotas.defaults(), 20, 400);
+
+        var response = service.search("question", new KnowledgeDomain.SearchFilters(null, null, null, null, List.of()), 8);
+
+        assertEquals(1, resolverCalls.get());
+        assertEquals(1, response.results().size());
+        assertEquals(RetrievalDomain.LaneType.RAW, response.results().get(0).candidate().lane());
+        assertFalse(response.results().get(0).evidence().isEmpty());
     }
 
     @Test

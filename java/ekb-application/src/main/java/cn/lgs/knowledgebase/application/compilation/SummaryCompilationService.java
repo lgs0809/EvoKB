@@ -109,10 +109,11 @@ public final class SummaryCompilationService {
         String summaryId = deterministicUuid("summary:" + unit.id() + ":" + model.identity(ModelRole.LARGE) + ":" + sha256(markdown));
         List<SummaryFact> withSummary = new ArrayList<>(facts.size());
         for (SummaryFact fact : facts) {
-            withSummary.add(new SummaryFact(fact.id(), summaryId, fact.section(), fact.factText(), fact.evidenceBlockIds(), fact.evidenceIds(),
+            String storedFactId = deterministicUuid("summary_fact:" + summaryId + ":" + fact.section() + ":" + normalize(fact.factText()));
+            withSummary.add(new SummaryFact(storedFactId, summaryId, fact.section(), fact.factText(), fact.evidenceBlockIds(), fact.evidenceIds(),
                     fact.groundingStatus(), fact.groundingReason()));
         }
-        String objectKey = "summary/" + source.documentId() + "/" + source.versionId() + "/" + unit.id() + ".md";
+        String objectKey = "summary/" + source.documentId() + "/" + source.versionId() + "/" + unit.id() + "/" + summaryId + ".md";
         byte[] bytes = markdown.getBytes(StandardCharsets.UTF_8);
         objects.put(objectKey, new ByteArrayInputStream(bytes), bytes.length, "text/markdown; charset=utf-8");
         String lifecycle = groundingPass && coveragePass ? "ACTIVE" : "INACTIVE";

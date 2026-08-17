@@ -51,18 +51,30 @@ public final class RetrievalApplicationService {
                 if (seen.add(key)) merged.add(candidate);
             }
         }
-        String searchId = "search_" + UUID.randomUUID().toString().replace("-", "");
+        String searchId = UUID.randomUUID().toString();
         if (merged.isEmpty()) return new SearchResponse(searchId, List.of());
 
         List<Candidate> pool = RetrievalDomain.balancedRerankPool(merged, maxRerankCandidates);
         List<String> documents = pool.stream().map(c -> bounded(c.knowledge(), maxRerankChars)).toList();
-        List<Candidate> reranked = RetrievalDomain.applyRerankScores(pool, reranker.rerank(query.trim(), documents));
+        List<Candidate> reranked;
+        try {
+            reranked = RetrievalDomain.applyRerankScores(pool, reranker.rerank(query.trim(), documents));
+        } catch (RuntimeException unavailable) {
+            // Rerank is a derived ordering aid. Preserve the already-grounded fused pool rather than
+            // failing the entire search when the optional model service is slow or unavailable.
+            reranked = pool;
+        }
+        List<String> allEvidenceIds = reranked.stream().flatMap(candidate -> candidate.evidenceIds().stream()).distinct().toList();
+        var resolved = allEvidenceIds.isEmpty() ? List.<cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence>of() : resolver.resolve(allEvidenceIds);
+        Map<String, cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence> evidenceById = new java.util.LinkedHashMap<>();
+        if (resolved != null) resolved.forEach(evidence -> evidenceById.put(evidence.id(), evidence));
+
         List<Result> results = new ArrayList<>(limit);
         for (Candidate candidate : reranked) {
             if (results.size() >= limit) break;
             if (candidate.evidenceIds().isEmpty()) continue;
-            var evidence = resolver.resolve(candidate.evidenceIds());
-            if (evidence == null || evidence.isEmpty()) continue;
+            var evidence = candidate.evidenceIds().stream().map(evidenceById::get).filter(java.util.Objects::nonNull).toList();
+            if (evidence.isEmpty()) continue;
             results.add(new Result(candidate, evidence));
         }
         return new SearchResponse(searchId, List.copyOf(results));

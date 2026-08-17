@@ -271,6 +271,7 @@ export interface EnterpriseCapabilities {
   search: boolean;
   package_sources: boolean;
   promotion: boolean;
+  artifact_evaluation?: boolean;
   graph: boolean;
   web: boolean;
 }

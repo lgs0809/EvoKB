@@ -206,7 +206,10 @@ public final class WikiCompilationService {
     private static String writerPrompt(Template template) {
         return "你是企业 Wiki Writer。仅基于输入的 grounded facts 编写候选 claims。wiki_type 必须为 " + template.wikiType()
                 + "，section 只能来自 " + template.sections() + "。每条 claim 必须引用 supporting_fact_ids。每个输入 fact 必须输出一个 fact_decision；"
-                + "适合 Wiki 的 fact 标记 wiki_eligible=true 且最终必须至少被一个 claim 使用；不适合的必须给 skip_reason。允许用 [[实体名]] 建立明确的 WikiLink，但不得为了造链接而改写事实。";
+                + "适合 Wiki 的 fact 标记 wiki_eligible=true 且最终必须至少被一个 claim 使用；不适合的必须给 skip_reason。"
+                + "Claim 必须原子化：一条 claim 只表达一个可独立验证的事实，不要把多个关系或多个时间事件拼在同一句。"
+                + "若 claim 表达两个实体之间的关系，应恰好使用两个 [[实体名]]，并把明确的关系词放在两个 wikilink 之间，例如 [[A]] 控制 [[B]]、[[A]] 投资 [[B]]、[[A]] supplies to [[B]]。"
+                + "一个 grounded fact 若包含多个二元关系，可以拆成多条 claims，并复用同一个 supporting_fact_id。不得为了造链接或关系而改写事实。";
     }
 
     private static String sourcePrompt(List<SummaryRecord> summaries, Map<String, SummaryFact> facts) {
