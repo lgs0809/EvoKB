@@ -75,6 +75,7 @@ public final class Ports {
         Optional<FileItem> findFile(String fileId);
         void saveFile(FileItem file);
         List<Batch> listBatches(String actorId, boolean admin, int offset, int limit, String status, String query);
+        long countBatches(String actorId, boolean admin, String status, String query);
         void queueBatch(String batchId, Instant now);
         void retryFile(String fileId, Instant now);
         void resetInterrupted(Instant now);
@@ -214,10 +215,62 @@ public final class Ports {
         <T> T generateStructured(ModelRole role, ModelTask task, String systemPrompt, String userPrompt, Class<T> outputType);
     }
 
+    public interface PromotionRepository {
+        void recordDeliveredSearch(DeliveredSearch search);
+        void recommend(String versionId, String reason, int distinctEffectiveHits);
+    }
+
+    public record DeliveredSearch(String searchId, String query, SearchFilters filters, List<DeliveredResult> results) {
+        public DeliveredSearch {
+            results = results == null ? List.of() : List.copyOf(results);
+        }
+    }
+
+    public record DeliveredResult(int rank, LaneType resultType, String resultId, double score,
+                                  List<String> evidenceIds, List<String> versionIds) {
+        public DeliveredResult {
+            evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
+            versionIds = versionIds == null ? List.of() : List.copyOf(versionIds);
+        }
+    }
+
+    public interface SourcePackageService {
+        EvidenceSource source(String evidenceId);
+        PublishedPackage packageSources(List<String> evidenceIds);
+        StoredObject openOriginal(String evidenceId);
+    }
+
+    public record EvidenceSource(String evidenceId, String documentId, String versionId, String objectKey,
+                                 String contentType, long sizeBytes, Map<String,Object> location,
+                                 String viewUrl, String downloadUrl, Instant expiresAt) {
+        public EvidenceSource { location = location == null ? Map.of() : Map.copyOf(location); }
+    }
+
+    public record PackageVersion(String versionId, String documentId, String originalFilename, String objectKey,
+                                 String archivePath, List<String> evidenceIds) {
+        public PackageVersion { evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds); }
+    }
+
+    public record PackageManifest(Instant generatedAt, List<String> evidenceIds, List<PackageVersion> versions) {
+        public PackageManifest {
+            evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
+            versions = versions == null ? List.of() : List.copyOf(versions);
+        }
+    }
+
+    public record PublishedPackage(String packageId, String objectKey, String downloadUrl,
+                                   Instant expiresAt, PackageManifest manifest) {}
+
     public interface AuditPort {
         void record(AuditEvent event);
     }
 
-    public record AuditEvent(String actorId, String action, String targetType, String targetId,
-                             String outcome, Map<String, Object> details, Instant occurredAt) {}
+    public record AuditEvent(String actorId, String actorUsername, String actorRole,
+                             String action, String targetType, String targetId, String targetName,
+                             String outcome, String requestId, String ipAddress, String userAgent,
+                             Map<String, Object> details, Instant occurredAt) {
+        public AuditEvent {
+            details = details == null ? Map.of() : Map.copyOf(details);
+        }
+    }
 }

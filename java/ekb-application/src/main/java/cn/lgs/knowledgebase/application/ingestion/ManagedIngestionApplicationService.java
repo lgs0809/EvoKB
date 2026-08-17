@@ -81,6 +81,11 @@ public final class ManagedIngestionApplicationService {
         return uploads.listBatches(actor.id(), actor.administrator(), offset, size, status, query);
     }
 
+    public long countBatches(User actor, String status, String query) {
+        requireActor(actor);
+        return uploads.countBatches(actor.id(), actor.administrator(), status, query);
+    }
+
     public FileItem patchMetadata(User actor, String fileId, MetadataPatch patch) {
         requireUpload(actor);
         FileItem file = uploads.findFile(requiredText(fileId, "fileId")).orElseThrow(() -> new NotFound("file not found"));
