@@ -69,7 +69,7 @@ export function AdminPage({ capabilities, currentUser, access, onAccessChanged, 
     { key: 'ask_answering', label: '回答模型', description: '已配置兼容的大模型', icon: 'sparkles' },
     { key: 'search', label: '统一检索', description: '原文 / 摘要 / 百科 / 图谱', icon: 'search' },
     { key: 'package_sources', label: '来源资料包', description: '按精确版本去重打包 ZIP', icon: 'download' },
-    { key: 'promotion', label: '知识生成推荐', description: '基于最终有效引用生成推荐', icon: 'sparkles' },
+    { key: 'generation_recommendation', label: '知识生成推荐', description: '基于最终有效引用生成推荐', icon: 'sparkles' },
     { key: 'graph', label: 'Neo4j 关系图谱', description: '有证据支撑的有限层级关系查询', icon: 'graph' },
     { key: 'web', label: '企业知识网页端', description: '同源知识管理工作台', icon: 'server' },
   ];

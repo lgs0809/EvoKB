@@ -23,14 +23,14 @@ spring:
   web:
     resources:
       static-locations:
-        - "file:${EKB_WEB_DIR:./internal/web/dist}/"
+        - "file:${EKB_WEB_DIR:./web/dist}/"
         - "classpath:/static/"
   flyway:
     enabled: false
   ai:
     openai:
-      base-url: ${EKB_CHAT_BASE_URL:https://api.openai.com}
-      api-key: ${EKB_CHAT_API_KEY:not-configured}
+      base-url: ${EKB_CHAT_BASE_URL}
+      api-key: ${EKB_CHAT_API_KEY}
     mcp:
       server:
         enabled: true

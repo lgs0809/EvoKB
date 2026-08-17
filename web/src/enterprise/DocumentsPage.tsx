@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
-import { fetchEnterpriseDocuments, fetchEnterpriseFacets, recommendEnterpriseDistill, type EnterpriseDocumentVersion, type EnterpriseFacets } from '../lib/api';
+import { fetchEnterpriseDocuments, fetchEnterpriseFacets, recommendEnterpriseKnowledgeGeneration, type EnterpriseDocumentVersion, type EnterpriseFacets } from '../lib/api';
 import { BatchUploadDialog } from './BatchUploadDialog';
 import type { EnterpriseSection } from './EnterpriseShell';
 import { EmptyState, Icon, LoadingBlock, Pipeline, PrimaryButton, SecondaryButton, SectionTitle, StatusBadge, formatDate, shortID } from './ui';
@@ -58,9 +58,9 @@ export function DocumentsPage({ onNavigate, onError, canUpload, isAdmin, onChang
     fetchEnterpriseFacets().then(setFacets).catch(() => undefined);
   }, []);
 
-  const markDistill = async (versionId: string) => {
+  const recommendGeneration = async (versionId: string) => {
     setBusy(true);
-    try { await recommendEnterpriseDistill(versionId); await load(page); if (selected) await select({ ...selected, recommendation: 'RECOMMENDED' }); onChanged(); onError(''); }
+    try { await recommendEnterpriseKnowledgeGeneration(versionId); await load(page); if (selected) await select({ ...selected, recommendation: 'RECOMMENDED' }); onChanged(); onError(''); }
     catch (err) { onError(String(err instanceof Error ? err.message : err)); }
     finally { setBusy(false); }
   };
@@ -90,21 +90,21 @@ export function DocumentsPage({ onNavigate, onError, canUpload, isAdmin, onChang
       </div>
 
       <aside class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-        {!selected ? <EmptyState icon="documents" title="选择一个资料版本" description="查看资料信息、版本历史和知识生成状态。"/> : detailLoading ? <LoadingBlock rows={6}/> : <DocumentDetail selected={selected} versions={versions} isAdmin={isAdmin} busy={busy} onSelect={setSelected} onDistill={markDistill} onNavigate={onNavigate}/>}
+        {!selected ? <EmptyState icon="documents" title="选择一个资料版本" description="查看资料信息、版本历史和知识生成状态。"/> : detailLoading ? <LoadingBlock rows={6}/> : <DocumentDetail selected={selected} versions={versions} isAdmin={isAdmin} busy={busy} onSelect={setSelected} onRecommendGeneration={recommendGeneration} onNavigate={onNavigate}/>}
       </aside>
     </section>
     {uploadOpen && canUpload && <BatchUploadDialog onClose={() => setUploadOpen(false)} onChanged={() => { void load(1); onChanged(); }} onError={onError}/>}
   </div>;
 }
 
-function DocumentDetail({ selected, versions, isAdmin, busy, onSelect, onDistill, onNavigate }: { selected: EnterpriseDocumentVersion; versions: EnterpriseDocumentVersion[]; isAdmin: boolean; busy: boolean; onSelect: (item: EnterpriseDocumentVersion) => void; onDistill: (id: string) => Promise<void>; onNavigate: (section: EnterpriseSection) => void }) {
+function DocumentDetail({ selected, versions, isAdmin, busy, onSelect, onRecommendGeneration, onNavigate }: { selected: EnterpriseDocumentVersion; versions: EnterpriseDocumentVersion[]; isAdmin: boolean; busy: boolean; onSelect: (item: EnterpriseDocumentVersion) => void; onRecommendGeneration: (id: string) => Promise<void>; onNavigate: (section: EnterpriseSection) => void }) {
   const summaryReady = selected.summary_count > 0 && selected.grounded_summaries > 0 && selected.covered_summaries > 0;
   return <div class="space-y-5"><div><div class="flex items-center gap-2"><StatusBadge value={selected.lifecycle}/>{selected.recommendation && <StatusBadge value={selected.recommendation}/>}</div><h3 class="mt-3 text-lg font-semibold">{selected.logical_name}</h3><div class="mt-1 text-xs text-slate-400">{selected.original_filename} · 版本 {selected.version_no}</div></div>
     <Pipeline summaryReady={summaryReady}/>
     <div class="grid grid-cols-2 gap-3 text-xs"><Info label="公司" value={selected.company || '—'}/><Info label="来源部门" value={selected.source_department || '—'}/><Info label="文档类型" value={selected.document_type || '—'}/><Info label="材料分类" value={selected.material_category || '—'}/><Info label="文档日期" value={selected.document_date ? formatDate(selected.document_date) : '—'}/><Info label="版本编号" value={shortID(selected.version_id, 12)}/></div>
     <div class="grid grid-cols-3 gap-2"><Quality label="摘要" value={selected.summary_count}/><Quality label="事实校验" value={selected.grounded_summaries}/><Quality label="完整性检查" value={selected.covered_summaries}/></div>
     <div><div class="mb-2 flex items-center justify-between"><div class="text-xs font-semibold tracking-[0.12em] text-slate-400">版本历史</div><span class="text-xs text-slate-400">{versions.length}</span></div><div class="max-h-56 space-y-2 overflow-y-auto">{versions.map(version => <button key={version.version_id} onClick={() => onSelect(version)} class={`flex w-full items-center justify-between rounded-xl border px-3 py-2.5 text-left ${version.version_id === selected.version_id ? 'border-blue-200 bg-blue-50 dark:border-blue-900 dark:bg-blue-950/30' : 'border-slate-100 bg-slate-50 dark:border-slate-800 dark:bg-slate-950/50'}`}><div><div class="text-xs font-semibold">版本 {version.version_no}</div><div class="mt-0.5 text-[11px] text-slate-400">{formatDate(version.parsed_at)}</div></div><StatusBadge value={version.lifecycle}/></button>)}</div></div>
-    {selected.recommendation === 'RECOMMENDED' ? <div class="rounded-xl border border-violet-200 bg-violet-50 p-3 text-xs text-violet-800 dark:border-violet-900/60 dark:bg-violet-950/30 dark:text-violet-300"><div class="font-semibold">建议生成高级知识</div><div class="mt-1">{selected.recommendation_reason || '由有效引用或管理员标记触发'}</div></div> : isAdmin && selected.lifecycle === 'ACTIVE' && <PrimaryButton onClick={() => void onDistill(selected.version_id)} disabled={busy} icon="sparkles">{busy ? '处理中…' : '建议生成高级知识'}</PrimaryButton>}
+    {selected.recommendation === 'RECOMMENDED' ? <div class="rounded-xl border border-violet-200 bg-violet-50 p-3 text-xs text-violet-800 dark:border-violet-900/60 dark:bg-violet-950/30 dark:text-violet-300"><div class="font-semibold">建议生成高级知识</div><div class="mt-1">{selected.recommendation_reason || '由有效引用或管理员标记触发'}</div></div> : isAdmin && selected.lifecycle === 'ACTIVE' && <PrimaryButton onClick={() => void onRecommendGeneration(selected.version_id)} disabled={busy} icon="sparkles">{busy ? '处理中…' : '建议生成高级知识'}</PrimaryButton>}
     <div class="grid grid-cols-2 gap-2"><SecondaryButton onClick={() => onNavigate('evidence')} icon="evidence">查看证据</SecondaryButton><SecondaryButton onClick={() => onNavigate('wiki')} icon="wiki">查看企业百科</SecondaryButton></div>
   </div>;
 }

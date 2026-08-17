@@ -3,9 +3,11 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <groupId>cn.lgs.knowledgebase</groupId>
-    <artifactId>enterprise-knowledge-base-java</artifactId>
+    <artifactId>enterprise-knowledge-base</artifactId>
     <version>0.1.0-SNAPSHOT</version>
     <packaging>pom</packaging>
+    <name>Enterprise Knowledge Base</name>
+    <description>Evidence-backed enterprise knowledge management and retrieval platform</description>
 
     <modules>
         <module>ekb-domain</module>
@@ -76,5 +78,27 @@
                 </plugin>
             </plugins>
         </pluginManagement>
+        <plugins>
+            <plugin>
+                <groupId>com.diffplug.spotless</groupId>
+                <artifactId>spotless-maven-plugin</artifactId>
+                <version>3.9.0</version>
+                <configuration>
+                    <java>
+                        <googleJavaFormat/>
+                        <removeUnusedImports/>
+                        <trimTrailingWhitespace/>
+                        <endWithNewline/>
+                    </java>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>spotless-check</id>
+                        <phase>verify</phase>
+                        <goals><goal>check</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
     </build>
 </project>

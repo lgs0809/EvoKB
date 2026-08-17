@@ -48,7 +48,12 @@ export function EnterpriseShell({ section, onNavigate, children, error, busy, on
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
-  const [darkMode, setDarkMode] = useState(() => document.documentElement.classList.contains('dark'));
+  const [darkMode, setDarkMode] = useState(() => {
+    const stored = localStorage.getItem('enterprise-knowledge-base-theme');
+    const initialDark = stored === 'dark' || (stored !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.classList.toggle('dark', initialDark);
+    return initialDark;
+  });
   const meta = section === 'ingestion' && user.role !== 'ADMIN'
     ? { title: '上传记录', description: '查看我的资料上传与处理进度。' }
     : pageMeta[section];
@@ -62,7 +67,7 @@ export function EnterpriseShell({ section, onNavigate, children, error, busy, on
   const toggleTheme = () => {
     const nextDark = !darkMode;
     document.documentElement.classList.toggle('dark', nextDark);
-    localStorage.setItem('sage-wiki-theme', nextDark ? 'dark' : 'light');
+    localStorage.setItem('enterprise-knowledge-base-theme', nextDark ? 'dark' : 'light');
     setDarkMode(nextDark);
   };
 

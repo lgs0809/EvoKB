@@ -1,76 +1,49 @@
 @import "tailwindcss";
-@plugin "@tailwindcss/typography";
-@import "highlight.js/styles/github.css" layer(base);
 
-/* Enable class-based dark mode for manual toggle */
 @custom-variant dark (&:where(.dark, .dark *));
 
-/* Dark mode highlight.js override */
-.dark .hljs {
-  background: #1e293b !important;
-  color: #e2e8f0 !important;
-}
-.dark .hljs-keyword, .dark .hljs-selector-tag { color: #c084fc !important; }
-.dark .hljs-string, .dark .hljs-attr { color: #86efac !important; }
-.dark .hljs-comment { color: #64748b !important; }
-.dark .hljs-number, .dark .hljs-literal { color: #fbbf24 !important; }
-.dark .hljs-title, .dark .hljs-function { color: #60a5fa !important; }
-.dark .hljs-built_in { color: #f472b6 !important; }
-
-/* Prose wikilink styling */
-.prose a.wikilink {
-  text-decoration: none;
-  border-bottom: 1px dashed currentColor;
-}
-.prose a.wikilink:hover {
-  border-bottom-style: solid;
+html,
+body,
+#app {
+  min-height: 100%;
 }
 
-/* Broken wikilinks */
-.prose a.wikilink-broken {
-  color: #9ca3af !important;
-  border-bottom: 1px dashed #d1d5db;
-  opacity: 0.7;
-}
-.dark .prose a.wikilink-broken {
-  color: #6b7280 !important;
-  border-bottom-color: #4b5563;
-}
-.prose a.wikilink-broken:hover {
-  border-bottom-style: solid;
+body {
+  margin: 0;
 }
 
-/* Image embeds in articles */
-.prose img {
-  border-radius: 0.5rem;
-  box-shadow: 0 1px 3px rgb(0 0 0 / 0.1);
-}
-
-/* Lightweight scrollbar */
 * {
+  box-sizing: border-box;
   scrollbar-width: thin;
   scrollbar-color: transparent transparent;
 }
+
 *:hover {
-  scrollbar-color: rgb(156 163 175 / 0.4) transparent;
+  scrollbar-color: rgb(148 163 184 / 0.45) transparent;
 }
+
 .dark *:hover {
-  scrollbar-color: rgb(75 85 99 / 0.5) transparent;
+  scrollbar-color: rgb(71 85 105 / 0.55) transparent;
 }
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
-::-webkit-scrollbar-track {
-  background: transparent;
-}
+
+::-webkit-scrollbar-track,
 ::-webkit-scrollbar-thumb {
   background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
   border-radius: 3px;
 }
+
 *:hover::-webkit-scrollbar-thumb {
-  background: rgb(156 163 175 / 0.4);
+  background: rgb(148 163 184 / 0.45);
 }
+
 .dark *:hover::-webkit-scrollbar-thumb {
-  background: rgb(75 85 99 / 0.5);
+  background: rgb(71 85 105 / 0.55);
 }
