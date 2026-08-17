@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
-import { fetchEnterpriseBatches, fetchEnterpriseDocuments, fetchEnterpriseFacets, recommendEnterpriseDistill, type EnterpriseDocumentVersion, type EnterpriseFacets, type EnterpriseIngestionBatch } from '../lib/api';
+import { fetchEnterpriseDocuments, fetchEnterpriseFacets, recommendEnterpriseDistill, type EnterpriseDocumentVersion, type EnterpriseFacets } from '../lib/api';
 import { BatchUploadDialog } from './BatchUploadDialog';
 import type { EnterpriseSection } from './EnterpriseShell';
 import { EmptyState, Icon, LoadingBlock, Pipeline, PrimaryButton, SecondaryButton, SectionTitle, StatusBadge, formatDate, shortID } from './ui';
@@ -25,9 +25,7 @@ export function DocumentsPage({ onNavigate, onError, canUpload, isAdmin, onChang
   const [versions, setVersions] = useState<EnterpriseDocumentVersion[]>([]);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
-  const [recentBatches, setRecentBatches] = useState<EnterpriseIngestionBatch[]>([]);
   const [uploadOpen, setUploadOpen] = useState(false);
-  const [resumeBatchId, setResumeBatchId] = useState('');
   const [busy, setBusy] = useState(false);
   const pageSize = 30;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
@@ -55,18 +53,8 @@ export function DocumentsPage({ onNavigate, onError, canUpload, isAdmin, onChang
     finally { setDetailLoading(false); }
   };
 
-  const loadRecentBatches = async () => {
-    try {
-      const data = await fetchEnterpriseBatches({ page: 1, page_size: 6 });
-      setRecentBatches(data.batches || []);
-    } catch {
-      setRecentBatches([]);
-    }
-  };
-
   useEffect(() => {
     void load(1);
-    void loadRecentBatches();
     fetchEnterpriseFacets().then(setFacets).catch(() => undefined);
   }, []);
 
@@ -79,50 +67,45 @@ export function DocumentsPage({ onNavigate, onError, canUpload, isAdmin, onChang
 
   return <div class="space-y-6">
     <section class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-      <SectionTitle eyebrow="Knowledge assets" title="文档与版本" description="大数据量按服务端分页。批量上传支持文件夹与 ZIP 后台解压，并在真正入库前逐文件确认 Metadata。" action={canUpload ? <PrimaryButton onClick={() => { setResumeBatchId(''); setUploadOpen(true); }} icon="documents">批量添加资料</PrimaryButton> : undefined}/>
+      <SectionTitle title="资料" description="管理资料及其版本。" action={canUpload ? <PrimaryButton onClick={() => setUploadOpen(true)} icon="documents">添加资料</PrimaryButton> : undefined}/>
       <div class="mt-5 grid gap-3 lg:grid-cols-[1.4fr_repeat(4,minmax(0,.7fr))_auto]">
         <div class="relative"><Icon name="search" size={16} class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"/><input value={query} onInput={event => setQuery((event.target as HTMLInputElement).value)} onKeyDown={event => { if (event.key === 'Enter') void load(1); }} placeholder="搜索文件名、知识名、公司、部门或类型" class="w-full rounded-xl border border-slate-200 bg-slate-50 py-2.5 pl-9 pr-3 text-sm outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950"/></div>
         <SelectFilter value={company} onChange={setCompany} values={facets.companies} label="全部公司"/>
         <SelectFilter value={department} onChange={setDepartment} values={facets.source_departments} label="全部部门"/>
         <SelectFilter value={documentType} onChange={setDocumentType} values={facets.document_types} label="全部类型"/>
         <SelectFilter value={category} onChange={setCategory} values={facets.material_categories} label="全部分类"/>
-        <button onClick={() => void load(1)} class="rounded-xl bg-slate-950 px-4 py-2.5 text-sm font-semibold text-white dark:bg-white dark:text-slate-950">筛选</button>
+        <button onClick={() => void load(1)} class="rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm shadow-blue-600/15 transition hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-400">筛选</button>
       </div>
-      <div class="mt-3 flex gap-2 overflow-x-auto">{['ALL','ACTIVE','PENDING','FAILED','INACTIVE'].map(item => <button key={item} onClick={() => { setLifecycle(item); window.setTimeout(() => void load(1), 0); }} class={`whitespace-nowrap rounded-xl px-3 py-2 text-xs font-semibold ${lifecycle === item ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-300'}`}>{item}</button>)}</div>
+      <div class="mt-3 flex gap-2 overflow-x-auto">{['ALL','ACTIVE','PENDING','FAILED','INACTIVE'].map(item => <button key={item} onClick={() => { setLifecycle(item); window.setTimeout(() => void load(1), 0); }} class={`whitespace-nowrap rounded-xl px-3 py-2 text-xs font-semibold ${lifecycle === item ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-300'}`}>{({ ALL: '全部', ACTIVE: '可用', PENDING: '等待处理', FAILED: '失败', INACTIVE: '已停用' } as Record<string, string>)[item]}</button>)}</div>
     </section>
-
-    {canUpload && recentBatches.length > 0 && <section class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-      <div class="flex items-center justify-between gap-3"><div><div class="text-xs font-semibold uppercase tracking-[0.14em] text-blue-600 dark:text-blue-400">Managed ingestion</div><h3 class="mt-1 text-base font-semibold">最近上传批次</h3><p class="mt-1 text-xs text-slate-400">STAGED 批次可以继续逐文件调整属性；运行中的批次可以随时重新打开查看进度。</p></div><button onClick={() => void loadRecentBatches()} class="rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-semibold text-slate-500 dark:border-slate-700">刷新</button></div>
-      <div class="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">{recentBatches.map(batch => <button key={batch.batch_id} onClick={() => { setUploadOpen(false); setResumeBatchId(batch.batch_id); }} class="rounded-2xl border border-slate-200 p-4 text-left transition hover:border-blue-300 hover:shadow-sm dark:border-slate-800"><div class="flex items-center justify-between gap-3"><StatusBadge value={batch.status}/><span class="font-mono text-[10px] text-slate-400">{shortID(batch.batch_id, 10)}</span></div><div class="mt-3 text-sm font-semibold text-slate-700 dark:text-slate-200">{batch.file_count} 个文件</div><div class="mt-1 text-xs text-slate-400">完成 {batch.succeeded_count} · 运行 {batch.running_count} · 失败 {batch.failed_count}</div><div class="mt-3 text-[11px] font-semibold text-blue-600 dark:text-blue-400">{batch.status === 'STAGED' ? '继续配置 →' : '查看进度 →'}</div></button>)}</div>
-    </section>}
 
     <section class="grid gap-5 xl:grid-cols-[minmax(0,1.35fr)_minmax(360px,.65fr)]">
       <div class="overflow-hidden rounded-2xl border border-slate-200/80 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900">
-        {loading ? <div class="p-5"><LoadingBlock rows={7}/></div> : documents.length === 0 ? <div class="p-5"><EmptyState icon="documents" title="没有匹配的文档" description="调整服务端筛选条件，或添加新的企业资料。"/></div> : <div class="divide-y divide-slate-100 dark:divide-slate-800">{documents.map(item => <button key={item.version_id} onClick={() => void select(item)} class={`flex w-full items-start gap-4 px-4 py-4 text-left transition sm:px-5 ${selected?.version_id === item.version_id ? 'bg-blue-50/70 dark:bg-blue-950/20' : 'hover:bg-slate-50 dark:hover:bg-slate-950/30'}`}>
+        {loading ? <div class="p-5"><LoadingBlock rows={7}/></div> : documents.length === 0 ? <div class="p-5"><EmptyState icon="documents" title="没有匹配的资料" description="调整筛选条件或添加资料。"/></div> : <div class="divide-y divide-slate-100 dark:divide-slate-800">{documents.map(item => <button key={item.version_id} onClick={() => void select(item)} class={`flex w-full items-start gap-4 px-4 py-4 text-left transition sm:px-5 ${selected?.version_id === item.version_id ? 'bg-blue-50/70 dark:bg-blue-950/20' : 'hover:bg-slate-50 dark:hover:bg-slate-950/30'}`}>
           <div class="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500 dark:bg-slate-800"><Icon name="file" size={18}/></div>
-          <div class="min-w-0 flex-1"><div class="flex flex-wrap items-center gap-2"><div class="truncate font-semibold text-slate-800 dark:text-slate-100">{item.logical_name}</div><StatusBadge value={item.lifecycle}/></div><div class="mt-1 truncate text-xs text-slate-400">{item.original_filename} · Version {item.version_no}</div><div class="mt-2 flex flex-wrap gap-2 text-[11px] text-slate-400">{item.company && <span>{item.company}</span>}{item.source_department && <span>· {item.source_department}</span>}{item.document_type && <span>· {item.document_type}</span>}{item.material_category && <span>· {item.material_category}</span>}</div></div>
-          <div class="hidden text-right text-[11px] text-slate-400 sm:block"><div>{formatDate(item.parsed_at)}</div><div class="mt-1">{item.effective_hits} effective hits</div></div>
+          <div class="min-w-0 flex-1"><div class="flex flex-wrap items-center gap-2"><div class="truncate font-semibold text-slate-800 dark:text-slate-100">{item.logical_name}</div><StatusBadge value={item.lifecycle}/></div><div class="mt-1 truncate text-xs text-slate-400">{item.original_filename} · 版本 {item.version_no}</div><div class="mt-2 flex flex-wrap gap-2 text-[11px] text-slate-400">{item.company && <span>{item.company}</span>}{item.source_department && <span>· {item.source_department}</span>}{item.document_type && <span>· {item.document_type}</span>}{item.material_category && <span>· {item.material_category}</span>}</div></div>
+          <div class="hidden text-right text-[11px] text-slate-400 sm:block"><div>{formatDate(item.parsed_at)}</div><div class="mt-1">{item.effective_hits} 次有效引用</div></div>
         </button>)}</div>}
         <Pager page={page} pageCount={pageCount} total={total} onPage={next => void load(next)}/>
       </div>
 
       <aside class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-        {!selected ? <EmptyState icon="documents" title="选择一个 Document Version" description="查看 Metadata、知识生命周期、版本历史与 Distillation 状态。"/> : detailLoading ? <LoadingBlock rows={6}/> : <DocumentDetail selected={selected} versions={versions} isAdmin={isAdmin} busy={busy} onSelect={setSelected} onDistill={markDistill} onNavigate={onNavigate}/>} 
+        {!selected ? <EmptyState icon="documents" title="选择一个资料版本" description="查看资料信息、版本历史和知识生成状态。"/> : detailLoading ? <LoadingBlock rows={6}/> : <DocumentDetail selected={selected} versions={versions} isAdmin={isAdmin} busy={busy} onSelect={setSelected} onDistill={markDistill} onNavigate={onNavigate}/>}
       </aside>
     </section>
-    {(uploadOpen || resumeBatchId) && canUpload && <BatchUploadDialog initialBatchId={resumeBatchId || undefined} onClose={() => { setUploadOpen(false); setResumeBatchId(''); void loadRecentBatches(); }} onChanged={() => { void load(1); void loadRecentBatches(); onChanged(); }} onError={onError}/>} 
+    {uploadOpen && canUpload && <BatchUploadDialog onClose={() => setUploadOpen(false)} onChanged={() => { void load(1); onChanged(); }} onError={onError}/>}
   </div>;
 }
 
 function DocumentDetail({ selected, versions, isAdmin, busy, onSelect, onDistill, onNavigate }: { selected: EnterpriseDocumentVersion; versions: EnterpriseDocumentVersion[]; isAdmin: boolean; busy: boolean; onSelect: (item: EnterpriseDocumentVersion) => void; onDistill: (id: string) => Promise<void>; onNavigate: (section: EnterpriseSection) => void }) {
   const summaryReady = selected.summary_count > 0 && selected.grounded_summaries > 0 && selected.covered_summaries > 0;
-  return <div class="space-y-5"><div><div class="flex items-center gap-2"><StatusBadge value={selected.lifecycle}/>{selected.recommendation && <StatusBadge value={selected.recommendation}/>}</div><h3 class="mt-3 text-lg font-semibold">{selected.logical_name}</h3><div class="mt-1 text-xs text-slate-400">{selected.original_filename} · Version {selected.version_no}</div></div>
-    <Pipeline summaryReady={summaryReady} wikiReady={summaryReady} graphReady={summaryReady}/>
-    <div class="grid grid-cols-2 gap-3 text-xs"><Info label="Company" value={selected.company || '—'}/><Info label="Department" value={selected.source_department || '—'}/><Info label="Document Type" value={selected.document_type || '—'}/><Info label="Material" value={selected.material_category || '—'}/><Info label="Document Date" value={selected.document_date ? formatDate(selected.document_date) : '—'}/><Info label="Version ID" value={shortID(selected.version_id, 12)}/></div>
-    <div class="grid grid-cols-3 gap-2"><Quality label="Summary" value={selected.summary_count}/><Quality label="Grounding" value={selected.grounded_summaries}/><Quality label="Coverage" value={selected.covered_summaries}/></div>
-    <div><div class="mb-2 flex items-center justify-between"><div class="text-xs font-semibold uppercase tracking-[0.12em] text-slate-400">Version history</div><span class="text-xs text-slate-400">{versions.length}</span></div><div class="max-h-56 space-y-2 overflow-y-auto">{versions.map(version => <button key={version.version_id} onClick={() => onSelect(version)} class={`flex w-full items-center justify-between rounded-xl border px-3 py-2.5 text-left ${version.version_id === selected.version_id ? 'border-blue-200 bg-blue-50 dark:border-blue-900 dark:bg-blue-950/30' : 'border-slate-100 bg-slate-50 dark:border-slate-800 dark:bg-slate-950/50'}`}><div><div class="text-xs font-semibold">Version {version.version_no}</div><div class="mt-0.5 text-[11px] text-slate-400">{formatDate(version.parsed_at)}</div></div><StatusBadge value={version.lifecycle}/></button>)}</div></div>
-    {selected.recommendation === 'RECOMMENDED' ? <div class="rounded-xl border border-violet-200 bg-violet-50 p-3 text-xs text-violet-800 dark:border-violet-900/60 dark:bg-violet-950/30 dark:text-violet-300"><div class="font-semibold">已推荐高价值编译</div><div class="mt-1">{selected.recommendation_reason || '由有效使用或人工标记触发'}</div></div> : isAdmin && selected.lifecycle === 'ACTIVE' && <PrimaryButton onClick={() => void onDistill(selected.version_id)} disabled={busy} icon="sparkles">{busy ? '处理中…' : '标记为高价值 Source'}</PrimaryButton>}
-    <div class="grid grid-cols-2 gap-2"><SecondaryButton onClick={() => onNavigate('evidence')} icon="evidence">查看 Evidence</SecondaryButton><SecondaryButton onClick={() => onNavigate('wiki')} icon="wiki">查看 Wiki</SecondaryButton></div>
+  return <div class="space-y-5"><div><div class="flex items-center gap-2"><StatusBadge value={selected.lifecycle}/>{selected.recommendation && <StatusBadge value={selected.recommendation}/>}</div><h3 class="mt-3 text-lg font-semibold">{selected.logical_name}</h3><div class="mt-1 text-xs text-slate-400">{selected.original_filename} · 版本 {selected.version_no}</div></div>
+    <Pipeline summaryReady={summaryReady}/>
+    <div class="grid grid-cols-2 gap-3 text-xs"><Info label="公司" value={selected.company || '—'}/><Info label="来源部门" value={selected.source_department || '—'}/><Info label="文档类型" value={selected.document_type || '—'}/><Info label="材料分类" value={selected.material_category || '—'}/><Info label="文档日期" value={selected.document_date ? formatDate(selected.document_date) : '—'}/><Info label="版本编号" value={shortID(selected.version_id, 12)}/></div>
+    <div class="grid grid-cols-3 gap-2"><Quality label="摘要" value={selected.summary_count}/><Quality label="事实校验" value={selected.grounded_summaries}/><Quality label="完整性检查" value={selected.covered_summaries}/></div>
+    <div><div class="mb-2 flex items-center justify-between"><div class="text-xs font-semibold tracking-[0.12em] text-slate-400">版本历史</div><span class="text-xs text-slate-400">{versions.length}</span></div><div class="max-h-56 space-y-2 overflow-y-auto">{versions.map(version => <button key={version.version_id} onClick={() => onSelect(version)} class={`flex w-full items-center justify-between rounded-xl border px-3 py-2.5 text-left ${version.version_id === selected.version_id ? 'border-blue-200 bg-blue-50 dark:border-blue-900 dark:bg-blue-950/30' : 'border-slate-100 bg-slate-50 dark:border-slate-800 dark:bg-slate-950/50'}`}><div><div class="text-xs font-semibold">版本 {version.version_no}</div><div class="mt-0.5 text-[11px] text-slate-400">{formatDate(version.parsed_at)}</div></div><StatusBadge value={version.lifecycle}/></button>)}</div></div>
+    {selected.recommendation === 'RECOMMENDED' ? <div class="rounded-xl border border-violet-200 bg-violet-50 p-3 text-xs text-violet-800 dark:border-violet-900/60 dark:bg-violet-950/30 dark:text-violet-300"><div class="font-semibold">建议生成高级知识</div><div class="mt-1">{selected.recommendation_reason || '由有效引用或管理员标记触发'}</div></div> : isAdmin && selected.lifecycle === 'ACTIVE' && <PrimaryButton onClick={() => void onDistill(selected.version_id)} disabled={busy} icon="sparkles">{busy ? '处理中…' : '建议生成高级知识'}</PrimaryButton>}
+    <div class="grid grid-cols-2 gap-2"><SecondaryButton onClick={() => onNavigate('evidence')} icon="evidence">查看证据</SecondaryButton><SecondaryButton onClick={() => onNavigate('wiki')} icon="wiki">查看企业百科</SecondaryButton></div>
   </div>;
 }
 

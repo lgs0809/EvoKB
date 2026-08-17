@@ -168,8 +168,9 @@ public final class EnterpriseApiController {
 
     @GetMapping("/tasks")
     public Map<String,Object> tasks(@RequestParam(defaultValue="1")int page,@RequestParam(name="page_size",defaultValue="30")int pageSize,
-                                    @RequestParam(name="q",required=false)String q,@RequestParam(required=false)String status,HttpServletRequest request){User actor=EnterpriseRequestContext.user(request);
-        var result=operations.tasks(query(page,pageSize,q,null,status,null,null,null,null,null,null,null,null,null,null,null,null),actor.id(),actor.administrator());
+                                    @RequestParam(name="q",required=false)String q,@RequestParam(required=false)String status,
+                                    @RequestParam(required=false)String source,HttpServletRequest request){User actor=EnterpriseRequestContext.user(request);
+        var result=operations.tasks(query(page,pageSize,q,null,status,null,null,null,null,null,null,null,null,null,null,null,null),actor.id(),actor.administrator(),source);
         return Map.of("tasks",result.items(),"total",result.total(),"page",result.page(),"page_size",result.pageSize());}
 
     @GetMapping("/audit")

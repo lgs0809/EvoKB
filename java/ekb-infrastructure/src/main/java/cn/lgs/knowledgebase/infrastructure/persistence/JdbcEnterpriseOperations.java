@@ -160,7 +160,7 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
     }
 
     @Override
-    public Page<TaskView> tasks(PageQuery q, String actorId, boolean admin) {
+    public Page<TaskView> tasks(PageQuery q, String actorId, boolean admin, String source) {
         PageQuery query = q == null ? emptyQuery() : q;
         String union;
         List<Object> unionArgs = new ArrayList<>();
@@ -172,6 +172,7 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
         }
         SqlWhere where = new SqlWhere("1=1");
         where.eq("u.status", upperExceptAll(query.status()));
+        where.eq("u.source", upperExceptAll(source));
         if (text(query.query())) {
             String like="%"+query.query().trim()+"%";
             where.add("(u.logical_name LIKE ? OR u.task_id LIKE ? OR u.version_id LIKE ? OR u.task_type LIKE ? OR u.error_message LIKE ? OR u.progress_stage LIKE ?)",like,like,like,like,like,like);

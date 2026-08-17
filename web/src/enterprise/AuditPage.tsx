@@ -61,7 +61,7 @@ export function AuditPage({ onError }: { onError: (message: string) => void }) {
         <input value={actor} onInput={event => setActor((event.target as HTMLInputElement).value)} placeholder="Actor" class="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950"/>
         <select value={action} onChange={event => setAction((event.target as HTMLSelectElement).value)} class="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm outline-none dark:border-slate-700 dark:bg-slate-950"><option value="">全部 Action</option>{knownActions.map(value => <option value={value} key={value}>{value}</option>)}</select>
         <select value={outcome} onChange={event => setOutcome((event.target as HTMLSelectElement).value)} class="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm outline-none dark:border-slate-700 dark:bg-slate-950"><option>ALL</option><option>SUCCESS</option><option>FAILURE</option></select>
-        <button onClick={() => void load(1)} class="rounded-xl bg-slate-950 px-4 py-2.5 text-sm font-semibold text-white dark:bg-white dark:text-slate-950">筛选</button>
+        <button onClick={() => void load(1)} class="rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm shadow-blue-600/15 transition hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-400">筛选</button>
       </div>
     </section>
 

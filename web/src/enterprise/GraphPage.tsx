@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'preact/hooks';
 import { fetchEnterpriseEvidence, fetchEnterpriseGraph, type EnterpriseEvidence, type EnterpriseGraphRelation } from '../lib/api';
-import { EmptyState, Icon, PrimaryButton, SectionTitle, shortID } from './ui';
+import { EmptyState, Icon, PrimaryButton, SectionTitle } from './ui';
 
 export function GraphPage({ onOpenEvidence, onError }: {
   onOpenEvidence: (evidence: EnterpriseEvidence) => void;
@@ -19,7 +19,7 @@ export function GraphPage({ onOpenEvidence, onError }: {
       setRelations(data.relations || []);
       onError('');
     } catch (err) {
-      onError(String(err));
+      onError(String(err instanceof Error ? err.message : err));
     } finally {
       setLoading(false);
     }
@@ -30,36 +30,34 @@ export function GraphPage({ onOpenEvidence, onError }: {
       onOpenEvidence(await fetchEnterpriseEvidence(id));
       onError('');
     } catch (err) {
-      onError(String(err));
+      onError(String(err instanceof Error ? err.message : err));
     }
   };
 
   return <div class="space-y-6">
     <section class="rounded-[28px] border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:p-7">
-      <SectionTitle eyebrow="Bounded traversal" title="从实体出发查看有证据的企业关系" description="Graph 不追求把所有事实都图谱化，只保留对关联、多跳与时间查询有价值、且拥有 ACTIVE Evidence Support 的关系。" />
+      <SectionTitle title="关系查询" description="输入公司、人员、合同、项目或机构名称。" />
       <div class="mt-6 flex flex-col gap-3 lg:flex-row">
         <div class="relative flex-1"><Icon name="graph" size={17} class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"/><input value={query} onInput={event => setQuery((event.target as HTMLInputElement).value)} onKeyDown={event => { if (event.key === 'Enter') void runSearch(); }} placeholder="输入公司、人员、合同、项目或机构名称" class="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-10 pr-3 text-sm outline-none focus:border-amber-400 dark:border-slate-700 dark:bg-slate-950"/></div>
-        <PrimaryButton onClick={() => void runSearch()} disabled={loading || !query.trim()} icon="graph">{loading ? '查询中…' : '查询 1–2 hop'}</PrimaryButton>
+        <PrimaryButton onClick={() => void runSearch()} disabled={loading || !query.trim()} icon="graph">{loading ? '查询中…' : '查询'}</PrimaryButton>
       </div>
-      <div class="mt-4 flex items-center justify-between border-t border-slate-100 pt-4 dark:border-slate-800">
-        <div class="flex items-center gap-2 text-xs text-slate-400"><Icon name="shield" size={14}/><span>仅返回拥有 ACTIVE Evidence Support 的 Relation Fact</span></div>
-        <div class="flex rounded-xl bg-slate-100 p-1 dark:bg-slate-800"><button onClick={() => setMode('relations')} class={`rounded-lg px-3 py-1.5 text-xs font-semibold ${mode === 'relations' ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white' : 'text-slate-400'}`}>关系浏览</button><button onClick={() => setMode('graph')} class={`rounded-lg px-3 py-1.5 text-xs font-semibold ${mode === 'graph' ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white' : 'text-slate-400'}`}>Graph View</button></div>
+      <div class="mt-4 flex justify-end border-t border-slate-100 pt-4 dark:border-slate-800">
+        <div class="flex rounded-xl bg-blue-50 p-1 dark:bg-blue-950/30"><button onClick={() => setMode('relations')} class={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${mode === 'relations' ? 'bg-blue-600 text-white shadow-sm dark:bg-blue-500' : 'text-blue-600 hover:bg-blue-100 dark:text-blue-300 dark:hover:bg-blue-950/60'}`}>关系浏览</button><button onClick={() => setMode('graph')} class={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${mode === 'graph' ? 'bg-blue-600 text-white shadow-sm dark:bg-blue-500' : 'text-blue-600 hover:bg-blue-100 dark:text-blue-300 dark:hover:bg-blue-950/60'}`}>图谱视图</button></div>
       </div>
     </section>
 
-    {relations.length === 0 && !loading && <EmptyState icon="graph" title="输入实体关键词开始浏览关系" description="Neo4j 从企业实体全文索引 Seed，最多展开 2 hop、10 个关系，并在返回前检查 Evidence Support。" />}
+    {relations.length === 0 && !loading && <EmptyState icon="graph" title="输入名称开始查询" description="查询结果会显示相关实体、关系和参考资料。" />}
 
     {relations.length > 0 && mode === 'relations' && <section class="space-y-4">
-      <SectionTitle eyebrow="Relations" title={`${relations.length} 条 Evidence-backed Relation`} description="点击 Evidence 可以直接回到原始 Document Version、page/block/bbox 与 Raw Content。" />
+      <SectionTitle title={`${relations.length} 条关系`} />
       <div class="grid gap-4 lg:grid-cols-2">{relations.map(rel => <article key={rel.relation_id} class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-        <div class="flex items-start gap-4"><EntityAvatar name={rel.source_name}/><div class="min-w-0 flex-1 pt-1 text-center"><div class="truncate text-xs font-semibold uppercase tracking-[0.1em] text-amber-600 dark:text-amber-400">{humanRelation(rel.relation_type)}</div><div class="my-2 flex items-center gap-2 text-slate-300 dark:text-slate-600"><div class="h-px flex-1 bg-current"/><Icon name="arrow" size={15}/></div><div class="text-[10px] text-slate-400">score {Number(rel.score || 0).toFixed(4)}</div></div><EntityAvatar name={rel.target_name}/></div>
-        <div class="mt-5 flex items-center justify-between border-t border-slate-100 pt-4 text-xs dark:border-slate-800"><span class="text-slate-400">Relation {shortID(rel.relation_id)}</span><span class="text-slate-400">{rel.evidence_ids?.length || 0} Evidence</span></div>
-        <div class="mt-3 flex flex-wrap gap-2">{(rel.evidence_ids || []).map(id => <button key={id} onClick={() => void openEvidence(id)} class="inline-flex items-center gap-1.5 rounded-lg bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-950/70"><Icon name="evidence" size={13}/>Evidence {shortID(id)}</button>)}</div>
+        <div class="flex items-start gap-4"><EntityAvatar name={rel.source_name}/><div class="min-w-0 flex-1 pt-1 text-center"><div class="truncate text-xs font-semibold tracking-[0.1em] text-amber-600 dark:text-amber-400">{humanRelation(rel.relation_type)}</div><div class="my-2 flex items-center gap-2 text-slate-300 dark:text-slate-600"><div class="h-px flex-1 bg-current"/><Icon name="arrow" size={15}/></div></div><EntityAvatar name={rel.target_name}/></div>
+        {(rel.evidence_ids || []).length > 0 && <div class="mt-5 border-t border-slate-100 pt-4 dark:border-slate-800"><div class="mb-2 text-xs text-slate-400">参考资料 {rel.evidence_ids.length} 条</div><div class="flex flex-wrap gap-2">{rel.evidence_ids.map(id => <button key={id} onClick={() => void openEvidence(id)} class="rounded-lg border border-blue-100 bg-blue-50/70 px-2.5 py-1.5 text-xs font-medium text-blue-700 transition hover:border-blue-300 hover:bg-blue-100 dark:border-blue-900/70 dark:bg-blue-950/30 dark:text-blue-300 dark:hover:bg-blue-950/60">查看原文</button>)}</div></div>}
       </article>)}</div>
     </section>}
 
     {relations.length > 0 && mode === 'graph' && <section class="rounded-2xl border border-slate-200/80 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:p-6">
-      <SectionTitle eyebrow="Graph view" title="关系拓扑" description="轻量可视化用于理解当前有界查询的实体关系；证据审计仍以 Relation / Evidence 为准。" />
+      <SectionTitle title="关系拓扑" />
       <div class="mt-5 overflow-hidden rounded-2xl border border-slate-100 bg-slate-50 dark:border-slate-800 dark:bg-slate-950/60"><GraphCanvas relations={relations}/></div>
       <div class="mt-4 flex flex-wrap gap-2">{relations.map(rel => <div key={rel.relation_id} class="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] text-slate-500 dark:border-slate-700 dark:text-slate-400">{rel.source_name} → {humanRelation(rel.relation_type)} → {rel.target_name}</div>)}</div>
     </section>}
@@ -67,7 +65,7 @@ export function GraphPage({ onOpenEvidence, onError }: {
 }
 
 function EntityAvatar({ name }: { name: string }) {
-  return <div class="min-w-0 max-w-[36%] text-center"><div class="mx-auto flex h-11 w-11 items-center justify-center rounded-2xl bg-slate-950 text-sm font-semibold text-white dark:bg-white dark:text-slate-950">{(name || '?').slice(0, 1).toUpperCase()}</div><div class="mt-2 break-words text-sm font-semibold text-slate-700 dark:text-slate-200">{name || 'Unknown'}</div></div>;
+  return <div class="min-w-0 max-w-[36%] text-center"><div class="mx-auto flex h-11 w-11 items-center justify-center rounded-2xl bg-blue-600 text-sm font-semibold text-white dark:bg-blue-500">{(name || '?').slice(0, 1).toUpperCase()}</div><div class="mt-2 break-words text-sm font-semibold text-slate-700 dark:text-slate-200">{name || '未知实体'}</div></div>;
 }
 
 function GraphCanvas({ relations }: { relations: EnterpriseGraphRelation[] }) {
@@ -93,10 +91,5 @@ function buildLayout(relations: EnterpriseGraphRelation[]) {
   return { nodes, edges };
 }
 
-function humanRelation(value: string) {
-  return (value || 'RELATED_TO').replaceAll('_', ' ');
-}
-
-function truncate(value: string, max: number) {
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
-}
+function humanRelation(value: string) { return (value || 'RELATED_TO').replaceAll('_', ' '); }
+function truncate(value: string, max: number) { return value.length > max ? `${value.slice(0, max - 1)}…` : value; }

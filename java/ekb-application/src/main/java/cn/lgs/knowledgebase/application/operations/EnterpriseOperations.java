@@ -95,7 +95,7 @@ public final class EnterpriseOperations {
         Optional<WikiView> wiki(String wikiId, Long version);
         Optional<EvidenceDetail> evidence(String evidenceId);
         Page<EvidenceListView> evidences(PageQuery query);
-        Page<TaskView> tasks(PageQuery query, String actorId, boolean admin);
+        Page<TaskView> tasks(PageQuery query, String actorId, boolean admin, String source);
         Facets facets();
         Page<AuditEventView> audit(PageQuery query);
         List<GraphRelationView> graph(String query, int depth, int limit);
