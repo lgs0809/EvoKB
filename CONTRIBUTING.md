@@ -1,322 +1,86 @@
-# Contributing to sage-wiki
+# 贡献指南
 
-**Before opening a PR:** run `make ci` on your feature branch — the accurate
-local fast gate. It runs, in order: canonical formatting over all tracked Go
-source (`scripts/ci/check-format.sh`), module tidy-drift and content
-verification (`scripts/ci/check-modules.sh`, worktree-preserving), pure-Go
-and webui builds, vet, new-issue lint, responsibility-manifest validation
-(`tools/civalidate`: exact package partition, aggregate membership, Make
-targets, determinism roles, platform inventory), the determinism tripwire
-with its self-test, generated/API/skill drift checks, translation self-test
-and header inventory, and the ordinary (non-race) test suite.
-On `main` itself the *local* translation-drift range is empty (CI's push path
-checks `before..after` and is not), so run `make translations` from your
-branch for the range-based check.
+感谢参与 Enterprise Knowledge Base。
 
-**`make ci-race`** is the canonical local race contract: `-race` over every
-manifest-owned package (`make test` is the legacy race alias). Run it before
-pushing compiler/concurrency work; `make ci` deliberately stays non-race for
-speed.
+## 开发环境
 
-**Local `make ci` is mandatory but not a substitute for hosted CI.** It
-prints, on success, exactly what it does NOT cover — hosted-only evidence:
-Windows/macOS execution, PostgreSQL/MinIO service contracts, the
-pinned-container frontend build, scheduled fuzz exploration, and exact-SHA
-publication proof. The hosted `CI required` check-run on the latest PR SHA is
-the merge gate: a green `make ci` does not replace a green hosted run, and a
-hosted result that predates your last push does not count. Today that gate
-is maintainer policy — a PR is not mergeable without `CI required` success
-on the HEAD SHA — and it becomes mechanical once branch protection requires
-the check on `main`.
+- JDK 17
+- Maven 3.9+
+- Node.js 24+
+- npm
+- Docker Engine + Docker Compose（需要做集成验证时）
 
-## CI responsibility and ownership states
+## 代码边界
 
-Quality responsibility is recorded in machine-readable manifests under
-`ci/` (`standards.yaml`, `package-ownership.yaml`,
-`platform-contracts.yaml`), validated fail-closed by `tools/civalidate`
-against the live tree. Two ownership states matter when reading CI:
+后端保持 DDD 模块边界：
 
-- **Required now (`required-requalifying`).** The current required jobs —
-  build, parity, go-test, fuzz-short, skill-drift, postgres, minio, lint,
-  frontend, translations — stay in the `CI required` aggregate and keep
-  merge authority while they re-qualify under the shadow protocol.
-- **Candidate (advisory).** Target witnesses (preflight checks, focused OS
-  contracts, service-contract shards) run advisory only. The CI workflow's
-  `Responsibility validation (advisory)` job may turn red — a validator or
-  parser failure stays visible — but it is deliberately outside the
-  `CI required` aggregate and cannot block a merge. Candidates earn
-  promotion only through a recorded qualification window (at least 20
-  relevant executions over seven days, zero unexplained divergence) and
-  explicit maintainer approval.
+- `ekb-domain`：纯领域模型与规则，不依赖 Spring Web、数据库或第三方适配器。
+- `ekb-application`：用例、业务编排、事务语义和端口。
+- `ekb-infrastructure`：数据库、对象存储、检索、图谱、模型和 MinerU 适配器。
+- `ekb-interfaces`：REST、MCP、认证、上传等协议入口。
+- `ekb-bootstrap`：组合根和启动配置。
 
-If the advisory job is red on your PR, treat it as a real signal — fix the
-underlying manifest/validation failure — but it does not gate merging while
-it remains advisory.
+不要为了形式化 DDD 增加没有领域意义的 Factory/Manager/Coordinator/Facade。
 
-## Repository layout
+## 提交前检查
 
-Selected entries (illustrative, not exhaustive):
-
-```
-├── cmd/sage-wiki/        # CLI entrypoint + command wiring
-├── internal/             # the core (~30 packages): compiler, llm, storage,
-│                         #   memory, vectors, search, graph, ontology, mcp,
-│                         #   trust, api (/v1 REST), web, tui, linter, …
-├── pkg/sagewiki/         # public Go module for embedding (in-process MCP)
-├── clients/              # SDKs: python/ + typescript/
-├── tools/skillgen/       # agent-skill generator (skills/ is generated output)
-├── tools/civalidate/     # fail-closed CI responsibility validator
-├── tools/testsummary/    # go test -json summarizer (annotations, exit-preserving)
-├── ci/                   # responsibility manifests (standards, ownership, contracts)
-├── skills/               # generated agent skills — never hand-edit; CI drift-checked
-├── examples/             # CI-exercised framework examples (langgraph, vercel-ai-sdk)
-├── eval/                 # benchmarks (LOCOMO, LongMemEval, BEAM)
-├── api/openapi.yaml      # the /v1 REST contract (drift-checked against tools+routes)
-├── web/                  # Preact web UI source (embedded via -tags webui)
-├── docs/                 # guides/ + translations/ (six README locales)
-├── assets/               # README images
-└── scripts/              # CI/dev shell tools
-```
-
-## Translations
-
-`README.md` and its six translations (`docs/translations/README_{fr,ja,ko,ru,vi,zh}.md`)
-move together. A change range that touches `README.md` without any
-`docs/translations/README_*.md` fails CI's Translation drift job (MAINT-05) —
-`make ci` runs the same check locally. If the change genuinely should not be
-translated yet, add `translations: lag-ok` to a commit message in the range
-to document the debt.
-
-**Maintainers merging external PRs:** GitHub holds CI for first-time
-contributors at `action_required` — checks must have *run and passed*, not
-merely be absent. Click "Approve and run workflows" on fork PRs, and treat a
-PR showing zero checks as unverified regardless of local runs. When reworking
-CI workflow code, keep the required context valid: once branch protection
-requires `CI required` on `main`, relax or remove that required status check
-before reverting or renaming the workflow that emits the check-run — a
-required context that no workflow produces blocks every merge.
-
-## Adding a file format parser
-
-### Go (built-in)
-
-1. Add a new case in `internal/extract/extract.go` matching the file extension
-2. Implement the extraction function returning plain text content
-3. Add tests in `internal/extract/extract_test.go`
-
-### External (subprocess)
-
-1. Write a parser script that reads file content from stdin and writes plain text to stdout
-2. Create `parsers/parser.yaml` in your project or pack with the extension mapping:
-   ```yaml
-   parsers:
-     - extensions: [".docx"]
-       command: python3
-       args: ["docx_parser.py"]
-       timeout: 30s
-   ```
-3. Place the script in `parsers/` and ensure it's executable (relative paths in `command` and `args` are resolved against `parsers/`)
-4. Enable external parsers in config: `parsers: { external: true }`
-
-External parsers run with timeout enforcement (30s default, 120s max) and
-environment stripping (only PATH, HOME, LANG reach the subprocess). They
-require double opt-in: `parsers.external: true` to load definitions and
-`parsers.trust_external: true` to acknowledge unsandboxed execution; packs
-with parsers additionally need `pack apply --enable-parsers`. Built-in
-extractors are hardened with decompression caps (per-entry and aggregate
-limits against zip bombs) and covered by a nightly fuzzing job
-([.github/workflows/fuzz.yml](.github/workflows/fuzz.yml)) that feeds
-malformed docx/xlsx/pptx/epub/eml/pdf inputs and checks the caps hold.
-
-## Fuzzing
-
-Native Go fuzz targets guard the parsing and hardening surfaces. Two tiers run
-in CI, both driven by the machine-readable inventory in
-[`ci/fuzz-targets.yaml`](ci/fuzz-targets.yaml) (validated fail-closed against
-the source tree — a new target without an inventory entry, or a stale entry,
-turns the nightly job red):
-
-- **PR-gated short pass** (`fuzz-short` job in
-  [.github/workflows/ci.yml](.github/workflows/ci.yml)): the 8 hardening
-  targets (`FuzzFrontmatter` ×5 packages, `FuzzWikilink`,
-  `FuzzAliasNormalize`, `FuzzCanonical`) for 30s each.
-- **Nightly exploration** ([.github/workflows/fuzz.yml](.github/workflows/fuzz.yml)):
-  every target in the inventory — the 8 hardening targets plus the 6 extractor
-  format targets (`FuzzExtract{Docx,Xlsx,Pptx,Epub,Email,PdfGo}`), which do
-  **not** run on PRs.
-
-Committed seed corpora run deterministically as ordinary package tests on
-every PR; only the time-bounded random exploration above is scheduled.
-
-Run a target locally (pick one target per invocation — Go's `-fuzz` errors if
-a pattern matches more than one):
-
-```sh
-go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/extract/
-go test -run=NONE -fuzz=FuzzWikilink    -fuzztime=30s ./internal/compiler/
-```
-
-The current targets:
-
-| Target | Package | Surface |
-|--------|---------|---------|
-| `FuzzExtract{Docx,Xlsx,Pptx,Epub,Email,PdfGo}` | `internal/extract` | extractor decompression caps |
-| `FuzzFrontmatter` | `internal/extract`, `internal/web`, `internal/ontology`, `internal/wiki`, `internal/compiler` | the five pure-string frontmatter sites (one target per owning package) |
-| `FuzzWikilink` | `internal/compiler` | wikilink matching, sanitization, broken-link strip |
-| `FuzzAliasNormalize` | `internal/compiler` | name normalization + alias map |
-| `FuzzCanonical` | `internal/compiler` | canonical frontmatter/JSON determinism |
-
-Assertions are security invariants only — no panic, no unbounded growth,
-deterministic output. Errors are accepted, never asserted.
-
-If a run finds a crash, Go writes the failing input under
-`<package>/testdata/fuzz/<Target>/`. **Commit that crasher file** with your
-fix so the corpus always reproduces it:
-
-```sh
-git add internal/compiler/testdata/fuzz/FuzzWikilink/   # example
-```
-
-## Regenerating the web UI dist
-
-The committed `internal/web/dist` must byte-match a `node:22-alpine` build
-(CI enforces this with a hard-fail drift check). After changing anything
-under `web/`, regenerate inside the pinned environment and commit the
-result:
-
-```sh
-docker run --rm -v "$PWD:/src" -w /src/web node:22-alpine sh -c "npm ci && npm run build"
-```
-
-
-## Creating a pack
-
-### Quick start
+后端：
 
 ```bash
-sage-wiki pack create my-pack
-cd my-pack
-# edit pack.yaml, add prompts, skills, samples
-sage-wiki pack validate
+mvn -f java/pom.xml clean test package
 ```
 
-### Pack directory structure
-
-```
-my-pack/
-├── pack.yaml              # required — manifest
-├── prompts/               # optional — prompt templates
-│   └── summarize.txt
-├── skills/                # optional — skill template files
-├── parsers/               # optional — external parser scripts
-│   ├── parser.yaml        # extension mappings
-│   └── convert.py         # parser script
-├── samples/               # optional — example source files
-│   └── example.md
-└── README.md              # optional — documentation
-```
-
-### Testing your pack
+前端：
 
 ```bash
-# validate schema and file references
-sage-wiki pack validate ./my-pack
-
-# install locally and apply to a test project
-sage-wiki pack install ./my-pack
-sage-wiki pack apply my-pack --mode merge
-
-# verify config and ontology changes
-sage-wiki status
+cd web
+npm ci
+npm run lint
+npm run typecheck
+npm run build
+npm audit --audit-level=low
 ```
 
-### Pack command reference
+Docker：
 
 ```bash
-sage-wiki pack install <name|url>     # install (bundled name or Git URL)
-sage-wiki pack apply <name> [--mode merge|replace]   # apply to the project
-sage-wiki pack remove <name>          # remove a pack from the project
-sage-wiki pack list                   # list applied, cached, and bundled packs
-sage-wiki pack search <query>         # search the pack registry
-sage-wiki pack update [name]          # update installed packs to latest versions
-sage-wiki pack info <name>            # show details about a pack
-sage-wiki pack create <name>          # scaffold a new pack directory
-sage-wiki pack validate [path]        # validate a pack's schema and files
-sage-wiki pack conflicts              # show multi-pack file overlaps
+docker compose -f deploy/docker-compose.yml config
 ```
 
-Packs are composable — apply multiple packs and their ontology types are
-union-merged. Conflicts (overlapping prompt files) are reported; use
-`sage-wiki pack conflicts` to inspect.
+## 配置与 Secret
 
-### Submitting to the registry
+- 新配置统一使用 `EKB_*`；前端开发专用变量使用 `VITE_*`。
+- 不提交真实 `.env`。
+- 不写入开发者绝对路径、固定个人账号、私有 endpoint 或 API Key。
+- 模型 Provider 和模型名必须可配置，不把本地测试模型变成产品依赖。
+- 新增配置时同步 `.env.example`、Compose 和 `docs/CONFIGURATION.md`。
 
-1. Fork the [sage-wiki-packs](https://github.com/xoai/sage-wiki-packs) repository
-2. Add your pack directory under `packs/`
-3. Add an entry to `index.yaml`:
-   ```yaml
-   - name: my-pack
-     version: 1.0.0
-     description: Short description of what this pack does
-     tier: community
-     tags: [domain, keywords]
-   ```
-4. Run `sage-wiki pack validate packs/my-pack` to verify
-5. Submit a pull request — CI validates the pack automatically
+## 前后端协议
 
-## Pack schema reference
+修改 REST/MCP DTO 时，同时检查：
 
-### pack.yaml fields
+- Java interfaces 层；
+- application use case；
+- `web/src/lib/api.ts`；
+- 对应页面；
+- 兼容已有持久化协议的必要性。
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | yes | Kebab-case identifier (`^[a-z][a-z0-9-]*$`) |
-| `version` | string | yes | Semantic version (e.g., `1.0.0`) |
-| `description` | string | yes | One-line description |
-| `author` | string | yes | Author name or organization |
-| `license` | string | no | License identifier (e.g., `MIT`) |
-| `min_version` | string | no | Minimum sage-wiki version required |
-| `tags` | string[] | no | Discovery tags |
-| `homepage` | string | no | URL to project homepage |
-| `config` | map | no | Config overlay (merged into project config.yaml) |
-| `ontology.entity_types` | object[] | no | Entity type definitions |
-| `ontology.relation_types` | object[] | no | Relation type definitions |
-| `article_fields` | string[] | no | Custom article metadata fields |
-| `prompts` | string[] | no | Prompt template filenames in `prompts/` |
-| `skills` | string[] | no | Skill template filenames in `skills/` |
-| `parsers` | string[] | no | Parser script filenames in `parsers/` |
-| `samples` | string[] | no | Sample source filenames in `samples/` |
+已经形成外部兼容协议的字段不要仅为了命名美观直接删除。新代码使用新术语时，可以在协议边界保留兼容映射。
 
-### Config overlay
+## 测试
 
-Only these top-level config keys are allowed in pack config overlays:
+修复问题应优先添加能够复现问题的测试。涉及 DDD 边界时更新 ArchUnit 规则；涉及批量上传、解析或权限时覆盖失败和越权路径。
 
-- `compiler` — compilation settings (default_tier, etc.)
-- `search` — search and retrieval settings
-- `linting` — linting rules
-- `ontology` — ontology configuration
-- `trust` — output trust settings
-- `type_signals` — type signal configuration
-- `ignore` — ignore patterns
+## 提交
 
-Keys like `api`, `embed`, `models`, `parsers`, `serve`, `vault`, `sources`,
-`output`, and `project` are stripped for security.
+一个提交尽量表达一个完整变化，并保持可构建。例如：
 
-### Entity and relation types
-
-```yaml
-ontology:
-  entity_types:
-    - name: finding
-      description: A research finding or result
-  relation_types:
-    - name: cites
-      synonyms: [references, builds_on]
-      valid_sources: [article]  # optional
-      valid_targets: [article]  # optional
+```text
+refactor: decouple runtime configuration
+refactor: remove legacy project dependencies
+build: make docker deployment portable
+ci: add release quality gates
+docs: prepare public documentation
 ```
 
-### Apply modes
-
-- **merge** (default) — fill-only: pack values apply only where the project has no value. Existing files are skipped as conflicts.
-- **replace** — overwrites existing values and files.
+不要提交生成的 `target/`、`web/dist/`、`node_modules/`、本地报告或真实凭据。
