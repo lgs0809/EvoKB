@@ -1,555 +1,65 @@
 name: CI
 
-# Quality gate for every push to main and every PR: build (incl. the `webui`
-# build tag), vet, race-test, lint, vuln-scan, typecheck the frontend, and the
-# translation-drift check (MAINT-05). Local mirror: `make ci`.
-#
-# CGO policy: the release build is pure-Go (`modernc.org/sqlite`) and MUST stay
-# CGO_ENABLED=0 (see .github/workflows/release.yml) — so build/vet run with cgo
-# OFF. The ONE exception is `go test -race`: the race detector links a C runtime
-# and hard-requires cgo (`-race requires cgo` otherwise), so the race step alone
-# runs CGO_ENABLED=1. That pulls in the toolchain's race runtime, NOT any cgo
-# module dependency, so the pure-Go release story is unaffected.
 on:
   push:
     branches: [main]
   pull_request:
 
-# Least privilege — CI only reads the repo (mirrors release.yml/docker.yml).
 permissions:
   contents: read
 
-# bash on every runner (incl. windows) so one inline `CGO_ENABLED=… go …` works
-# uniformly instead of per-shell env juggling.
-defaults:
-  run:
-    shell: bash
-
 jobs:
-  build:
-    name: Build+vet ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          # Latest 1.26.x (go.mod targets `go 1.26`) — a patched toolchain also
-          # picks up stdlib security fixes without editing go.mod.
-          go-version: "1.26"
-          cache: true
-
-      - name: Build
-        run: CGO_ENABLED=0 go build ./...
-
-      - name: Build (webui tag)
-        run: CGO_ENABLED=0 go build -tags webui ./...
-
-      - name: Vet
-        run: CGO_ENABLED=0 go vet ./...
-
-      # SPEC-01 AC-B2: the embedding example must run offline (fake provider).
-      - name: Embed example runs offline
-        run: CGO_ENABLED=0 go run ./examples/embed
-
-  # SPEC-09 golden-corpus parity suite: linux required, macOS best-effort.
-  # Fully offline (recorded fixtures; CI never records).
-  parity:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        include:
-          - os: ubuntu-latest
-            required: true
-          - os: macos-latest
-            required: false
-    continue-on-error: ${{ matrix.required == false }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # the golden-changes marker diffs against the base ref
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-      - name: Vet
-        run: CGO_ENABLED=0 go vet ./internal/parity/
-      - name: Parity suite (replay mode)
-        run: CGO_ENABLED=0 go test -count=1 ./internal/parity/
-      - name: Flake loop (10x)
-        run: CGO_ENABLED=0 go test -count=10 -run TestParity ./internal/parity/
-      - name: Golden-changes marker (PRs)
-        if: github.event_name == 'pull_request'
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          set -euo pipefail
-          git fetch origin ${{ github.event.pull_request.head.sha }}
-          if git diff --name-only origin/${{ github.base_ref }}...${{ github.event.pull_request.head.sha }} -- testdata/golden/ testdata/fixtures/ | grep -q .; then
-            case "$PR_BODY" in
-              *"Golden changes"*) ;;
-              *) echo "goldens changed without a 'Golden changes' PR section"; exit 1 ;;
-            esac
-          fi
-
-  # Tests are sharded three ways per OS so the slowest shard (~compiler,
-  # ~6 min) bounds wall time instead of the whole suite (~14 min serial).
-  go-test:
-    name: Test ${{ matrix.shard }} ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        shard: [compiler, core, rest]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
-
-      # Race detector needs cgo; ubuntu/macos ship a C compiler. Windows
-      # runs without -race (no guaranteed C compiler) — ubuntu+macos race
-      # coverage satisfies the acceptance bar.
-      - name: Resolve shard packages
-        id: pkgs
-        shell: bash
-        run: |
-          case "${{ matrix.shard }}" in
-            compiler) PKGS="./internal/compiler" ;;
-            core)     PKGS="./internal/api ./internal/mcp ./internal/llm ./internal/extract/..." ;;
-            rest)     PKGS=$(go list ./... | grep -v -E "internal/(compiler|api|mcp|llm|extract)" | tr '\n' ' ') ;;
-          esac
-          echo "packages=$PKGS" >> "$GITHUB_OUTPUT"
-
-      - name: Test (race)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: CGO_ENABLED=1 go test -race -timeout 15m ${{ steps.pkgs.outputs.packages }}
-
-      - name: Test
-        if: runner.os == 'Windows'
-        shell: bash
-        run: CGO_ENABLED=0 go test -timeout 15m ${{ steps.pkgs.outputs.packages }}
-
-  # SPEC-08 AC5: short PR-gated fuzz pass over the hardening targets. Each
-  # target gets its own invocation (Go's -fuzz errors when one invocation
-  # matches multiple targets) and its own continue-on-error step, so one
-  # crasher never masks the others — the aggregation step reads OUTCOME and
-  # turns the job red on any failure. FuzzFrontmatter runs once per owning
-  # package (the five pure-string frontmatter sites live in five packages;
-  # Go visibility forbids one cross-package target).
-  fuzz-short:
-    name: Fuzz (short, SPEC-08)
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
-
-      - id: fm-extract
-        name: FuzzFrontmatter (extract)
-        run: go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/extract/
-        continue-on-error: true
-      - id: fm-web
-        name: FuzzFrontmatter (web)
-        run: go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/web/
-        continue-on-error: true
-      - id: fm-ontology
-        name: FuzzFrontmatter (ontology)
-        run: go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/ontology/
-        continue-on-error: true
-      - id: fm-wiki
-        name: FuzzFrontmatter (wiki)
-        run: go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/wiki/
-        continue-on-error: true
-      - id: fm-compiler
-        name: FuzzFrontmatter (compiler)
-        run: go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/compiler/
-        continue-on-error: true
-      - id: wikilink
-        name: FuzzWikilink
-        run: go test -run=NONE -fuzz=FuzzWikilink -fuzztime=30s ./internal/compiler/
-        continue-on-error: true
-      - id: alias
-        name: FuzzAliasNormalize
-        run: go test -run=NONE -fuzz=FuzzAliasNormalize -fuzztime=30s ./internal/compiler/
-        continue-on-error: true
-      - id: canonical
-        name: FuzzCanonical
-        run: go test -run=NONE -fuzz=FuzzCanonical -fuzztime=30s ./internal/compiler/
-        continue-on-error: true
-
-      - name: Upload crashers (when any target failed)
-        if: always() && (steps.fm-extract.outcome == 'failure' || steps.fm-web.outcome == 'failure' || steps.fm-ontology.outcome == 'failure' || steps.fm-wiki.outcome == 'failure' || steps.fm-compiler.outcome == 'failure' || steps.wikilink.outcome == 'failure' || steps.alias.outcome == 'failure' || steps.canonical.outcome == 'failure')
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-short-crashers
-          path: |
-            internal/extract/testdata/fuzz/
-            internal/web/testdata/fuzz/
-            internal/ontology/testdata/fuzz/
-            internal/wiki/testdata/fuzz/
-            internal/compiler/testdata/fuzz/
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Fail if any target crashed
-        if: always()
-        run: |
-          if [ "${{ steps.fm-extract.outcome }}" = "failure" ] || \
-             [ "${{ steps.fm-web.outcome }}" = "failure" ] || \
-             [ "${{ steps.fm-ontology.outcome }}" = "failure" ] || \
-             [ "${{ steps.fm-wiki.outcome }}" = "failure" ] || \
-             [ "${{ steps.fm-compiler.outcome }}" = "failure" ] || \
-             [ "${{ steps.wikilink.outcome }}" = "failure" ] || \
-             [ "${{ steps.alias.outcome }}" = "failure" ] || \
-             [ "${{ steps.canonical.outcome }}" = "failure" ]; then
-            echo "fuzz findings — see the fuzz-short-crashers artifact"
-            exit 1
-          fi
-
-  skill-drift:
-    name: Agent skill drift
+  backend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-java@v4
         with:
-          go-version: "1.26"
-          cache: true
-
-      # Regenerate the agent skills from the live MCP registry; any diff
-      # means a tool/schema change shipped without re-running the generator.
-      - name: Check skill drift
-        run: |
-          go run ./tools/skillgen/
-          git diff --exit-code -- skills/
-
-  postgres:
-    name: Postgres backend
-    runs-on: ubuntu-latest
-    # The postgres backend's tests are env-gated (TEST_DATABASE_URL), so on
-    # every other job they SKIP — a pg-only regression shipped green twice
-    # before this job existed (20260728-search-upgrade Gate-3 F-046/F-055).
-    # pgvector/pgvector ships the extension the v1 migration needs.
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: sage_wiki_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
-
-      # sage-wiki refuses to CREATE EXTENSION itself by design (it needs
-      # superuser; on RDS an operator runs it once), so CI must create it.
-      # Doing it explicitly rather than trusting the image's initdb hook:
-      # the hook only fires on first init of the data directory, and when it
-      # silently doesn't, every pg test fails with "relation does not exist"
-      # — which reads like a schema bug, not a missing extension.
-      - name: Enable pgvector in the test database
-        env:
-          PGPASSWORD: postgres
-        run: |
-          for i in $(seq 1 15); do
-            pg_isready -h localhost -U postgres && break
-            sleep 2
-          done
-          psql -h localhost -U postgres -d sage_wiki_test \
-            -c 'CREATE EXTENSION IF NOT EXISTS vector;'
-          psql -h localhost -U postgres -d sage_wiki_test \
-            -c "SELECT extname FROM pg_extension WHERE extname='vector';" | grep -q vector
-
-      # -p 1: every pg package talks to the SAME database, so parallel
-      # packages would race on shared tables (they drop and recreate schema).
-      - name: Test (postgres-gated packages)
-        env:
-          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/sage_wiki_test?sslmode=disable
-        run: |
-          CGO_ENABLED=0 go test -p 1 -count=1 \
-            ./internal/storage/postgres/... \
-            ./internal/storetest/... \
-            ./internal/hub/... \
-            ./internal/wiki/...
-
-  minio:
-    name: MinIO mirror integration
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
-
-      # Run MinIO as a background docker container so we can explicitly pass
-      # `server /data` — GitHub Actions service containers run the image's
-      # default CMD with no override, and mineio/minio:latest no longer
-      # defaults to running the server.
-      - name: Start MinIO
-        run: >
-          docker run -d --name minio
-          -p 9000:9000
-          -e MINIO_ROOT_USER=minioadmin
-          -e MINIO_ROOT_PASSWORD=minioadmin
-          minio/minio server /data --console-address ":9001"
-      - name: Wait for MinIO
-        run: |
-          for i in $(seq 1 20); do
-            if curl -fsS http://localhost:9000/minio/health/live 2>/dev/null; then
-              echo "MinIO ready"
-              exit 0
-            fi
-            sleep 3
-          done
-          echo "MinIO failed to start" && docker logs minio && exit 1
-
-      - name: Create test buckets
-        run: |
-          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
-          chmod +x /tmp/mc
-          /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
-          /tmp/mc mb --ignore-existing local/sage-it-roundtrip
-          /tmp/mc mb --ignore-existing local/sage-it-corrupt
-          /tmp/mc mb --ignore-existing local/sage-it-crypt
-
-      # SAGE_MIRROR_CRASH_LOOPS=100 is AC-2's CI count; the default 5 stays
-      # for local runs. No real cloud creds anywhere in this job.
-      - name: Test (MinIO-gated mirror packages)
-        env:
-          SAGE_TEST_MINIO: "1"
-          SAGE_TEST_MINIO_ENDPOINT: http://localhost:9000
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-          SAGE_MIRROR_CRASH_LOOPS: "100"
-        run: |
-          CGO_ENABLED=0 go test -count=1 -timeout 10m ./internal/mirror/...
-
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      # Full history so golangci-lint can diff against the base (new-issue mode).
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
-
-      # Build golangci-lint from source with THIS toolchain. A prebuilt binary
-      # built with an older Go refuses a go1.26 module
-      # ("the Go language version used to build golangci-lint is lower than the
-      # targeted Go version"); `go install` sidesteps that. v2 line is required
-      # for go1.26 support.
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
-
-      # Ensure the base ref exists for the merge-base diff.
-      - name: Fetch base ref
-        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-
-      # Gate NEW issues only: the tree carries pre-existing findings that P0-1
-      # deliberately does not refactor (establish the gate, not clean the tree).
-      # A local `golangci-lint run` still reports everything for gradual cleanup.
-      - name: Lint (new issues)
-        run: golangci-lint run --new-from-merge-base=origin/main --timeout=5m ./...
-
-      # SPEC-04 D1 tripwire: unsorted map-range loops feeding serializers.
-      # Best-effort grep + allowlist (limits documented in docs/determinism.md).
-      - name: Determinism check
-        run: bash scripts/check-determinism.sh
-
-  vuln:
-    name: Vuln scan (advisory)
-    runs-on: ubuntu-latest
-    # Advisory in P0-1: govulncheck currently reports Go stdlib advisories fixed
-    # only in a newer patch toolchain, which would turn CI red on unmodified main
-    # through no fault of a change. Surface findings without blocking; dependabot
-    # is the actionable channel for dependency vulns. (Blocking gate revisited in
-    # master-plan P2-7.)
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
-
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
-      - name: govulncheck
-        run: govulncheck ./...
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Verify Java backend
+        run: mvn -f java/pom.xml clean verify
 
   frontend:
-    name: Frontend (typecheck + build)
     runs-on: ubuntu-latest
-    # P2-7 (MAINT-02): build inside the Dockerfile builder's environment so
-    # the committed dist byte-matches what CI produces — the precondition
-    # for an enforcing drift check. Alpine ships neither bash nor git while
-    # the workflow defaults to `shell: bash`, so the FIRST step installs
-    # both under `shell: sh`. setup-node is dropped (the image IS node 22).
-    container: node:22-alpine
-    steps:
-      - name: Install shell and git
-        shell: sh
-        # safe.directory: the workspace dir is owned by the host runner uid
-        # while steps run as root in the container — git's dubious-ownership
-        # protection rejects the repo for every step except checkout (which
-        # sets it only for itself). Set it once for all later git calls.
-        run: |
-          apk add --no-cache bash git
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - uses: actions/checkout@v4
-
-      # `npm run build` runs `tsc -b` first — a real typecheck — then `vite build`.
-      # This is the hard gate.
-      - name: Install and build
+    defaults:
+      run:
         working-directory: web
-        run: |
-          npm ci
-          npm run build
-
-      # Enforcing drift check (was advisory): any byte difference between
-      # the committed dist and this build fails the job. Regenerate with
-      # the documented docker command and commit the result.
-      - name: Verify dist is current
-        run: git diff --exit-code internal/web/dist
-
-  translations:
-    name: Translation drift (MAINT-05)
-    runs-on: ubuntu-latest
-    steps:
-      # Full history: the check diffs README.md against the base ref.
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check README translation drift
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch origin main
-            BASE="origin/main"
-            HEAD="HEAD"
-            RANGE="$(git merge-base "$BASE" "$HEAD")..$HEAD"
-          else
-            BASE="${{ github.event.before }}"
-            HEAD="${{ github.event.after }}"
-            if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
-              echo "new branch push — nothing to check"
-              exit 0
-            fi
-            RANGE="$(git merge-base "$BASE" "$HEAD" 2>/dev/null || echo "$BASE")..$HEAD"
-          fi
-          COMMIT_MSGS="$(git log --format=%B "$RANGE")"
-          export BASE HEAD COMMIT_MSGS
-          bash scripts/check-readme-translations.sh
-
-  # 20260812-ci-quality-system Task 8: advisory responsibility validation.
-  # Deliberately NOT in ci-required's needs: it may turn red (a validator or
-  # parser failure stays visible) but can never alter or block the stable
-  # `CI required` aggregate. Shadow ownership is earned under the qualification
-  # protocol; promotion is a later milestone and requires explicit approval.
-  responsibility:
-    name: Responsibility validation (advisory)
-    runs-on: ubuntu-latest
-    # Explicit least-privilege (parity with ci-required): this job executes
-    # PR-supplied code, so a future broadening of the workflow-level
-    # permissions block must not grant it write scope.
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-node@v4
         with:
-          go-version: "1.26"
-          cache: true
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Audit dependencies
+        run: npm audit --audit-level=low
 
-      # Self-tests first: a broken checker must be visible before the live
-      # validation below can produce a false green.
-      - name: Checker self-tests
-        run: |
-          bash scripts/ci/check-format.sh --self-test
-          bash scripts/ci/check-modules.sh --self-test
-          bash scripts/ci/run-go-tests.sh --self-test
-
-      - name: Responsibility tool suites
-        run: go test ./tools/civalidate ./tools/testsummary -count=1
-
-      - name: Live fail-closed manifest validation
-        run: |
-          go run ./tools/civalidate \
-            --standards ci/standards.yaml \
-            --packages ci/package-ownership.yaml \
-            --platforms ci/platform-contracts.yaml \
-            --workflow .github/workflows/ci.yml \
-            --makefile Makefile
-
-  # The ONE stable required result: `CI required` is the unique displayed
-  # check-run context this repo protects (R5-R6). Every non-advisory job is
-  # a dependency; vuln stays advisory (continue-on-error) and is deliberately
-  # excluded. `if: always()` + explicit result inspection means this job runs
-  # even when a dependency fails and turns red unless EVERY listed result is
-  # `success` — the aggregate behavior a required status check needs. No
-  # checkout, no permissions: this job only reads `needs`. Explicit empty
-  # job-level permissions drop the workflow-level `contents: read` here, so
-  # the aggregate gate stays least-privilege even if a future workflow edit
-  # broadens the top-level permissions block.
-  ci-required:
-    name: CI required
-    needs: [build, parity, go-test, fuzz-short, skill-drift, postgres, minio, lint, frontend, translations]
-    if: always()
+  release-hygiene:
     runs-on: ubuntu-latest
-    permissions: {}
     steps:
-      - name: All required jobs succeeded
-        run: |
-          if [ "${{ needs.build.result }}" != "success" ] || \
-             [ "${{ needs.parity.result }}" != "success" ] || \
-             [ "${{ needs.go-test.result }}" != "success" ] || \
-             [ "${{ needs.fuzz-short.result }}" != "success" ] || \
-             [ "${{ needs.skill-drift.result }}" != "success" ] || \
-             [ "${{ needs.postgres.result }}" != "success" ] || \
-             [ "${{ needs.minio.result }}" != "success" ] || \
-             [ "${{ needs.lint.result }}" != "success" ] || \
-             [ "${{ needs.frontend.result }}" != "success" ] || \
-             [ "${{ needs.translations.result }}" != "success" ]; then
-            echo "CI required: one or more dependencies did not succeed"
-            exit 1
-          fi
-          echo "CI required: all dependencies succeeded"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Scan tracked files
+        run: node scripts/release-hygiene.mjs
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend, release-hygiene]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose
+        run: docker compose --env-file .env.example -f deploy/docker-compose.yml config -q
+      - name: Build application image
+        run: docker build -f deploy/Dockerfile -t enterprise-knowledge-base:ci .

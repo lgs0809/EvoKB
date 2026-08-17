@@ -1,45 +1,50 @@
-# Claude
-.claude/
-.opencode/
-CLAUDE.md
-AGENTS.md
-.mcp.json
-opencode.json
-# Sage
-.sage/
-.sage-memory/
-.sage-wiki/
-sage/
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.yml
+*.local.yaml
+*.local.properties
 
-# macOS
-.DS_Store
+# Java / Maven
+**/target/
+*.jar
+*.class
 
-# Build
-/sage-wiki
-/civalidate
-/ciobserve
-/testsummary
-bin/
+# Node / Vite
+**/node_modules/
+web/dist/
+*.tsbuildinfo
 
-# memory-benchmark working data (datasets, projects, checkpoints)
-eval/benchmarks/runs/
-
-# Python bytecode
+# Test / tooling output
+coverage/
+reports/
+web/test-results/
+web/playwright-report/
+web/blob-report/
+*.log
+.pytest_cache/
 __pycache__/
 *.pyc
 
-# Client/example build artifacts (P4-3/P4-4/P4-6)
-node_modules/
-.venv/
-dist/
-dist-test/
-*.egg-info/
+# Runtime data
+*.db
+*.sqlite
+*.sqlite3
+.tmp/
+tmp/
 
-# Local deployment secrets
-/.env
-/.env.local
-deploy/.env
-deploy/.env.local
-.pytest_cache/
-examples/langgraph/__pycache__/
-skillgen
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local assistant/tool metadata
+.ai-bridge/
+.claude/
+.opencode/
+.mcp.json
+AGENTS.md
+CLAUDE.md
