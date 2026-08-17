@@ -1,5 +1,6 @@
 .git
 .github
+.ai-bridge
 .sage
 .sage-memory
 *.db
@@ -7,6 +8,28 @@
 !go.md
 docs
 sage
+
+# Local dependency caches and generated artifacts
 web/node_modules
+internal/web/dist
+java/**/target
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Local IDE/build metadata
+.idea
+.vscode
+**/.idea
+**/.vscode
+**/*.iml
+**/.DS_Store
+**/Thumbs.db
+
+# Local runtime outputs that are never build inputs
+*.log
+coverage
+reports
 Dockerfile
 .dockerignore
