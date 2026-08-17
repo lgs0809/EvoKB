@@ -3,7 +3,6 @@ name: enterprise-knowledge-base
 services:
   mysql:
     image: mysql:8.4
-    container_name: ekb-mysql
     restart: unless-stopped
     environment:
       MYSQL_DATABASE: ${EKB_MYSQL_DATABASE:-enterprise_kb}
@@ -11,7 +10,7 @@ services:
       MYSQL_PASSWORD: ${EKB_MYSQL_PASSWORD}
       MYSQL_ROOT_PASSWORD: ${EKB_MYSQL_ROOT_PASSWORD}
     ports:
-      - "127.0.0.1:${EKB_MYSQL_PORT:-23316}:3306"
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_MYSQL_PORT:-23316}:3306"
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_0900_ai_ci
@@ -28,15 +27,14 @@ services:
 
   minio:
     image: pgsty/minio:RELEASE.2026-03-25T00-00-00Z
-    container_name: ekb-minio
     restart: unless-stopped
     environment:
       MINIO_ROOT_USER: ${EKB_MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${EKB_MINIO_ROOT_PASSWORD}
     command: server /data --console-address ":9001"
     ports:
-      - "127.0.0.1:${EKB_MINIO_PORT:-19000}:9000"
-      - "127.0.0.1:${EKB_MINIO_CONSOLE_PORT:-19001}:9001"
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_MINIO_PORT:-19000}:9000"
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_MINIO_CONSOLE_PORT:-19001}:9001"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -47,13 +45,12 @@ services:
 
   opensearch:
     image: opensearchproject/opensearch:2.19.3
-    container_name: ekb-opensearch
     restart: unless-stopped
     environment:
       discovery.type: single-node
       plugins.security.disabled: "true"
       bootstrap.memory_lock: "true"
-      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      OPENSEARCH_JAVA_OPTS: ${EKB_OPENSEARCH_JAVA_OPTS:--Xms512m -Xmx512m}
       DISABLE_INSTALL_DEMO_CONFIG: "true"
     ulimits:
       memlock:
@@ -63,7 +60,7 @@ services:
         soft: 65536
         hard: 65536
     ports:
-      - "127.0.0.1:${EKB_OPENSEARCH_PORT:-19200}:9200"
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_OPENSEARCH_PORT:-19200}:9200"
     volumes:
       - opensearch-data:/usr/share/opensearch/data
     healthcheck:
@@ -73,109 +70,17 @@ services:
       retries: 60
       start_period: 30s
 
-  models:
-    build:
-      context: ./models
-    image: enterprise-knowledge-base:models-cpu
-    container_name: ekb-models
-    restart: unless-stopped
-    environment:
-      EMBED_MODEL: Qwen/Qwen3-Embedding-0.6B
-      RERANK_MODEL: Qwen/Qwen3-Reranker-0.6B
-      MODEL_MEMORY_MODE: dual
-      MODEL_DEVICE: cpu
-      MODEL_DTYPE: bfloat16
-      RERANK_MODEL_DTYPE: float32
-      HF_HOME: /models
-      TOKENIZERS_PARALLELISM: "false"
-      OMP_NUM_THREADS: "6"
-    ports:
-      - "127.0.0.1:${EKB_MODELS_PORT:-18081}:8000"
-    volumes:
-      - models-data:/models
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 15s
-
-  knowledge-server:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-    image: enterprise-knowledge-base:server
-    container_name: ekb-knowledge-server
-    restart: unless-stopped
-    environment:
-      EKB_MYSQL_DSN: ${EKB_MYSQL_USER:-ekb}:${EKB_MYSQL_PASSWORD}@tcp(mysql:3306)/${EKB_MYSQL_DATABASE:-enterprise_kb}?parseTime=true
-      EKB_MINIO_ENDPOINT: minio:9000
-      EKB_MINIO_PUBLIC_ENDPOINT: ${EKB_MINIO_PUBLIC_ENDPOINT:-127.0.0.1:19000}
-      EKB_MINIO_ACCESS_KEY: ${EKB_MINIO_ROOT_USER}
-      EKB_MINIO_SECRET_KEY: ${EKB_MINIO_ROOT_PASSWORD}
-      EKB_MINIO_BUCKET: ${EKB_MINIO_BUCKET:-enterprise-kb}
-      EKB_OPENSEARCH_URL: http://opensearch:9200
-      EKB_RAW_INDEX: ${EKB_RAW_INDEX:-ekb_raw_v1}
-      EKB_DERIVED_INDEX: ${EKB_DERIVED_INDEX:-ekb_derived_v1}
-      EKB_MODELS_URL: http://models:8000
-      EKB_EMBED_DIMS: ${EKB_EMBED_DIMS:-1024}
-      EKB_MINERU_URL: ${EKB_MINERU_URL:-http://host.docker.internal:8000}
-      EKB_ASK_PROVIDER: ${EKB_ASK_PROVIDER:-openai}
-      EKB_ASK_BASE_URL: ${EKB_ASK_BASE_URL:-}
-      EKB_ASK_API_KEY: ${EKB_ASK_API_KEY:-}
-      EKB_ASK_MODEL: ${EKB_ASK_MODEL:-}
-      EKB_ASK_REASONING_EFFORT: ${EKB_ASK_REASONING_EFFORT:-}
-      EKB_ASK_MAX_TOKENS: ${EKB_ASK_MAX_TOKENS:-1200}
-      EKB_NEO4J_URL: http://neo4j:7474
-      EKB_NEO4J_AUTH: ${EKB_NEO4J_AUTH}
-      EKB_SERVER_ADDR: 0.0.0.0:18080
-      EKB_WEB_DIR: /app/internal/web/dist
-      EKB_SERVER_TOKEN: ${EKB_SERVER_TOKEN:-}
-      EKB_SESSION_TTL_HOURS: ${EKB_SESSION_TTL_HOURS:-12}
-      EKB_SESSION_COOKIE_SECURE: ${EKB_SESSION_COOKIE_SECURE:-false}
-      EKB_TRUST_PROXY_HEADERS: ${EKB_TRUST_PROXY_HEADERS:-false}
-      EKB_MAX_UPLOAD_MIB: ${EKB_MAX_UPLOAD_MIB:-512}
-      EKB_MAX_BATCH_UPLOAD_MIB: ${EKB_MAX_BATCH_UPLOAD_MIB:-4096}
-      EKB_MAX_BATCH_EXPANDED_MIB: ${EKB_MAX_BATCH_EXPANDED_MIB:-16384}
-      EKB_MAX_BATCH_FILES: ${EKB_MAX_BATCH_FILES:-2000}
-      EKB_STAGING_ROOT: /var/lib/enterprise-kb/staging
-      EKB_RERANK_MAX_CHARS: ${EKB_RERANK_MAX_CHARS:-400}
-      EKB_RERANK_MAX_CANDIDATES: ${EKB_RERANK_MAX_CANDIDATES:-20}
-      EKB_DISTILL_EFFECTIVE_HIT_THRESHOLD: ${EKB_DISTILL_EFFECTIVE_HIT_THRESHOLD:-3}
-    ports:
-      - "127.0.0.1:${EKB_SERVER_PORT:-18080}:18080"
-    volumes:
-      - server-staging:/var/lib/enterprise-kb/staging
-    depends_on:
-      mysql:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-      opensearch:
-        condition: service_healthy
-      models:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:18080/health >/dev/null || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 20s
-
   neo4j:
     image: neo4j:5.26.12-community
-    container_name: ekb-neo4j
     restart: unless-stopped
     environment:
       NEO4J_AUTH: ${EKB_NEO4J_AUTH}
-      NEO4J_server_memory_heap_initial__size: 256m
-      NEO4J_server_memory_heap_max__size: 512m
-      NEO4J_server_memory_pagecache_size: 256m
+      NEO4J_server_memory_heap_initial__size: ${EKB_NEO4J_HEAP_INITIAL:-256m}
+      NEO4J_server_memory_heap_max__size: ${EKB_NEO4J_HEAP_MAX:-512m}
+      NEO4J_server_memory_pagecache_size: ${EKB_NEO4J_PAGECACHE:-256m}
     ports:
-      - "127.0.0.1:${EKB_NEO4J_HTTP_PORT:-17474}:7474"
-      - "127.0.0.1:${EKB_NEO4J_BOLT_PORT:-17687}:7687"
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_NEO4J_HTTP_PORT:-17474}:7474"
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_NEO4J_BOLT_PORT:-17687}:7687"
     volumes:
       - neo4j-data:/data
     healthcheck:
@@ -185,10 +90,80 @@ services:
       retries: 60
       start_period: 30s
 
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.java
+    image: enterprise-knowledge-base:latest
+    restart: unless-stopped
+    environment:
+      EKB_JDBC_URL: jdbc:mysql://mysql:3306/${EKB_MYSQL_DATABASE:-enterprise_kb}?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
+      EKB_MYSQL_USER: ${EKB_MYSQL_USER:-ekb}
+      EKB_MYSQL_PASSWORD: ${EKB_MYSQL_PASSWORD}
+      EKB_MINIO_ENDPOINT: http://minio:9000
+      EKB_MINIO_PUBLIC_ENDPOINT: ${EKB_MINIO_PUBLIC_ENDPOINT:-http://127.0.0.1:19000}
+      EKB_MINIO_REGION: ${EKB_MINIO_REGION:-us-east-1}
+      EKB_MINIO_ACCESS_KEY: ${EKB_MINIO_ROOT_USER}
+      EKB_MINIO_SECRET_KEY: ${EKB_MINIO_ROOT_PASSWORD}
+      EKB_MINIO_BUCKET: ${EKB_MINIO_BUCKET:-enterprise-kb}
+      EKB_OPENSEARCH_URL: http://opensearch:9200
+      EKB_RAW_INDEX: ${EKB_RAW_INDEX:-ekb_raw_v1}
+      EKB_DERIVED_INDEX: ${EKB_DERIVED_INDEX:-ekb_derived_v1}
+      EKB_NEO4J_URL: http://neo4j:7474
+      EKB_NEO4J_AUTH: ${EKB_NEO4J_AUTH}
+      EKB_NEO4J_DATABASE: ${EKB_NEO4J_DATABASE:-neo4j}
+      EKB_MINERU_URL: ${EKB_MINERU_URL}
+      EKB_MINERU_PARSE_METHOD: ${EKB_MINERU_PARSE_METHOD:-auto}
+      EKB_MINERU_LANGUAGE: ${EKB_MINERU_LANGUAGE:-ch}
+      EKB_CHAT_BASE_URL: ${EKB_CHAT_BASE_URL}
+      EKB_CHAT_API_KEY: ${EKB_CHAT_API_KEY:-}
+      EKB_SMALL_MODEL: ${EKB_SMALL_MODEL}
+      EKB_LARGE_MODEL: ${EKB_LARGE_MODEL}
+      EKB_EMBEDDING_BASE_URL: ${EKB_EMBEDDING_BASE_URL}
+      EKB_EMBEDDING_API_KEY: ${EKB_EMBEDDING_API_KEY:-}
+      EKB_EMBEDDING_MODEL: ${EKB_EMBEDDING_MODEL}
+      EKB_EMBED_DIMS: ${EKB_EMBED_DIMS:-1024}
+      EKB_EMBED_TIMEOUT_SECONDS: ${EKB_EMBED_TIMEOUT_SECONDS:-120}
+      EKB_RERANK_BASE_URL: ${EKB_RERANK_BASE_URL}
+      EKB_RERANK_API_KEY: ${EKB_RERANK_API_KEY:-}
+      EKB_RERANK_MODEL: ${EKB_RERANK_MODEL}
+      EKB_RERANK_TIMEOUT_SECONDS: ${EKB_RERANK_TIMEOUT_SECONDS:-30}
+      EKB_RERANK_MAX_CHARS: ${EKB_RERANK_MAX_CHARS:-400}
+      EKB_RERANK_MAX_CANDIDATES: ${EKB_RERANK_MAX_CANDIDATES:-20}
+      EKB_SERVER_PORT: 18080
+      EKB_WEB_DIR: /app/web
+      EKB_SESSION_TTL_HOURS: ${EKB_SESSION_TTL_HOURS:-12}
+      EKB_SESSION_COOKIE_SECURE: ${EKB_SESSION_COOKIE_SECURE:-false}
+      EKB_TRUST_PROXY_HEADERS: ${EKB_TRUST_PROXY_HEADERS:-false}
+      EKB_MAX_UPLOAD_BYTES: ${EKB_MAX_UPLOAD_BYTES:-536870912}
+      EKB_MAX_BATCH_UPLOAD_MIB: ${EKB_MAX_BATCH_UPLOAD_MIB:-4096}
+      EKB_MAX_BATCH_EXPANDED_MIB: ${EKB_MAX_BATCH_EXPANDED_MIB:-16384}
+      EKB_MAX_BATCH_FILES: ${EKB_MAX_BATCH_FILES:-2000}
+      EKB_STAGING_ROOT: /var/lib/enterprise-kb/staging
+      EKB_DISTILL_EFFECTIVE_HIT_THRESHOLD: ${EKB_DISTILL_EFFECTIVE_HIT_THRESHOLD:-3}
+    ports:
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_SERVER_PORT:-18080}:18080"
+    volumes:
+      - server-staging:/var/lib/enterprise-kb/staging
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/18080'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
 volumes:
   mysql-data:
   minio-data:
   opensearch-data:
-  models-data:
   neo4j-data:
   server-staging:

@@ -83,7 +83,7 @@ public class EnterpriseConfiguration {
 
     @Bean
     MinerUPipelineAdapter minerUParser(ObjectMapper mapper, Environment env) {
-        return new MinerUPipelineAdapter(value(env,"EKB_MINERU_URL","http://127.0.0.1:8000"), mapper,
+        return new MinerUPipelineAdapter(required(env,"EKB_MINERU_URL"), mapper,
                 Duration.ofMillis(integer(env,"EKB_MINERU_POLL_MS",500)), value(env,"EKB_MINERU_PARSE_METHOD","auto"),
                 value(env,"EKB_MINERU_LANGUAGE","ch"));
     }
@@ -101,10 +101,11 @@ public class EnterpriseConfiguration {
 
     @Bean
     OpenAiCompatibleModelServingAdapter modelServing(Environment env) {
-        return new OpenAiCompatibleModelServingAdapter(value(env,"EKB_MODELS_URL","http://127.0.0.1:18081"),
-                value(env,"EKB_MODELS_API_KEY",""), value(env,"EKB_EMBED_MODEL","Qwen/Qwen3-Embedding-0.6B"),
-                value(env,"EKB_RERANK_MODEL","Qwen/Qwen3-Reranker-0.6B"), integer(env,"EKB_EMBED_DIMS",1024),
-                integer(env,"EKB_EMBED_BATCH_SIZE",16), Duration.ofSeconds(integer(env,"EKB_EMBED_TIMEOUT_SECONDS",120)),
+        return new OpenAiCompatibleModelServingAdapter(
+                required(env,"EKB_EMBEDDING_BASE_URL"), value(env,"EKB_EMBEDDING_API_KEY",""), required(env,"EKB_EMBEDDING_MODEL"),
+                required(env,"EKB_RERANK_BASE_URL"), value(env,"EKB_RERANK_API_KEY",""), required(env,"EKB_RERANK_MODEL"),
+                integer(env,"EKB_EMBED_DIMS",1024), integer(env,"EKB_EMBED_BATCH_SIZE",16),
+                Duration.ofSeconds(integer(env,"EKB_EMBED_TIMEOUT_SECONDS",120)),
                 Duration.ofSeconds(integer(env,"EKB_RERANK_TIMEOUT_SECONDS",30)));
     }
 
@@ -141,16 +142,18 @@ public class EnterpriseConfiguration {
 
     @Bean
     Neo4jGraphStoreAdapter graphStore(JdbcTemplate jdbc,ObjectMapper mapper,Environment env) {
-        String[] auth = value(env,"EKB_NEO4J_AUTH","neo4j/password").split("/",2);
-        return new Neo4jGraphStoreAdapter(value(env,"EKB_NEO4J_URL","http://127.0.0.1:17474"),auth[0],auth.length>1?auth[1]:"",
+        String[] auth = required(env,"EKB_NEO4J_AUTH").split("/",2);
+        if (auth.length != 2 || auth[0].isBlank() || auth[1].isBlank()) {
+            throw new IllegalStateException("EKB_NEO4J_AUTH must use username/password format");
+        }
+        return new Neo4jGraphStoreAdapter(value(env,"EKB_NEO4J_URL","http://127.0.0.1:17474"),auth[0],auth[1],
                 value(env,"EKB_NEO4J_DATABASE","neo4j"),mapper,jdbc);
     }
 
     @Bean
     SpringAiAlibabaKnowledgeModel knowledgeModel(ChatClient.Builder builder, Environment env) {
         return new SpringAiAlibabaKnowledgeModel(builder,
-                firstValue(env,"gpt-5.4-mini","EKB_SMALL_MODEL","EKB_LLM_JUDGE_MODEL"),
-                firstValue(env,"gpt-5.6-luna","EKB_LARGE_MODEL","EKB_LLM_MODEL"));
+                required(env,"EKB_SMALL_MODEL"), required(env,"EKB_LARGE_MODEL"));
     }
 
     @Bean
@@ -295,7 +298,6 @@ public class EnterpriseConfiguration {
 
     private static String required(Environment env,String name){String v=env.getProperty(name);if(v==null||v.isBlank())throw new IllegalStateException(name+" is required");return v.trim();}
     private static String value(Environment env,String name,String fallback){String v=env.getProperty(name);return v==null||v.isBlank()?fallback:v.trim();}
-    private static String firstValue(Environment env,String fallback,String... names){for(String name:names){String v=env.getProperty(name);if(v!=null&&!v.isBlank())return v.trim();}return fallback;}
     private static int integer(Environment env,String name,int fallback){try{return Integer.parseInt(value(env,name,Integer.toString(fallback)));}catch(Exception e){return fallback;}}
     private static long mib(Environment env,String name,long fallbackMiB){String v=value(env,name,Long.toString(fallbackMiB));try{return Math.multiplyExact(Long.parseLong(v),1024L*1024L);}catch(Exception e){return fallbackMiB*1024L*1024L;}}
 }

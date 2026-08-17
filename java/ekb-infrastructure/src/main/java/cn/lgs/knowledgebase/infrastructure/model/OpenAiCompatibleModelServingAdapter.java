@@ -21,18 +21,21 @@ public final class OpenAiCompatibleModelServingAdapter implements EmbeddingPort,
     private final int dimensions;
     private final int batchSize;
 
-    public OpenAiCompatibleModelServingAdapter(String baseUrl, String apiKey, String embeddingModel,
-                                               String rerankModel, int dimensions, int batchSize) {
-        this(baseUrl, apiKey, embeddingModel, rerankModel, dimensions, batchSize,
-                Duration.ofSeconds(120), Duration.ofSeconds(30));
+    public OpenAiCompatibleModelServingAdapter(String embeddingBaseUrl, String embeddingApiKey, String embeddingModel,
+                                               String rerankBaseUrl, String rerankApiKey, String rerankModel,
+                                               int dimensions, int batchSize) {
+        this(embeddingBaseUrl, embeddingApiKey, embeddingModel, rerankBaseUrl, rerankApiKey, rerankModel,
+                dimensions, batchSize, Duration.ofSeconds(120), Duration.ofSeconds(30));
     }
 
-    public OpenAiCompatibleModelServingAdapter(String baseUrl, String apiKey, String embeddingModel,
-                                               String rerankModel, int dimensions, int batchSize,
+    public OpenAiCompatibleModelServingAdapter(String embeddingBaseUrl, String embeddingApiKey, String embeddingModel,
+                                               String rerankBaseUrl, String rerankApiKey, String rerankModel,
+                                               int dimensions, int batchSize,
                                                Duration embeddingTimeout, Duration rerankTimeout) {
-        String normalizedBaseUrl = trimSlash(baseUrl);
-        this.embeddingClient = client(normalizedBaseUrl, apiKey, positive(embeddingTimeout, Duration.ofSeconds(120)));
-        this.rerankClient = client(normalizedBaseUrl, apiKey, positive(rerankTimeout, Duration.ofSeconds(30)));
+        this.embeddingClient = client(trimSlash(embeddingBaseUrl), embeddingApiKey,
+                positive(embeddingTimeout, Duration.ofSeconds(120)));
+        this.rerankClient = client(trimSlash(rerankBaseUrl), rerankApiKey,
+                positive(rerankTimeout, Duration.ofSeconds(30)));
         this.embeddingModel = requireText(embeddingModel, "embedding model");
         this.rerankModel = requireText(rerankModel, "rerank model");
         if (dimensions <= 0) throw new IllegalArgumentException("embedding dimensions must be positive");

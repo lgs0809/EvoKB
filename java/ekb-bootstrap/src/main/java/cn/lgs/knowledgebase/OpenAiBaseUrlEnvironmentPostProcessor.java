@@ -9,19 +9,16 @@ import org.springframework.core.env.MapPropertySource;
 import java.util.Map;
 
 /**
- * Keeps the Java runtime compatible with the existing Go-era EKB_LLM_BASE_URL convention.
- * Spring AI appends /v1/chat/completions to its OpenAI base URL, while many OpenAI-compatible
- * endpoints are commonly configured by users with a trailing /v1. Normalize only that final
- * version segment so either convention works without duplicating /v1.
+ * Normalizes OpenAI-compatible chat endpoints. Spring AI appends /v1/chat/completions,
+ * while many providers publish their base URL with a trailing /v1.
  */
 public final class OpenAiBaseUrlEnvironmentPostProcessor implements EnvironmentPostProcessor, Ordered {
     static final String PROPERTY_SOURCE = "ekb-openai-base-url-compatibility";
 
     @Override
     public void postProcessEnvironment(ConfigurableEnvironment environment, SpringApplication application) {
-        String configured = firstNonBlank(environment.getProperty("EKB_ASK_BASE_URL"),
-                environment.getProperty("EKB_LLM_BASE_URL"));
-        if (configured == null) return;
+        String configured = environment.getProperty("EKB_CHAT_BASE_URL");
+        if (configured == null || configured.isBlank()) return;
         environment.getPropertySources().addFirst(new MapPropertySource(PROPERTY_SOURCE,
                 Map.of("spring.ai.openai.base-url", normalize(configured))));
     }
@@ -35,11 +32,6 @@ public final class OpenAiBaseUrlEnvironmentPostProcessor implements EnvironmentP
         return normalized;
     }
 
-    private static String firstNonBlank(String first, String second) {
-        if (first != null && !first.isBlank()) return first;
-        if (second != null && !second.isBlank()) return second;
-        return null;
-    }
 
     @Override
     public int getOrder() {
