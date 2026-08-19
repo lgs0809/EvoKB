@@ -105,6 +105,21 @@ public final class JdbcIngestionRepository implements UploadRepository {
     }
 
     @Override
+    public long countBatches(String actorId, boolean admin, String status, String query) {
+        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM ingestion_batch b WHERE 1=1");
+        List<Object> args = new ArrayList<>();
+        if (!admin) { sql.append(" AND b.created_by=?"); args.add(actorId); }
+        if (status != null && !status.isBlank() && !status.equalsIgnoreCase("ALL")) { sql.append(" AND b.status=?"); args.add(status.trim().toUpperCase()); }
+        if (query != null && !query.isBlank()) {
+            sql.append(" AND (b.created_by_username LIKE ? OR EXISTS (SELECT 1 FROM ingestion_file fx WHERE fx.batch_id=b.batch_id AND (fx.logical_name LIKE ? OR fx.original_filename LIKE ? OR fx.relative_path LIKE ?)))");
+            String like = "%" + query.trim() + "%";
+            Collections.addAll(args, like, like, like, like);
+        }
+        Long count = jdbc.queryForObject(sql.toString(), Long.class, args.toArray());
+        return count == null ? 0 : count;
+    }
+
+    @Override
     public void queueBatch(String batchId, Instant now) {
         transactions.executeWithoutResult(status -> {
             String current = jdbc.queryForObject("SELECT status FROM ingestion_batch WHERE batch_id=? FOR UPDATE", String.class, batchId);

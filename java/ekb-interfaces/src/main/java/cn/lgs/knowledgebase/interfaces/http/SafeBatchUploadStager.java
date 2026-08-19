@@ -58,6 +58,7 @@ public final class SafeBatchUploadStager {
 
         Counters counters = new Counters();
         List<StagedDraft> drafts = new ArrayList<>();
+        List<String> rejected = new ArrayList<>();
         try {
             for (int i = 0; i < uploads.size(); i++) {
                 MultipartFile upload = uploads.get(i);
@@ -67,7 +68,7 @@ public final class SafeBatchUploadStager {
                 String relative = normalizeRelative(suppliedRelative, original);
                 if (extension(original).equals(".zip")) {
                     try (InputStream input = new BufferedInputStream(upload.getInputStream())) {
-                        expandZip(input, relative, batchDir, defaults, drafts, counters);
+                        expandZip(input, relative, batchDir, defaults, drafts, rejected, counters);
                     }
                 } else if (SUPPORTED.contains(extension(original))) {
                     counters.addFile(upload.getSize());
@@ -77,10 +78,12 @@ public final class SafeBatchUploadStager {
                         copyBounded(input, destination, counters, true);
                     }
                     drafts.add(draft(relative, original, destination, defaults));
+                } else {
+                    rejected.add(relative);
                 }
             }
             if (drafts.isEmpty()) throw new UploadRejected("batch contains no supported files");
-            return new StageResult(uploads.size(), List.copyOf(drafts), batchDir);
+            return new StageResult(uploads.size(), List.copyOf(drafts), List.copyOf(rejected), batchDir);
         } catch (RuntimeException | IOException e) {
             deleteTree(batchDir);
             if (e instanceof RuntimeException runtime) throw runtime;
@@ -97,7 +100,7 @@ public final class SafeBatchUploadStager {
     }
 
     private void expandZip(InputStream input, String zipRelativePath, Path batchDir, Defaults defaults,
-                           List<StagedDraft> drafts, Counters counters) throws IOException {
+                           List<StagedDraft> drafts, List<String> rejected, Counters counters) throws IOException {
         String parent = parent(zipRelativePath);
         try (ZipInputStream zip = new ZipInputStream(input)) {
             ZipEntry entry;
@@ -106,7 +109,7 @@ public final class SafeBatchUploadStager {
                 if (entryName.isBlank() || entry.isDirectory()) { zip.closeEntry(); continue; }
                 String relative = normalizeRelative(parent.isEmpty() ? entryName : parent + "/" + entryName, entryName);
                 String ext = extension(relative);
-                if (!SUPPORTED.contains(ext)) { zip.closeEntry(); continue; }
+                if (!SUPPORTED.contains(ext)) { rejected.add(relative); zip.closeEntry(); continue; }
                 counters.addFile(Math.max(0, entry.getSize()));
                 Path destination = destination(batchDir, relative);
                 Files.createDirectories(destination.getParent());
@@ -225,6 +228,11 @@ public final class SafeBatchUploadStager {
         public Defaults { manualTags = manualTags == null ? List.of() : List.copyOf(manualTags); }
         static Defaults empty() { return new Defaults(null, null, null, null, null, List.of()); }
     }
-    public record StageResult(int sourceCount, List<StagedDraft> drafts, Path batchDirectory) {}
+    public record StageResult(int sourceCount, List<StagedDraft> drafts, List<String> rejected, Path batchDirectory) {
+        public StageResult {
+            drafts = drafts == null ? List.of() : List.copyOf(drafts);
+            rejected = rejected == null ? List.of() : List.copyOf(rejected);
+        }
+    }
     public static final class UploadRejected extends RuntimeException { public UploadRejected(String message) { super(message); } }
 }
