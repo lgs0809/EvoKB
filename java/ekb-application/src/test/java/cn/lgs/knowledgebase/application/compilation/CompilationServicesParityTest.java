@@ -2,6 +2,7 @@ package cn.lgs.knowledgebase.application.compilation;
 
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.CompilationRepository;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.DocumentUnit;
+import cn.lgs.knowledgebase.application.compilation.CompilationContracts.EntityResolution;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryRecord;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.VersionSource;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.WikiRecord;
@@ -45,6 +46,10 @@ class CompilationServicesParityTest {
         assertEquals(1, graph.relations().size());
         assertEquals(List.of("ev1"), graph.relations().get(0).evidenceIds());
         assertEquals(1, f.graphStore.relations.size());
+        assertFalse(f.repository.resolutions.isEmpty());
+        assertTrue(f.repository.resolutions.stream().allMatch(r -> "v1".equals(r.versionId())));
+        assertTrue(f.repository.resolutions.stream().allMatch(r -> "ev1".equals(r.evidenceId())));
+        assertTrue(f.repository.resolutions.stream().allMatch(r -> r.canonicalEntityId() != null && !r.canonicalEntityId().isBlank()));
 
         var wiki = f.wiki.compile(new WikiCompilationService.CompileRequest("COMPANY", "甲公司", graph.entities().get(0).canonicalId(), List.of(summary.id())));
         assertTrue(wiki.coverage().pass());
@@ -148,6 +153,7 @@ class CompilationServicesParityTest {
         final Map<String, Entity> entities = new LinkedHashMap<>();
         List<DocumentUnit> units = List.of();
         List<Relation> relations = List.of();
+        List<EntityResolution> resolutions = List.of();
 
         @Override public VersionSource loadVersionSource(String versionId) { return source; }
         @Override public void replaceDocumentUnits(String versionId, List<DocumentUnit> units) { this.units = List.copyOf(units); }
@@ -159,7 +165,10 @@ class CompilationServicesParityTest {
             return entities.computeIfAbsent(key, ignored -> new Entity(GraphCompilationService.stableId("entity", entityType, GraphCompilationService.canonicalKey(name)),
                     name, entityType, GraphCompilationService.canonicalKey(name), List.of(), Map.of()));
         }
-        @Override public void saveGraph(String summaryId, List<Entity> entities, List<Relation> relations) { this.relations = List.copyOf(relations); }
+        @Override public void saveGraph(String summaryId, List<Entity> entities, List<Relation> relations, List<EntityResolution> resolutions) {
+            this.relations = List.copyOf(relations);
+            this.resolutions = List.copyOf(resolutions);
+        }
         @Override public long nextWikiVersion(String wikiId) { return wikis.containsKey(wikiId) ? wikis.get(wikiId).version() + 1 : 1; }
         @Override public void saveWiki(WikiRecord wiki) { wikis.put(wiki.id(), wiki); }
         @Override public Ports.DerivedContext derivedContextForSummaries(List<String> summaryIds) {

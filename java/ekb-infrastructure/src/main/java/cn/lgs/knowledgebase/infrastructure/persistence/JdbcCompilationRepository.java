@@ -2,6 +2,7 @@ package cn.lgs.knowledgebase.infrastructure.persistence;
 
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.CompilationRepository;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.DocumentUnit;
+import cn.lgs.knowledgebase.application.compilation.CompilationContracts.EntityResolution;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryFact;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryRecord;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.VersionSource;
@@ -174,12 +175,20 @@ public final class JdbcCompilationRepository implements CompilationRepository {
     }
 
     @Override
-    public void saveGraph(String summaryId, List<Entity> entities, List<Relation> relations) {
+    public void saveGraph(String summaryId, List<Entity> entities, List<Relation> relations, List<EntityResolution> resolutions) {
         transactions.executeWithoutResult(status -> {
             for (Entity entity : entities) {
                 jdbc.update("INSERT INTO canonical_entity(canonical_entity_id,canonical_name,entity_type,canonical_key,attributes_json) VALUES(?,?,?,?,?) " +
                                 "ON DUPLICATE KEY UPDATE canonical_name=VALUES(canonical_name),attributes_json=VALUES(attributes_json),updated_at=CURRENT_TIMESTAMP(6)",
                         entity.canonicalId(), entity.canonicalName(), entity.entityType(), entity.canonicalKey(), json(entity.attributes()));
+            }
+            for (EntityResolution resolution : resolutions == null ? List.<EntityResolution>of() : resolutions) {
+                jdbc.update("INSERT INTO source_entity(source_entity_id,version_id,surface_form,entity_type,evidence_id) VALUES(?,?,?,?,?) " +
+                                "ON DUPLICATE KEY UPDATE surface_form=VALUES(surface_form),entity_type=VALUES(entity_type),evidence_id=VALUES(evidence_id)",
+                        resolution.sourceEntityId(), resolution.versionId(), resolution.surfaceForm(), resolution.entityType(), resolution.evidenceId());
+                jdbc.update("INSERT INTO entity_mapping(source_entity_id,canonical_entity_id,confidence,status,decided_by) VALUES(?,?,?,'APPLIED',?) " +
+                                "ON DUPLICATE KEY UPDATE canonical_entity_id=VALUES(canonical_entity_id),confidence=VALUES(confidence),status='APPLIED',decided_by=VALUES(decided_by)",
+                        resolution.sourceEntityId(), resolution.canonicalEntityId(), resolution.confidence(), nullable(resolution.decidedBy()));
             }
             for (Relation relation : relations) {
                 jdbc.update("INSERT INTO relation_fact(relation_id,source_entity_id,relation_type,target_entity_id,valid_from,valid_to,conflict_status,lifecycle) VALUES(?,?,?,?,?,?,?,?) " +

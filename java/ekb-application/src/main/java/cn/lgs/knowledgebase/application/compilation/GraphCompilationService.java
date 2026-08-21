@@ -1,6 +1,7 @@
 package cn.lgs.knowledgebase.application.compilation;
 
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.CompilationRepository;
+import cn.lgs.knowledgebase.application.compilation.CompilationContracts.EntityResolution;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryFact;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryRecord;
 import cn.lgs.knowledgebase.application.port.Ports.GraphStore;
@@ -71,13 +72,25 @@ public final class GraphCompilationService {
         Map<String, Entity> cache = new LinkedHashMap<>();
         List<Entity> entities = new ArrayList<>();
         List<Relation> relations = new ArrayList<>();
+        Map<String, EntityResolution> resolutions = new LinkedHashMap<>();
+        String decidedBy = "graph_compiler:" + model.identity(ModelRole.LARGE);
         for (ProposedRelation proposed : validation.relations()) {
-            Entity sourceEntity = resolve(proposed.sourceName(), proposed.sourceType(), cache, entities);
-            Entity targetEntity = resolve(proposed.targetName(), proposed.targetType(), cache, entities);
+            String sourceType = normalizeType(proposed.sourceType());
+            String targetType = normalizeType(proposed.targetType());
+            String sourceSurface = trim(proposed.sourceName());
+            String targetSurface = trim(proposed.targetName());
+            Entity sourceEntity = resolve(sourceSurface, sourceType, cache, entities);
+            Entity targetEntity = resolve(targetSurface, targetType, cache, entities);
             Instant validFrom = parseOptionalTime(proposed.validFrom());
             Instant validTo = parseOptionalTime(proposed.validTo());
             LinkedHashSet<String> evidenceIds = new LinkedHashSet<>();
             for (String factId : proposed.supportingFactIds()) evidenceIds.addAll(facts.get(factId).evidenceIds());
+            for (String evidenceId : evidenceIds) {
+                addResolution(resolutions, source.versionId(), sourceSurface, sourceType, evidenceId,
+                        sourceEntity.canonicalId(), proposed.confidence(), decidedBy);
+                addResolution(resolutions, source.versionId(), targetSurface, targetType, evidenceId,
+                        targetEntity.canonicalId(), proposed.confidence(), decidedBy);
+            }
             String relationId = relationId(sourceEntity.canonicalId(), proposed.relationType(), targetEntity.canonicalId(), validFrom);
             relations.add(new Relation(relationId, sourceEntity.canonicalId(), proposed.relationType(), targetEntity.canonicalId(),
                     validFrom, validTo, ConflictStatus.NONE, RelationLifecycle.ACTIVE, List.copyOf(evidenceIds), proposed.confidence(),
@@ -86,10 +99,24 @@ public final class GraphCompilationService {
 
         entities.sort(Comparator.comparing(Entity::canonicalId));
         relations.sort(Comparator.comparing(Relation::id));
-        repository.saveGraph(source.id(), entities, relations);
+        List<EntityResolution> resolutionList = resolutions.values().stream().sorted(Comparator.comparing(EntityResolution::sourceEntityId)).toList();
+        repository.saveGraph(source.id(), entities, relations, resolutionList);
         graph.upsertEntities(entities);
         graph.upsertRelations(relations);
         return new CompileResult(source.id(), List.copyOf(entities), List.copyOf(relations), validation.coverage(), model.identity(ModelRole.LARGE));
+    }
+
+    private static void addResolution(Map<String, EntityResolution> target, String versionId, String surfaceForm,
+                                      String entityType, String evidenceId, String canonicalEntityId,
+                                      double confidence, String decidedBy) {
+        String sourceEntityId = stableId("source_entity", versionId, surfaceForm, entityType, evidenceId);
+        EntityResolution next = new EntityResolution(sourceEntityId, versionId, surfaceForm, entityType,
+                evidenceId, canonicalEntityId, confidence, decidedBy);
+        EntityResolution current = target.get(sourceEntityId);
+        if (current != null && !current.canonicalEntityId().equals(next.canonicalEntityId())) {
+            throw new IllegalStateException("entity resolution conflict for surface form " + surfaceForm + " and evidence " + evidenceId);
+        }
+        if (current == null || next.confidence() > current.confidence()) target.put(sourceEntityId, next);
     }
 
     private Entity resolve(String name, String type, Map<String, Entity> cache, List<Entity> entities) {
@@ -211,6 +238,11 @@ public final class GraphCompilationService {
         for (SummaryFact fact : facts) out.append("<fact id=\"").append(fact.id()).append("\" section=\"").append(fact.section()).append("\">\n")
                 .append(fact.factText()).append("\n</fact>\n");
         return out.toString();
+    }
+
+    public static boolean relationAllowed(String sourceType, String relationType, String targetType) {
+        RelationRule rule = RELATION_RULES.get(normalizeType(relationType));
+        return rule != null && rule.sourceTypes().contains(normalizeType(sourceType)) && rule.targetTypes().contains(normalizeType(targetType));
     }
 
     private static Map<String, RelationRule> relationRules() {

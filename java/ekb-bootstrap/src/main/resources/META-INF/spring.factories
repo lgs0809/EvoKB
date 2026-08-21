@@ -1,0 +1,1 @@
+org.springframework.boot.env.EnvironmentPostProcessor=cn.lgs.knowledgebase.OpenAiBaseUrlEnvironmentPostProcessor

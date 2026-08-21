@@ -1,6 +1,7 @@
 package cn.lgs.knowledgebase;
 
 import cn.lgs.knowledgebase.application.ask.AskApplicationService;
+import cn.lgs.knowledgebase.application.evaluation.ArtifactEvaluationApplicationService;
 import cn.lgs.knowledgebase.application.compilation.*;
 import cn.lgs.knowledgebase.application.identity.IdentityApplicationService;
 import cn.lgs.knowledgebase.application.ingestion.ManagedIngestionApplicationService;
@@ -18,13 +19,17 @@ import cn.lgs.knowledgebase.infrastructure.model.OpenAiCompatibleModelServingAda
 import cn.lgs.knowledgebase.infrastructure.model.SpringAiAlibabaKnowledgeModel;
 import cn.lgs.knowledgebase.infrastructure.parser.JacksonParsedArtifactEncoder;
 import cn.lgs.knowledgebase.infrastructure.parser.MinerUPipelineAdapter;
+import cn.lgs.knowledgebase.infrastructure.parser.RoutingParserAdapter;
+import cn.lgs.knowledgebase.infrastructure.parser.TextDocumentParserAdapter;
 import cn.lgs.knowledgebase.infrastructure.persistence.*;
+import cn.lgs.knowledgebase.infrastructure.search.CachedQueryEmbeddingPort;
 import cn.lgs.knowledgebase.infrastructure.search.HybridRetrievalLanes;
 import cn.lgs.knowledgebase.infrastructure.search.OpenSearchDerivedIndexAdapter;
 import cn.lgs.knowledgebase.infrastructure.search.OpenSearchRawIndexAdapter;
 import cn.lgs.knowledgebase.infrastructure.security.BCryptPasswordHasher;
 import cn.lgs.knowledgebase.infrastructure.storage.LocalFileSourceAdapter;
 import cn.lgs.knowledgebase.infrastructure.storage.MinioObjectStoreAdapter;
+import cn.lgs.knowledgebase.interfaces.evaluation.GoldenJsonlLoader;
 import cn.lgs.knowledgebase.interfaces.http.EnterpriseAuditInterceptor;
 import cn.lgs.knowledgebase.interfaces.http.EnterpriseSessionInterceptor;
 import cn.lgs.knowledgebase.interfaces.http.SafeBatchUploadStager;
@@ -39,6 +44,7 @@ import org.springframework.core.env.Environment;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
 import java.nio.file.Path;
@@ -68,16 +74,26 @@ public class EnterpriseConfiguration {
 
     @Bean
     MinioObjectStoreAdapter objectStore(Environment env) {
-        return new MinioObjectStoreAdapter(value(env,"EKB_MINIO_ENDPOINT","127.0.0.1:19000"),
+        String endpoint=value(env,"EKB_MINIO_ENDPOINT","127.0.0.1:19000");
+        return new MinioObjectStoreAdapter(endpoint,
+                value(env,"EKB_MINIO_PUBLIC_ENDPOINT",endpoint),
                 required(env,"EKB_MINIO_ACCESS_KEY"), required(env,"EKB_MINIO_SECRET_KEY"),
-                value(env,"EKB_MINIO_BUCKET","enterprise-kb"));
+                value(env,"EKB_MINIO_BUCKET","enterprise-kb"), value(env,"EKB_MINIO_REGION","us-east-1"));
     }
 
     @Bean
-    MinerUPipelineAdapter parser(ObjectMapper mapper, Environment env) {
+    MinerUPipelineAdapter minerUParser(ObjectMapper mapper, Environment env) {
         return new MinerUPipelineAdapter(value(env,"EKB_MINERU_URL","http://127.0.0.1:8000"), mapper,
                 Duration.ofMillis(integer(env,"EKB_MINERU_POLL_MS",500)), value(env,"EKB_MINERU_PARSE_METHOD","auto"),
                 value(env,"EKB_MINERU_LANGUAGE","ch"));
+    }
+
+    @Bean
+    TextDocumentParserAdapter textParser(ObjectMapper mapper) { return new TextDocumentParserAdapter(mapper); }
+
+    @Bean
+    RoutingParserAdapter parser(TextDocumentParserAdapter textParser, MinerUPipelineAdapter minerUParser) {
+        return new RoutingParserAdapter(textParser, minerUParser);
     }
 
     @Bean
@@ -88,7 +104,8 @@ public class EnterpriseConfiguration {
         return new OpenAiCompatibleModelServingAdapter(value(env,"EKB_MODELS_URL","http://127.0.0.1:18081"),
                 value(env,"EKB_MODELS_API_KEY",""), value(env,"EKB_EMBED_MODEL","Qwen/Qwen3-Embedding-0.6B"),
                 value(env,"EKB_RERANK_MODEL","Qwen/Qwen3-Reranker-0.6B"), integer(env,"EKB_EMBED_DIMS",1024),
-                integer(env,"EKB_EMBED_BATCH_SIZE",16));
+                integer(env,"EKB_EMBED_BATCH_SIZE",16), Duration.ofSeconds(integer(env,"EKB_EMBED_TIMEOUT_SECONDS",120)),
+                Duration.ofSeconds(integer(env,"EKB_RERANK_TIMEOUT_SECONDS",30)));
     }
 
     @Bean
@@ -112,6 +129,17 @@ public class EnterpriseConfiguration {
     JdbcEnterpriseOperations operations(JdbcTemplate jdbc,ObjectMapper mapper) { return new JdbcEnterpriseOperations(jdbc,mapper); }
 
     @Bean
+    JdbcArtifactEvaluationRepository artifactEvaluationRepository(JdbcTemplate jdbc) { return new JdbcArtifactEvaluationRepository(jdbc); }
+
+    @Bean
+    ArtifactEvaluationApplicationService artifactEvaluationApplicationService(JdbcArtifactEvaluationRepository repository) {
+        return new ArtifactEvaluationApplicationService(repository);
+    }
+
+    @Bean
+    GoldenJsonlLoader goldenJsonlLoader(ObjectMapper mapper) { return new GoldenJsonlLoader(mapper); }
+
+    @Bean
     Neo4jGraphStoreAdapter graphStore(JdbcTemplate jdbc,ObjectMapper mapper,Environment env) {
         String[] auth = value(env,"EKB_NEO4J_AUTH","neo4j/password").split("/",2);
         return new Neo4jGraphStoreAdapter(value(env,"EKB_NEO4J_URL","http://127.0.0.1:17474"),auth[0],auth.length>1?auth[1]:"",
@@ -120,7 +148,9 @@ public class EnterpriseConfiguration {
 
     @Bean
     SpringAiAlibabaKnowledgeModel knowledgeModel(ChatClient.Builder builder, Environment env) {
-        return new SpringAiAlibabaKnowledgeModel(builder,value(env,"EKB_SMALL_MODEL","gpt-5.4-mini"),value(env,"EKB_LARGE_MODEL","gpt-5.6-luna"));
+        return new SpringAiAlibabaKnowledgeModel(builder,
+                firstValue(env,"gpt-5.4-mini","EKB_SMALL_MODEL","EKB_LLM_JUDGE_MODEL"),
+                firstValue(env,"gpt-5.6-luna","EKB_LARGE_MODEL","EKB_LLM_MODEL"));
     }
 
     @Bean
@@ -140,14 +170,20 @@ public class EnterpriseConfiguration {
     }
 
     @Bean
+    CachedQueryEmbeddingPort retrievalQueryEmbedding(OpenAiCompatibleModelServingAdapter models) {
+        return new CachedQueryEmbeddingPort(models,512);
+    }
+
+    @Bean
     RetrievalApplicationService retrievalApplicationService(OpenSearchRawIndexAdapter rawIndex,
                                                             OpenSearchDerivedIndexAdapter derivedIndex,
                                                             OpenAiCompatibleModelServingAdapter models,
-                                                            Neo4jGraphStoreAdapter graph,
+                                                            CachedQueryEmbeddingPort queryEmbedding,
+                                                             Neo4jGraphStoreAdapter graph,
                                                             JdbcKnowledgeRepository knowledge,
                                                             Environment env) {
-        List<RetrievalLane> lanes=List.of(new HybridRetrievalLanes.Raw(rawIndex,models),
-                new HybridRetrievalLanes.Summary(derivedIndex,models),new HybridRetrievalLanes.Wiki(derivedIndex,models),
+        List<RetrievalLane> lanes=List.of(new HybridRetrievalLanes.Raw(rawIndex,queryEmbedding),
+                new HybridRetrievalLanes.Summary(derivedIndex,queryEmbedding),new HybridRetrievalLanes.Wiki(derivedIndex,queryEmbedding),
                 new GraphRetrievalLane(graph));
         return new RetrievalApplicationService(lanes,models,knowledge::resolveEvidence,Quotas.defaults(),
                 integer(env,"EKB_RERANK_MAX_CANDIDATES",20),integer(env,"EKB_RERANK_MAX_CHARS",400));
@@ -160,7 +196,7 @@ public class EnterpriseConfiguration {
 
     @Bean
     RawIngestionApplicationService rawIngestionApplicationService(LocalFileSourceAdapter files,ObjectStore objects,
-                                                                  JdbcKnowledgeRepository knowledge,MinerUPipelineAdapter parser,
+                                                                  JdbcKnowledgeRepository knowledge,RoutingParserAdapter parser,
                                                                   JacksonParsedArtifactEncoder encoder,OpenSearchRawIndexAdapter rawIndex,
                                                                   OpenAiCompatibleModelServingAdapter models,OpenSearchDerivedIndexAdapter derived) {
         return new RawIngestionApplicationService(files,objects,knowledge,parser,encoder,rawIndex,models,derived);
@@ -199,6 +235,16 @@ public class EnterpriseConfiguration {
     }
 
     @Bean
+    JdbcWikiKeywordProjectionRepository wikiKeywordProjectionRepository(JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper) {
+        return new JdbcWikiKeywordProjectionRepository(jdbc, tx, mapper);
+    }
+
+    @Bean
+    WikiKeywordProjectionService wikiKeywordProjection(JdbcWikiKeywordProjectionRepository repository, GraphStore graph) {
+        return new WikiKeywordProjectionService(repository, graph);
+    }
+
+    @Bean
     WikiCompilationService wikiCompilation(CompilationContracts.CompilationRepository repo,KnowledgeModel model,ObjectStore objects,
                                            OpenAiCompatibleModelServingAdapter embeddings,OpenSearchDerivedIndexAdapter derived) {
         return new WikiCompilationService(repo,model,objects,embeddings,derived);
@@ -219,12 +265,20 @@ public class EnterpriseConfiguration {
     }
 
     @Bean
-    WebMvcConfigurer enterpriseWebMvcConfigurer(EnterpriseSessionInterceptor session, EnterpriseAuditInterceptor audit) {
+    WebMvcConfigurer enterpriseWebMvcConfigurer(EnterpriseSessionInterceptor session, EnterpriseAuditInterceptor audit, Environment env) {
+        String webDir = value(env,"EKB_WEB_DIR",Path.of("internal","web","dist").toString());
+        String webLocation = Path.of(webDir).toAbsolutePath().normalize().toUri().toString();
+        if (!webLocation.endsWith("/")) webLocation += "/";
+        String finalWebLocation = webLocation;
         return new WebMvcConfigurer() {
             @Override public void addInterceptors(InterceptorRegistry registry) {
                 registry.addInterceptor(audit).addPathPatterns("/api/enterprise/**");
                 registry.addInterceptor(session).addPathPatterns("/api/enterprise/**")
                         .excludePathPatterns("/api/enterprise/auth/status","/api/enterprise/auth/setup","/api/enterprise/auth/login");
+            }
+            @Override public void addResourceHandlers(ResourceHandlerRegistry registry) {
+                registry.addResourceHandler("/index.html","/favicon.svg","/icons.svg").addResourceLocations(finalWebLocation);
+                registry.addResourceHandler("/assets/**").addResourceLocations(finalWebLocation+"assets/");
             }
         };
     }
@@ -241,6 +295,7 @@ public class EnterpriseConfiguration {
 
     private static String required(Environment env,String name){String v=env.getProperty(name);if(v==null||v.isBlank())throw new IllegalStateException(name+" is required");return v.trim();}
     private static String value(Environment env,String name,String fallback){String v=env.getProperty(name);return v==null||v.isBlank()?fallback:v.trim();}
+    private static String firstValue(Environment env,String fallback,String... names){for(String name:names){String v=env.getProperty(name);if(v!=null&&!v.isBlank())return v.trim();}return fallback;}
     private static int integer(Environment env,String name,int fallback){try{return Integer.parseInt(value(env,name,Integer.toString(fallback)));}catch(Exception e){return fallback;}}
     private static long mib(Environment env,String name,long fallbackMiB){String v=value(env,name,Long.toString(fallbackMiB));try{return Math.multiplyExact(Long.parseLong(v),1024L*1024L);}catch(Exception e){return fallbackMiB*1024L*1024L;}}
 }

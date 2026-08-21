@@ -134,8 +134,8 @@ public final class KnowledgeDomain {
             location.put("block_no", block.blockNo());
             location.put("block_type", block.blockType());
             location.put("heading_path", block.headingPath());
-            location.put("page_start", block.pageStart());
-            location.put("page_end", block.pageEnd());
+            if (block.pageStart() != null) location.put("page_start", block.pageStart());
+            if (block.pageEnd() != null) location.put("page_end", block.pageEnd());
             location.put("bbox", block.bbox());
             location.put("page_size", block.pageSize());
             return new Evidence(id, documentId, block.versionId(), block.id(), objectKey,

@@ -207,7 +207,7 @@ public final class EnterpriseApiController {
     public Map<String,Boolean> capabilities(HttpServletRequest request){EnterpriseRequestContext.user(request);return Map.ofEntries(
             Map.entry("auth",true),Map.entry("users",true),Map.entry("documents",true),Map.entry("upload",true),Map.entry("batch_ingestion",true),
             Map.entry("tasks",true),Map.entry("audit",true),Map.entry("evidence",true),Map.entry("source_viewer",true),Map.entry("ask",true),
-            Map.entry("ask_answering",true),Map.entry("search",true),Map.entry("package_sources",true),Map.entry("promotion",true),Map.entry("graph",true),Map.entry("web",true));}
+            Map.entry("ask_answering",true),Map.entry("search",true),Map.entry("package_sources",true),Map.entry("promotion",true),Map.entry("artifact_evaluation",true),Map.entry("graph",true),Map.entry("web",true));}
 
     private static PageQuery query(int page,int pageSize,String q,String lifecycle,String status,Boolean active,String company,String dept,String docType,String category,String docId,String wikiType,String wikiId,String subject,String actor,String action,String outcome){
         return new PageQuery(page,pageSize,q,lifecycle,status,active,company,dept,docType,category,docId,wikiType,wikiId,subject,actor,action,outcome);}

@@ -85,14 +85,16 @@ public final class Neo4jGraphStoreAdapter implements GraphStore {
             List<String> supportIds = evidenceIds.stream().map(e -> "support_" + shortHash(relation.id() + "\u0000" + e)).toList();
             String cypher = "MATCH (s:Entity {id:$source_id}),(t:Entity {id:$target_id}) " +
                     "MERGE (s)-[r:" + type + " {relation_id:$relation_id}]->(t) " +
-                    "SET r.valid_from=$valid_from,r.valid_to=$valid_to,r.conflict_status=$conflict_status,r.lifecycle=$lifecycle," +
+                    "SET r.valid_from=CASE WHEN $valid_from='' THEN null ELSE datetime($valid_from) END," +
+                    "r.valid_to=CASE WHEN $valid_to='' THEN null ELSE datetime($valid_to) END," +
+                    "r.conflict_status=$conflict_status,r.lifecycle=$lifecycle," +
                     "r.updated_at=datetime(),r.evidence_ids=$evidence_ids,r.support_ids=$support_ids";
             Map<String, Object> params = new LinkedHashMap<>();
             params.put("source_id", relation.subjectEntityId());
             params.put("target_id", relation.objectEntityId());
             params.put("relation_id", relation.id());
-            params.put("valid_from", relation.validFrom() == null ? null : relation.validFrom().toString());
-            params.put("valid_to", relation.validTo() == null ? null : relation.validTo().toString());
+            params.put("valid_from", relation.validFrom() == null ? "" : relation.validFrom().toString());
+            params.put("valid_to", relation.validTo() == null ? "" : relation.validTo().toString());
             params.put("conflict_status", relation.conflictStatus().name());
             params.put("lifecycle", relation.lifecycle().name());
             params.put("evidence_ids", evidenceIds);

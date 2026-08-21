@@ -217,8 +217,8 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                 SELECT rf.relation_id,rf.source_entity_id,se.canonical_name,rf.target_entity_id,te.canonical_name,rf.relation_type,
                        GROUP_CONCAT(DISTINCT rs.evidence_id ORDER BY rs.evidence_id SEPARATOR ',') evidence_ids,
                        MAX(rs.confidence) score
-                FROM relation_fact rf JOIN canonical_entity se ON se.entity_id=rf.source_entity_id
-                JOIN canonical_entity te ON te.entity_id=rf.target_entity_id
+                FROM relation_fact rf JOIN canonical_entity se ON se.canonical_entity_id=rf.source_entity_id
+                JOIN canonical_entity te ON te.canonical_entity_id=rf.target_entity_id
                 JOIN relation_evidence_support rs ON rs.relation_id=rf.relation_id AND rs.active=TRUE
                 JOIN evidence ev ON ev.evidence_id=rs.evidence_id AND ev.active=TRUE
                 WHERE rf.lifecycle='ACTIVE' AND (se.canonical_name LIKE ? OR te.canonical_name LIKE ? OR rf.relation_type LIKE ?)
@@ -234,7 +234,7 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
         List<Object> args=new ArrayList<>();args.addAll(entityIds);args.addAll(entityIds);args.addAll(relationIds);args.add(max-first.size());
         List<GraphRelationView> second=jdbc.query("SELECT rf.relation_id,rf.source_entity_id,se.canonical_name,rf.target_entity_id,te.canonical_name,rf.relation_type,"+
                         "GROUP_CONCAT(DISTINCT rs.evidence_id ORDER BY rs.evidence_id SEPARATOR ',') evidence_ids,MAX(rs.confidence) score "+
-                        "FROM relation_fact rf JOIN canonical_entity se ON se.entity_id=rf.source_entity_id JOIN canonical_entity te ON te.entity_id=rf.target_entity_id "+
+                        "FROM relation_fact rf JOIN canonical_entity se ON se.canonical_entity_id=rf.source_entity_id JOIN canonical_entity te ON te.canonical_entity_id=rf.target_entity_id "+
                         "JOIN relation_evidence_support rs ON rs.relation_id=rf.relation_id AND rs.active=TRUE JOIN evidence ev ON ev.evidence_id=rs.evidence_id AND ev.active=TRUE "+
                         "WHERE rf.lifecycle='ACTIVE' AND (rf.source_entity_id IN ("+entityMarks+") OR rf.target_entity_id IN ("+entityMarks+")) AND rf.relation_id NOT IN ("+relationMarks+") "+
                         "GROUP BY rf.relation_id,rf.source_entity_id,se.canonical_name,rf.target_entity_id,te.canonical_name,rf.relation_type ORDER BY score DESC,rf.relation_id LIMIT ?",

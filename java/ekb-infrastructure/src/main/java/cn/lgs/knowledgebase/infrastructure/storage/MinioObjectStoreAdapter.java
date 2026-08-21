@@ -19,12 +19,27 @@ import java.util.concurrent.TimeUnit;
 
 public final class MinioObjectStoreAdapter implements ObjectStore {
     private final MinioClient client;
+    private final MinioClient presignClient;
     private final String bucket;
 
     public MinioObjectStoreAdapter(String endpoint, String accessKey, String secretKey, String bucket) {
-        String normalized = endpoint == null ? "" : endpoint.trim();
-        if (!normalized.startsWith("http://") && !normalized.startsWith("https://")) normalized = "http://" + normalized;
-        this.client = MinioClient.builder().endpoint(normalized).credentials(require(accessKey, "MinIO access key"), require(secretKey, "MinIO secret key")).build();
+        this(endpoint, endpoint, accessKey, secretKey, bucket, "us-east-1");
+    }
+
+    public MinioObjectStoreAdapter(String endpoint, String publicEndpoint, String accessKey, String secretKey, String bucket) {
+        this(endpoint, publicEndpoint, accessKey, secretKey, bucket, "us-east-1");
+    }
+
+    public MinioObjectStoreAdapter(String endpoint, String publicEndpoint, String accessKey, String secretKey, String bucket, String region) {
+        String normalized = normalizeEndpoint(endpoint);
+        String normalizedPublic = publicEndpoint == null || publicEndpoint.isBlank() ? normalized : normalizeEndpoint(publicEndpoint);
+        String access = require(accessKey, "MinIO access key");
+        String secret = require(secretKey, "MinIO secret key");
+        String normalizedRegion = region == null || region.isBlank() ? "us-east-1" : region.trim();
+        this.client = MinioClient.builder().endpoint(normalized).credentials(access, secret).region(normalizedRegion).build();
+        this.presignClient = normalizedPublic.equals(normalized)
+                ? this.client
+                : MinioClient.builder().endpoint(normalizedPublic).credentials(access, secret).region(normalizedRegion).build();
         this.bucket = require(bucket, "MinIO bucket");
         ensureBucket();
     }
@@ -66,7 +81,7 @@ public final class MinioObjectStoreAdapter implements ObjectStore {
     public String presignGet(String key, Duration expiry) {
         try {
             long seconds = expiry == null ? 900 : Math.max(1, expiry.toSeconds());
-            return client.getPresignedObjectUrl(GetPresignedObjectUrlArgs.builder().bucket(bucket).object(key)
+            return presignClient.getPresignedObjectUrl(GetPresignedObjectUrlArgs.builder().bucket(bucket).object(key)
                     .method(Method.GET).expiry((int) Math.min(seconds, 7 * 24 * 3600), TimeUnit.SECONDS).build());
         } catch (Exception e) {
             throw new IllegalStateException("minio presign failed: " + key, e);
@@ -81,6 +96,15 @@ public final class MinioObjectStoreAdapter implements ObjectStore {
         } catch (Exception e) {
             throw new IllegalStateException("cannot initialize MinIO bucket " + bucket, e);
         }
+    }
+
+    private static String normalizeEndpoint(String value) {
+        String normalized = require(value, "MinIO endpoint");
+        if (!normalized.startsWith("http://") && !normalized.startsWith("https://")) normalized = "http://" + normalized;
+        while (normalized.endsWith("/") && normalized.length() > "http://x".length()) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
     }
 
     private static String require(String value, String name) {

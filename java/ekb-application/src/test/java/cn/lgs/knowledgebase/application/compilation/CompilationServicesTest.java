@@ -190,7 +190,7 @@ class CompilationServicesTest {
             String key = GraphCompilationService.canonicalKey(name);
             return new Entity(GraphCompilationService.stableId("entity", entityType, key), name, entityType, key, List.of(), Map.of());
         }
-        @Override public void saveGraph(String summaryId, List<Entity> entities, List<Relation> relations) {}
+        @Override public void saveGraph(String summaryId, List<Entity> entities, List<Relation> relations, List<CompilationContracts.EntityResolution> resolutions) {}
         @Override public long nextWikiVersion(String wikiId) { return ++wikiVersion; }
         @Override public void saveWiki(WikiRecord wiki) { wikis.put(wiki.id(), wiki); }
         @Override public Ports.DerivedContext derivedContextForSummaries(List<String> summaryIds) {
