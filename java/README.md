@@ -1,19 +1,25 @@
-# Enterprise Knowledge Base - Java DDD implementation
+# Java backend
 
-This directory is the Java parity implementation of the verified Go enterprise knowledge base.
+Enterprise Knowledge Base 后端采用 Java 17 + Spring Boot 的 DDD 模块化结构。
 
-Build:
-
-```bash
-mvn -f java/pom.xml clean verify
+```text
+ekb-domain          领域模型与领域规则
+ekb-application     用例、业务编排与端口
+ekb-infrastructure  MySQL / MinIO / OpenSearch / Neo4j / MinerU / 模型适配
+ekb-interfaces      REST / MCP / 认证等入口
+ekb-bootstrap       Spring Boot 组合根
 ```
 
-Modules:
+构建与测试：
 
-- `ekb-domain`: pure domain model and domain services.
-- `ekb-application`: use cases and ports.
-- `ekb-infrastructure`: MySQL, MinIO, MinerU, OpenSearch, Neo4j and Spring AI Alibaba adapters.
-- `ekb-interfaces`: REST/MCP/security adapters.
-- `ekb-bootstrap`: Spring Boot composition root.
+```bash
+mvn -f java/pom.xml clean test package
+```
 
-The existing `web/` React application remains the UI parity target.
+最终可执行文件：
+
+```text
+java/ekb-bootstrap/target/enterprise-knowledge-base.jar
+```
+
+运行时配置统一使用 `EKB_*` 环境变量，完整说明见 `../docs/CONFIGURATION.md`。
