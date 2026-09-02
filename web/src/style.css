@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+html,
+body,
+#app {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+:where(button, a, input, select, textarea, summary):focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 3px;
+}
+
+button:not(:disabled), summary { cursor: pointer; }
+
+dialog.evokb-dialog {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100dvh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 1rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+dialog.evokb-dialog[open] { display: flex; align-items: center; justify-content: center; }
+dialog.evokb-dialog:not([open]) { display: none; }
+dialog.evokb-dialog::backdrop { background: rgb(15 23 42 / .35); backdrop-filter: blur(2px); }
+dialog.evokb-dialog > div { max-height: calc(100dvh - 2rem); overflow-y: auto; }
+dialog.evokb-drawer[open] { justify-content: flex-end; align-items: stretch; padding: 0; }
+dialog.evokb-drawer-left[open] { justify-content: flex-start; align-items: stretch; padding: 0; }
+dialog.evokb-drawer > div { max-height: 100dvh; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+* {
+  box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+*:hover {
+  scrollbar-color: rgb(148 163 184 / 0.45) transparent;
+}
+
+.dark *:hover {
+  scrollbar-color: rgb(71 85 105 / 0.55) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 3px;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background: rgb(148 163 184 / 0.45);
+}
+
+.dark *:hover::-webkit-scrollbar-thumb {
+  background: rgb(71 85 105 / 0.55);
+}

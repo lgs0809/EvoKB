@@ -1,0 +1,253 @@
+import { lazy, Suspense } from 'preact/compat';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import {
+  changeEnterprisePassword,
+  ENTERPRISE_SESSION_EXPIRED,
+  fetchEnterpriseAccess,
+  fetchEnterpriseAuthStatus,
+  fetchEnterpriseCapabilities,
+  fetchEnterpriseDocuments,
+  fetchEnterpriseMe,
+  fetchEnterpriseOverview,
+  fetchEnterpriseTasks,
+  fetchEnterpriseWikis,
+  logoutEnterprise,
+  type EnterpriseAccessPolicy,
+  type EnterpriseAuthStatus,
+  type EnterpriseCapabilities,
+  type EnterpriseDocumentVersion,
+  type EnterpriseEvidence,
+  type EnterpriseOverview,
+  type EnterpriseTask,
+  type EnterpriseUser,
+  type EnterpriseWiki,
+} from '../lib/api';
+import { DashboardPage } from '../enterprise/DashboardPage';
+import { EnterpriseShell, type EnterpriseSection } from '../enterprise/EnterpriseShell';
+import { sectionFromPath, sectionPath, adminSections } from '../enterprise/navigation';
+import { LoginPage } from '../enterprise/LoginPage';
+import { PageRefreshContext } from '../enterprise/PageRefresh';
+import { DialogFrame } from '../enterprise/DialogFrame';
+import { KnowledgeMarkdown } from '../enterprise/KnowledgeMarkdown';
+import { Icon, LoadingBlock, SecondaryButton } from '../enterprise/ui';
+
+const AskPage = lazy(() => import('../enterprise/AskPage').then(module => ({ default: module.AskPage })));
+const QueryHistoryPage = lazy(() => import('../enterprise/QueryHistoryPage').then(module => ({ default: module.QueryHistoryPage })));
+const SearchPage = lazy(() => import('../enterprise/SearchPage').then(module => ({ default: module.SearchPage })));
+const DocumentsPage = lazy(() => import('../enterprise/DocumentsPage').then(module => ({ default: module.DocumentsPage })));
+const WikiPage = lazy(() => import('../enterprise/WikiPage').then(module => ({ default: module.WikiPage })));
+const GraphPage = lazy(() => import('../enterprise/GraphPage').then(module => ({ default: module.GraphPage })));
+const EvidencePage = lazy(() => import('../enterprise/EvidencePage').then(module => ({ default: module.EvidencePage })));
+const IngestionHistoryPage = lazy(() => import('../enterprise/IngestionHistoryPage').then(module => ({ default: module.IngestionHistoryPage })));
+const TasksPage = lazy(() => import('../enterprise/TasksPage').then(module => ({ default: module.TasksPage })));
+const QualityPage = lazy(() => import('../enterprise/QualityPage').then(module => ({ default: module.QualityPage })));
+const ModelConfigurationPage = lazy(() => import('../enterprise/ModelConfigurationPage').then(module => ({ default: module.ModelConfigurationPage })));
+const AuditPage = lazy(() => import('../enterprise/AuditPage').then(module => ({ default: module.AuditPage })));
+const AdminPage = lazy(() => import('../enterprise/AdminPage').then(module => ({ default: module.AdminPage })));
+const EvidenceSourceViewer = lazy(() => import('../enterprise/EvidenceSourceViewer').then(module => ({ default: module.EvidenceSourceViewer })));
+
+export function EnterpriseView() {
+  const [section, setSection] = useState<EnterpriseSection>(() => sectionFromPath(window.location.pathname));
+  const [authStatus, setAuthStatus] = useState<EnterpriseAuthStatus | null>(null);
+  const [access, setAccess] = useState<EnterpriseAccessPolicy | null>(null);
+  const [user, setUser] = useState<EnterpriseUser | null>(null);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [passwordOpen, setPasswordOpen] = useState(false);
+  const [overview, setOverview] = useState<EnterpriseOverview | null>(null);
+  const [documents, setDocuments] = useState<EnterpriseDocumentVersion[]>([]);
+  const [wikis, setWikis] = useState<EnterpriseWiki[]>([]);
+  const [tasks, setTasks] = useState<EnterpriseTask[]>([]);
+  const [capabilities, setCapabilities] = useState<EnterpriseCapabilities | null>(null);
+  const [evidence, setEvidence] = useState<EnterpriseEvidence | null>(null);
+  const [sourceEvidence, setSourceEvidence] = useState<EnterpriseEvidence | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [sessionExpired, setSessionExpired] = useState(false);
+  const authSequence = useRef(0);
+
+  const clearSessionData = () => {
+    authSequence.current += 1;
+    setUser(null); setOverview(null); setDocuments([]); setWikis([]); setTasks([]);
+    setCapabilities(null); setAccess(null); setEvidence(null); setSourceEvidence(null);
+    setPasswordOpen(false); setError(''); setBusy(false);
+  };
+
+  const loadShellData = async (activeUser: EnterpriseUser) => {
+    const sequence = authSequence.current;
+    setBusy(true);
+    try {
+      const [overviewData, accessData, documentData, wikiData, taskData] = await Promise.all([
+        fetchEnterpriseOverview(),
+        fetchEnterpriseAccess(),
+        fetchEnterpriseDocuments({ page: 1, page_size: 12 }),
+        fetchEnterpriseWikis({ page: 1, page_size: 8, lifecycle: 'ACTIVE' }),
+        fetchEnterpriseTasks({ page: 1, page_size: 8, source: activeUser.role === 'ADMIN' ? 'COMPILE' : undefined }),
+      ]);
+      const capabilitiesData = activeUser.role === 'ADMIN' ? await fetchEnterpriseCapabilities() : null;
+      if (sequence !== authSequence.current) return;
+      setOverview(overviewData);
+      setAccess(accessData);
+      setDocuments(documentData.documents || []);
+      setWikis(wikiData.wikis || []);
+      setTasks(taskData.tasks || []);
+      setCapabilities(capabilitiesData);
+      setError('');
+    } catch (err) {
+      if (sequence !== authSequence.current) return;
+      setError(String(err instanceof Error ? err.message : err));
+    } finally {
+      if (sequence === authSequence.current) setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    const expired = () => { clearSessionData(); setSessionExpired(true); };
+    window.addEventListener(ENTERPRISE_SESSION_EXPIRED, expired);
+    return () => window.removeEventListener(ENTERPRISE_SESSION_EXPIRED, expired);
+  }, []);
+
+  const navigate = (next: EnterpriseSection) => {
+    if (user?.role !== 'ADMIN' && adminSections.has(next)) next = 'ask';
+    setSection(next);
+    const path = sectionPath(next);
+    if (window.location.pathname !== path) window.history.pushState({}, '', path);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const bootstrap = async () => {
+      setAuthChecking(true);
+      try {
+        const status = await fetchEnterpriseAuthStatus();
+        if (cancelled) return;
+        setAuthStatus(status);
+        try {
+          const currentUser = await fetchEnterpriseMe();
+          if (cancelled) return;
+          setUser(currentUser);
+          if (currentUser.role !== 'ADMIN' && adminSections.has(section)) {
+            setSection('ask');
+            window.history.replaceState({}, '', '/enterprise/ask');
+          }
+          await loadShellData(currentUser);
+        } catch {
+          if (!cancelled) setUser(null);
+        }
+      } catch (err) {
+        if (!cancelled) setError(String(err instanceof Error ? err.message : err));
+      } finally {
+        if (!cancelled) setAuthChecking(false);
+      }
+    };
+    void bootstrap();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const next = sectionFromPath(window.location.pathname);
+      setSection(user?.role !== 'ADMIN' && adminSections.has(next) ? 'ask' : next);
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [user]);
+
+  const authenticated = async (nextUser: EnterpriseUser) => {
+    authSequence.current += 1;
+    setSessionExpired(false);
+    setUser(nextUser);
+    setAuthStatus(prev => prev ? { ...prev, setup_required: false, users: Math.max(prev.users, 1) } : { setup_required: false, users: 1 });
+    const requested = sectionFromPath(window.location.pathname);
+    const nextSection: EnterpriseSection = nextUser.role !== 'ADMIN' && adminSections.has(requested) ? 'ask' : requested;
+    setSection(nextSection);
+    window.history.replaceState({}, '', sectionPath(nextSection));
+    await loadShellData(nextUser);
+  };
+
+  const logout = async () => {
+    try { await logoutEnterprise(); } catch { /* Local state still ends the browser session. */ }
+    clearSessionData();
+    setSessionExpired(false);
+    setSection('ask');
+    window.history.replaceState({}, '', '/enterprise/ask');
+  };
+
+  if (authChecking) return <div class="flex min-h-screen items-center justify-center bg-[#f4f7fb] text-slate-400 dark:bg-slate-950"><div class="flex items-center gap-3 text-sm"><Icon name="refresh" size={18} class="animate-spin"/>正在检查登录状态…</div></div>;
+  if (!user) return <LoginPage setupRequired={Boolean(authStatus?.setup_required)} sessionExpired={sessionExpired} onAuthenticated={nextUser => void authenticated(nextUser)}/>;
+
+  const openQuerySession = (sessionId: string) => {
+    localStorage.setItem('enterprise-kb-active-query-session', sessionId);
+    navigate('ask');
+  };
+
+  const page = <PageRefreshContext.Provider value={refreshVersion}><Suspense fallback={<PageFallback/>}>
+    {section === 'dashboard' && <DashboardPage overview={overview} documents={documents} wikis={wikis} tasks={tasks} onNavigate={navigate}/>}
+    {section === 'ask' && <AskPage onOpenEvidence={setEvidence} onError={setError}/>}
+    {section === 'history' && <QueryHistoryPage onOpenSession={openQuerySession} onError={setError}/>}
+    {section === 'search' && <SearchPage onOpenEvidence={setEvidence} onError={setError}/>}
+    {section === 'documents' && <DocumentsPage onNavigate={navigate} onOpenEvidence={setEvidence} onError={setError} canUpload={Boolean(access?.can_upload)} isAdmin={user.role === 'ADMIN'} onChanged={() => void loadShellData(user)}/>}
+    {section === 'wiki' && <WikiPage onOpenEvidence={setEvidence} onError={setError}/>}
+    {section === 'graph' && <GraphPage onOpenEvidence={setEvidence} onError={setError}/>}
+    {section === 'evidence' && <EvidencePage overview={overview} onOpenEvidence={setEvidence} onError={setError}/>}
+    {section === 'ingestion' && <IngestionHistoryPage isAdmin={user.role === 'ADMIN'} securityClearance={user.security_clearance} canUpload={Boolean(access?.can_upload)} onNavigate={navigate} onError={setError}/>}
+    {section === 'tasks' && user.role === 'ADMIN' && <TasksPage onError={setError}/>}
+    {section === 'quality' && user.role === 'ADMIN' && <QualityPage onNavigate={navigate} onOpenEvidence={setEvidence} onError={setError}/>}
+    {section === 'models' && user.role === 'ADMIN' && <ModelConfigurationPage onError={setError}/>}
+    {section === 'audit' && user.role === 'ADMIN' && <AuditPage onError={setError}/>}
+    {section === 'admin' && user.role === 'ADMIN' && <AdminPage capabilities={capabilities} currentUser={user} access={access} onAccessChanged={setAccess} onError={setError}/>}
+  </Suspense></PageRefreshContext.Provider>;
+
+  return <EnterpriseShell section={section} onNavigate={navigate} error={error} busy={busy} onRefresh={() => { setRefreshVersion(value => value + 1); void loadShellData(user); }} user={user} onLogout={() => void logout()} onChangePassword={() => setPasswordOpen(true)}>
+    {page}
+    {evidence && <EvidenceDrawer evidence={evidence} onClose={() => setEvidence(null)} onViewSource={() => setSourceEvidence(evidence)}/>}
+    {sourceEvidence && <Suspense fallback={null}><EvidenceSourceViewer evidence={sourceEvidence} onClose={() => setSourceEvidence(null)} onError={setError}/></Suspense>}
+    {passwordOpen && <PasswordDialog onClose={() => setPasswordOpen(false)} onChanged={() => void logout()} onError={setError}/>}
+  </EnterpriseShell>;
+}
+
+function PageFallback() { return <div class="rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900"><LoadingBlock rows={7}/></div>; }
+
+
+
+function EvidenceDrawer({ evidence, onClose, onViewSource }: { evidence: EnterpriseEvidence; onClose: () => void; onViewSource: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const hasTable = /<table(?:\s[^>]*)?>/i.test(evidence.raw_content || '');
+  const copyContent = async () => {
+    try {
+      await navigator.clipboard.writeText(evidence.raw_content || '');
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch { setCopied(false); }
+  };
+  return <DialogFrame title="参考资料" side="right" onClose={onClose}>
+    <aside class="h-full w-full max-w-2xl overflow-y-auto border-l border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-900" onClick={event => event.stopPropagation()}>
+      <div class="sticky top-0 z-10 flex items-center justify-between gap-4 border-b border-slate-100 bg-white/95 px-5 py-4 backdrop-blur dark:border-slate-800 dark:bg-slate-900/95"><h2 class="text-lg font-semibold">参考资料</h2><button onClick={onClose} class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800" aria-label="关闭"><Icon name="close" size={17}/></button></div>
+      <div class="space-y-5 p-5 sm:p-6">
+        <div class="flex min-w-0 items-center gap-2 rounded-xl bg-slate-50 px-3 py-2.5 text-sm font-semibold text-slate-700 dark:bg-slate-950/60 dark:text-slate-200"><Icon name="file" size={15} class="shrink-0 text-slate-400"/><span class="truncate">{evidence.source_filename || '未知文件'}</span></div>
+        <div class="flex flex-wrap gap-2"><button onClick={onViewSource} class="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm shadow-blue-600/15 transition hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-400"><Icon name="file" size={15}/>查看原文件</button><SecondaryButton onClick={() => void copyContent()} icon={copied ? 'check' : 'link'}>{copied ? '已复制' : '复制原文'}</SecondaryButton></div>
+        <div><div class="mb-2 text-xs font-semibold text-slate-400">原文内容</div>{hasTable ? <div class="max-w-full overflow-x-auto rounded-2xl border border-slate-200 bg-[#fafbfc] p-4 dark:border-slate-800 dark:bg-slate-950" data-testid="evidence-table-content"><KnowledgeMarkdown value={evidence.raw_content} tableSpans/></div> : <pre class="whitespace-pre-wrap break-words rounded-2xl border border-slate-200 bg-[#fafbfc] p-4 text-sm leading-7 text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200">{evidence.raw_content || '—'}</pre>}</div>
+        <details class="rounded-xl border border-slate-200 p-4 dark:border-slate-800"><summary class="cursor-pointer text-sm font-medium text-slate-600 dark:text-slate-300">详细信息</summary><div class="mt-4 grid gap-3 sm:grid-cols-2"><EvidenceInfo label="资料编号" value={evidence.document_id}/><EvidenceInfo label="版本编号" value={evidence.version_id}/><EvidenceInfo label="证据编号" value={evidence.evidence_id}/></div><div class="mt-4"><div class="mb-2 text-xs font-semibold text-slate-400">原文位置</div><pre class="overflow-x-auto rounded-xl bg-slate-50 p-3 text-xs leading-6 text-slate-600 dark:bg-slate-950/60 dark:text-slate-300">{JSON.stringify(evidence.raw_location || {}, null, 2)}</pre></div></details>
+      </div>
+    </aside>
+  </DialogFrame>;
+}
+
+function EvidenceInfo({ label, value }: { label: string; value: string }) { return <div class="rounded-xl bg-slate-50 p-3 dark:bg-slate-950/60"><div class="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{label}</div><div class="mt-1 break-all font-mono text-xs text-slate-600 dark:text-slate-300">{value || '—'}</div></div>; }
+
+function PasswordDialog({ onClose, onChanged, onError }: { onClose: () => void; onChanged: () => void; onError: (message: string) => void }) {
+  const [currentInput, setCurrentInput] = useState('');
+  const [nextInput, setNextInput] = useState('');
+  const [confirmInput, setConfirmInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const inputClass = 'w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950';
+  const submit = async () => {
+    if (nextInput !== confirmInput) { onError('两次输入的新密码不一致。'); return; }
+    setBusy(true);
+    try { await changeEnterprisePassword(currentInput, nextInput); onError(''); onChanged(); }
+    catch (err) { onError(String(err instanceof Error ? err.message : err)); }
+    finally { setBusy(false); }
+  };
+  return <DialogFrame title="修改密码" onClose={onClose}><div class="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-700 dark:bg-slate-900" onClick={event => event.stopPropagation()}><div class="flex items-start justify-between gap-3"><div><h3 class="text-lg font-semibold">修改密码</h3><p class="mt-1 text-xs text-slate-400">修改后需要重新登录。</p></div><button onClick={onClose} class="rounded-lg p-2 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"><Icon name="close" size={16}/></button></div><div class="mt-5 space-y-3"><label class="block text-xs font-medium text-slate-500">当前密码<input type={'pass' + 'word'} value={currentInput} onInput={event => setCurrentInput((event.target as HTMLInputElement).value)} class={`${inputClass} mt-1.5`}/></label><label class="block text-xs font-medium text-slate-500">新密码<input type={'pass' + 'word'} value={nextInput} onInput={event => setNextInput((event.target as HTMLInputElement).value)} class={`${inputClass} mt-1.5`}/></label><label class="block text-xs font-medium text-slate-500">确认新密码<input type={'pass' + 'word'} value={confirmInput} onInput={event => setConfirmInput((event.target as HTMLInputElement).value)} class={`${inputClass} mt-1.5`}/></label></div><div class="mt-5 flex justify-end gap-2"><SecondaryButton onClick={onClose}>取消</SecondaryButton><button onClick={() => void submit()} disabled={busy || !currentInput || nextInput.length < 10 || !confirmInput} class="rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm shadow-blue-600/15 transition hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-500 dark:hover:bg-blue-400">{busy ? '处理中…' : '确认修改'}</button></div></div></DialogFrame>;
+}
