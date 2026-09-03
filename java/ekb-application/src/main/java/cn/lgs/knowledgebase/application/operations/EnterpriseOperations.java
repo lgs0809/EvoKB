@@ -58,13 +58,31 @@ public final class EnterpriseOperations {
       String company,
       String documentType,
       LocalDate documentDate,
+      List<String> manualTags,
       Instant parsedAt,
       int summaryCount,
       int groundedSummaries,
       int coveredSummaries,
       String recommendation,
       String recommendationReason,
-      int effectiveHits) {}
+      int effectiveHits) {
+    public DocumentVersionView {
+      manualTags = manualTags == null ? List.of() : List.copyOf(manualTags);
+    }
+  }
+
+  public record DocumentMetadataUpdate(
+      String versionId,
+      String logicalName,
+      String sourceDepartment,
+      String materialCategory,
+      String documentType,
+      LocalDate documentDate,
+      List<String> manualTags) {
+    public DocumentMetadataUpdate {
+      manualTags = manualTags == null ? List.of() : List.copyOf(manualTags);
+    }
+  }
 
   public record ClaimView(
       String claimId,
@@ -165,6 +183,76 @@ public final class EnterpriseOperations {
     }
   }
 
+  public record RawBlockPreview(
+      String blockId,
+      int blockNo,
+      String blockType,
+      List<String> headingPath,
+      Integer pageStart,
+      Integer pageEnd,
+      String evidenceId,
+      String content,
+      String contentHash) {
+    public RawBlockPreview {
+      headingPath = headingPath == null ? List.of() : List.copyOf(headingPath);
+    }
+  }
+
+  public record DocumentKnowledgeStatus(
+      int rawBlocks,
+      int evidence,
+      int summaries,
+      int activeSummaries,
+      int groundedSummaries,
+      int coveredSummaries,
+      int sourceEntities,
+      int appliedEntityMappings,
+      int activeRelations,
+      int relationEvidenceSupports,
+      int wikiClaims,
+      int wikiEvidence,
+      int pendingTasks,
+      int runningTasks,
+      int failedTasks) {}
+
+  public record DocumentDetailView(
+      String documentId,
+      String versionId,
+      DocumentKnowledgeStatus knowledge,
+      List<RawBlockPreview> blocks) {
+    public DocumentDetailView {
+      blocks = blocks == null ? List.of() : List.copyOf(blocks);
+    }
+  }
+
+  public record QualityIssueView(
+      String issueType,
+      String severity,
+      String title,
+      String detail,
+      String versionId,
+      String artifactId,
+      List<String> evidenceIds,
+      Instant createdAt) {
+    public QualityIssueView {
+      evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
+    }
+  }
+
+  public record QualityView(
+      int summaryGroundingFailures,
+      int summaryCoverageFailures,
+      int wikiGroundingFailures,
+      int wikiTemporalConflicts,
+      int relationConflicts,
+      int unresolvedEntities,
+      int failedGenerationTasks,
+      List<QualityIssueView> issues) {
+    public QualityView {
+      issues = issues == null ? List.of() : List.copyOf(issues);
+    }
+  }
+
   public record Facets(
       List<String> companies,
       List<String> sourceDepartments,
@@ -206,9 +294,14 @@ public final class EnterpriseOperations {
       String relationId,
       String sourceEntityId,
       String sourceName,
+      String sourceType,
       String targetEntityId,
       String targetName,
+      String targetType,
       String relationType,
+      Instant validFrom,
+      Instant validTo,
+      String conflictStatus,
       List<String> evidenceIds,
       double score) {
     public GraphRelationView {
@@ -221,6 +314,10 @@ public final class EnterpriseOperations {
 
     Page<DocumentVersionView> documents(PageQuery query);
 
+    Optional<DocumentVersionView> updateDocumentMetadata(DocumentMetadataUpdate update);
+
+    Optional<DocumentDetailView> documentDetail(String versionId, int blockLimit);
+
     Page<WikiView> wikis(PageQuery query);
 
     Optional<WikiView> wiki(String wikiId, Long version);
@@ -231,11 +328,14 @@ public final class EnterpriseOperations {
 
     Page<TaskView> tasks(PageQuery query, String actorId, boolean admin, String source);
 
+    QualityView quality(int limit);
+
     Facets facets();
 
     Page<AuditEventView> audit(PageQuery query);
 
-    List<GraphRelationView> graph(String query, int depth, int limit);
+    List<GraphRelationView> graph(
+        String query, int depth, int limit, String relationType, Instant validAt);
 
     List<EvidenceSourceRef> evidenceSources(List<String> evidenceIds);
   }

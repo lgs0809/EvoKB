@@ -38,6 +38,7 @@ export interface EnterpriseDocumentVersion {
   company?: string;
   document_type?: string;
   document_date?: string;
+  manual_tags?: string[];
   parsed_at?: string;
   summary_count: number;
   grounded_summaries: number;
@@ -47,11 +48,49 @@ export interface EnterpriseDocumentVersion {
   effective_hits: number;
 }
 
+export interface EnterpriseRawBlockPreview {
+  block_id: string;
+  block_no: number;
+  block_type: string;
+  heading_path: string[];
+  page_start?: number;
+  page_end?: number;
+  evidence_id?: string;
+  content: string;
+  content_hash: string;
+}
+
+export interface EnterpriseDocumentKnowledgeStatus {
+  raw_blocks: number;
+  evidence: number;
+  summaries: number;
+  active_summaries: number;
+  grounded_summaries: number;
+  covered_summaries: number;
+  source_entities: number;
+  applied_entity_mappings: number;
+  active_relations: number;
+  relation_evidence_supports: number;
+  wiki_claims: number;
+  wiki_evidence: number;
+  pending_tasks: number;
+  running_tasks: number;
+  failed_tasks: number;
+}
+
+export interface EnterpriseDocumentDetail {
+  document_id: string;
+  version_id: string;
+  knowledge: EnterpriseDocumentKnowledgeStatus;
+  blocks: EnterpriseRawBlockPreview[];
+}
+
 export interface EnterpriseEvidence {
   evidence_id: string;
   document_id: string;
   version_id: string;
   object_key: string;
+  source_filename: string;
   raw_location: Record<string, unknown>;
   raw_content: string;
   content_hash: string;
@@ -81,9 +120,14 @@ export interface EnterpriseGraphRelation {
   relation_id: string;
   source_entity_id: string;
   source_name: string;
+  source_type: string;
   target_entity_id: string;
   target_name: string;
+  target_type: string;
   relation_type: string;
+  valid_from?: string;
+  valid_to?: string;
+  conflict_status: string;
   evidence_ids: string[];
   score: number;
 }
@@ -94,12 +138,53 @@ export async function fetchEnterpriseDocuments(params: EnterprisePageParams = {}
   return res.json();
 }
 
+export async function fetchEnterpriseDocumentDetail(versionId: string, blockLimit = 120): Promise<EnterpriseDocumentDetail> {
+  const qs = new URLSearchParams({ version_id: versionId, block_limit: String(blockLimit) });
+  const res = await fetch(`${BASE}/api/enterprise/document/detail?${qs}`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Document detail failed');
+  return res.json();
+}
+
+export async function updateEnterpriseDocumentMetadata(versionId: string, input: {
+  logical_name: string;
+  source_department: string;
+  material_category: string;
+  document_type: string;
+  document_date: string;
+  manual_tags: string[];
+}): Promise<EnterpriseDocumentVersion> {
+  const qs = new URLSearchParams({ version_id: versionId });
+  const res = await fetch(`${BASE}/api/enterprise/document?${qs}`, {
+    method: 'PATCH',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await responseError(res, 'Document metadata update failed');
+  return res.json();
+}
+
 export async function recommendEnterpriseKnowledgeGeneration(versionId: string): Promise<void> {
   const res = await fetch(`${BASE}/api/enterprise/generation/recommend`, {
     method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
     body: JSON.stringify({ version_id: versionId, reason: 'user' }),
   });
   if (!res.ok) throw new Error(`Knowledge generation recommendation failed: ${res.status}`);
+}
+
+export async function startEnterpriseKnowledgeGeneration(versionId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/generation/start`, {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ version_id: versionId }),
+  });
+  if (!res.ok) throw await responseError(res, 'Knowledge generation start failed');
+}
+
+export async function retryEnterpriseGenerationTask(taskId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/generation/task/retry`, {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task_id: taskId }),
+  });
+  if (!res.ok) throw await responseError(res, 'Knowledge generation retry failed');
 }
 
 export async function fetchEnterpriseWikis(params: EnterprisePageParams = {}): Promise<{ wikis: EnterpriseWiki[]; total: number; page: number; page_size: number }> {
@@ -122,8 +207,11 @@ export async function fetchEnterpriseEvidence(id: string): Promise<EnterpriseEvi
   return res.json();
 }
 
-export async function fetchEnterpriseGraph(query: string): Promise<{ relations: EnterpriseGraphRelation[]; total: number }> {
-  const res = await fetch(`${BASE}/api/enterprise/graph?q=${encodeURIComponent(query)}&depth=2&limit=10`, { headers: authHeaders() });
+export async function fetchEnterpriseGraph(query: string, options: { depth?: 1 | 2; limit?: number; relation_type?: string; valid_at?: string } = {}): Promise<{ relations: EnterpriseGraphRelation[]; total: number }> {
+  const qs = new URLSearchParams({ q: query, depth: String(options.depth || 2), limit: String(options.limit || 30) });
+  if (options.relation_type?.trim()) qs.set('relation_type', options.relation_type.trim());
+  if (options.valid_at?.trim()) qs.set('valid_at', options.valid_at.trim());
+  const res = await fetch(`${BASE}/api/enterprise/graph?${qs}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Graph request failed: ${res.status}`);
   return res.json();
 }
@@ -149,6 +237,28 @@ export interface EnterpriseOverview {
   pending_tasks: number;
   running_tasks: number;
   failed_tasks: number;
+}
+
+export interface EnterpriseQualityIssue {
+  issue_type: string;
+  severity: 'HIGH' | 'MEDIUM' | 'LOW' | string;
+  title: string;
+  detail: string;
+  version_id?: string;
+  artifact_id?: string;
+  evidence_ids: string[];
+  created_at?: string;
+}
+
+export interface EnterpriseQuality {
+  summary_grounding_failures: number;
+  summary_coverage_failures: number;
+  wiki_grounding_failures: number;
+  wiki_temporal_conflicts: number;
+  relation_conflicts: number;
+  unresolved_entities: number;
+  failed_generation_tasks: number;
+  issues: EnterpriseQualityIssue[];
 }
 
 export interface EnterpriseTask {
@@ -196,6 +306,10 @@ export interface EnterpriseCapabilities {
   source_viewer: boolean;
   ask: boolean;
   ask_answering: boolean;
+  adaptive_query?: boolean;
+  query_feedback?: boolean;
+  query_history?: boolean;
+  query_groups?: boolean;
   search: boolean;
   package_sources: boolean;
   generation_recommendation: boolean;
@@ -208,7 +322,6 @@ export interface EnterpriseCapabilities {
 export interface EnterpriseSearchFilters {
   source_department?: string;
   material_category?: string;
-  company?: string;
   document_type?: string;
   version_ids?: string[];
 }
@@ -247,6 +360,12 @@ export interface EnterprisePublishedPackage {
 export async function fetchEnterpriseOverview(): Promise<EnterpriseOverview> {
   const res = await fetch(`${BASE}/api/enterprise/overview`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Overview request failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchEnterpriseQuality(limit = 120): Promise<EnterpriseQuality> {
+  const res = await fetch(`${BASE}/api/enterprise/quality?limit=${encodeURIComponent(String(limit))}`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Knowledge quality request failed');
   return res.json();
 }
 
@@ -315,6 +434,96 @@ export interface EnterpriseAccessPolicy {
   can_upload: boolean;
 }
 
+export interface EnterpriseModelConfiguration {
+  chat_base_url: string;
+  chat_api_key_configured: boolean;
+  small_model: string;
+  large_model: string;
+  chat_timeout_seconds: number;
+  embedding_base_url: string;
+  embedding_api_key_configured: boolean;
+  embedding_model: string;
+  embedding_dimensions: number;
+  embedding_batch_size: number;
+  embedding_timeout_seconds: number;
+  rerank_base_url: string;
+  rerank_api_key_configured: boolean;
+  rerank_model: string;
+  rerank_timeout_seconds: number;
+  updated_at?: string;
+}
+
+export interface EnterpriseModelConfigurationUpdate {
+  chat_base_url?: string;
+  chat_api_key?: string;
+  clear_chat_api_key?: boolean;
+  small_model?: string;
+  large_model?: string;
+  chat_timeout_seconds?: number;
+  embedding_base_url?: string;
+  embedding_api_key?: string;
+  clear_embedding_api_key?: boolean;
+  embedding_model?: string;
+  embedding_dimensions?: number;
+  embedding_batch_size?: number;
+  embedding_timeout_seconds?: number;
+  rerank_base_url?: string;
+  rerank_api_key?: string;
+  clear_rerank_api_key?: boolean;
+  rerank_model?: string;
+  rerank_timeout_seconds?: number;
+}
+
+export interface EnterpriseModelProfile {
+  profile_id: string;
+  name: string;
+  active: boolean;
+  chat_base_url: string;
+  chat_api_key_configured: boolean;
+  chat_api_key_masked: string;
+  small_model: string;
+  large_model: string;
+  chat_timeout_seconds: number;
+  embedding_base_url: string;
+  embedding_api_key_configured: boolean;
+  embedding_api_key_masked: string;
+  embedding_model: string;
+  embedding_dimensions: number;
+  embedding_batch_size: number;
+  embedding_timeout_seconds: number;
+  rerank_base_url: string;
+  rerank_api_key_configured: boolean;
+  rerank_api_key_masked: string;
+  rerank_model: string;
+  rerank_timeout_seconds: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface EnterpriseModelProfiles {
+  active_profile_id: string;
+  profiles: EnterpriseModelProfile[];
+}
+
+export interface EnterpriseModelProfileUpdate {
+  name: string;
+  chat_base_url: string;
+  chat_api_key?: string;
+  small_model: string;
+  large_model: string;
+  chat_timeout_seconds: number;
+  embedding_base_url: string;
+  embedding_api_key?: string;
+  embedding_model: string;
+  embedding_dimensions: number;
+  embedding_batch_size: number;
+  embedding_timeout_seconds: number;
+  rerank_base_url: string;
+  rerank_api_key?: string;
+  rerank_model: string;
+  rerank_timeout_seconds: number;
+}
+
 export interface EnterpriseUploadResult {
   document_id: string;
   version_id: string;
@@ -365,6 +574,61 @@ export async function updateEnterpriseAccess(userUploadEnabled: boolean): Promis
   });
   if (!res.ok) throw await responseError(res, 'Access policy update failed');
   return res.json();
+}
+
+export async function fetchEnterpriseModelConfiguration(): Promise<EnterpriseModelConfiguration> {
+  const res = await fetch(`${BASE}/api/enterprise/model-configuration`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Model configuration request failed');
+  return res.json();
+}
+
+export async function updateEnterpriseModelConfiguration(input: EnterpriseModelConfigurationUpdate): Promise<EnterpriseModelConfiguration> {
+  const res = await fetch(`${BASE}/api/enterprise/model-configuration`, {
+    method: 'PUT',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await responseError(res, 'Model configuration update failed');
+  return res.json();
+}
+
+export async function fetchEnterpriseModelProfiles(): Promise<EnterpriseModelProfiles> {
+  const res = await fetch(`${BASE}/api/enterprise/model-configurations`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Model profiles request failed');
+  return res.json();
+}
+
+export async function createEnterpriseModelProfile(name: string): Promise<EnterpriseModelProfile> {
+  const res = await fetch(`${BASE}/api/enterprise/model-configurations`, {
+    method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw await responseError(res, 'Model profile create failed');
+  return res.json();
+}
+
+export async function updateEnterpriseModelProfile(profileId: string, input: EnterpriseModelProfileUpdate): Promise<EnterpriseModelProfile> {
+  const res = await fetch(`${BASE}/api/enterprise/model-configurations/${encodeURIComponent(profileId)}`, {
+    method: 'PUT', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+  });
+  if (!res.ok) throw await responseError(res, 'Model profile update failed');
+  return res.json();
+}
+
+export async function copyEnterpriseModelProfile(profileId: string): Promise<EnterpriseModelProfile> {
+  const res = await fetch(`${BASE}/api/enterprise/model-configurations/${encodeURIComponent(profileId)}/copy`, { method: 'POST', headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Model profile copy failed');
+  return res.json();
+}
+
+export async function activateEnterpriseModelProfile(profileId: string): Promise<EnterpriseModelProfile> {
+  const res = await fetch(`${BASE}/api/enterprise/model-configurations/${encodeURIComponent(profileId)}/activate`, { method: 'POST', headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Model profile activation failed');
+  return res.json();
+}
+
+export async function deleteEnterpriseModelProfile(profileId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/model-configurations/${encodeURIComponent(profileId)}`, { method: 'DELETE', headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Model profile delete failed');
 }
 
 export async function setupEnterpriseAdmin(input: { username: string; display_name: string; password: string }): Promise<EnterpriseUser> {
@@ -566,6 +830,61 @@ export interface EnterpriseAskResponse {
   evidence_only: boolean;
 }
 
+export type EnterpriseQueryStatus = 'RUNNING' | 'WAITING_USER' | 'ANSWERED' | 'INSUFFICIENT' | 'FAILED';
+
+export interface EnterpriseQueryResponse {
+  session_id: string;
+  status: EnterpriseQueryStatus;
+  answer: string;
+  evidence_only: boolean;
+  clarification_question: string;
+  choices: string[];
+  citations: EnterpriseAskCitation[];
+}
+
+export interface EnterpriseQuerySessionSummary {
+  session_id: string;
+  question: string;
+  status: EnterpriseQueryStatus;
+  answer: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export type EnterpriseQueryPackageStatus = 'AVAILABLE' | 'DELETED' | 'MISSING';
+
+export interface EnterpriseQueryPackage {
+  package_id: string;
+  status: EnterpriseQueryPackageStatus;
+  download_url?: string;
+  expires_at?: string;
+  created_at: string;
+}
+
+export interface EnterpriseQueryHistoryRecord {
+  session_id: string;
+  name: string;
+  question: string;
+  status: EnterpriseQueryStatus;
+  answer: string;
+  evidence_only: boolean;
+  citation_count: number;
+  group_id?: string;
+  group_name?: string;
+  created_at: string;
+  updated_at: string;
+  latest_package?: EnterpriseQueryPackage;
+}
+
+export interface EnterpriseQueryGroup {
+  group_id: string;
+  name: string;
+  records: EnterpriseQueryHistoryRecord[];
+  created_at: string;
+  updated_at: string;
+  latest_package?: EnterpriseQueryPackage;
+}
+
 export async function fetchEnterpriseFacets(): Promise<EnterpriseFacets> {
   const res = await fetch(`${BASE}/api/enterprise/facets`, { headers: authHeaders() });
   if (!res.ok) throw await responseError(res, 'Metadata facets failed');
@@ -631,6 +950,98 @@ export async function askEnterpriseKnowledge(question: string, filters: Enterpri
   const res = await fetch(`${BASE}/api/enterprise/ask`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ question, filters, limit }) });
   if (!res.ok) throw await responseError(res, 'Enterprise Ask failed');
   return res.json();
+}
+
+export async function queryEnterpriseKnowledge(question: string, filters: EnterpriseSearchFilters = {}, limit = 8): Promise<EnterpriseQueryResponse> {
+  const res = await fetch(`${BASE}/api/enterprise/query`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ question, filters, limit }) });
+  if (!res.ok) throw await responseError(res, 'Enterprise knowledge query failed');
+  return res.json();
+}
+
+export async function continueEnterpriseQuery(sessionId: string, clarification: string, limit = 8): Promise<EnterpriseQueryResponse> {
+  const res = await fetch(`${BASE}/api/enterprise/query/continue`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId, clarification, limit }) });
+  if (!res.ok) throw await responseError(res, 'Enterprise query continuation failed');
+  return res.json();
+}
+
+export async function fetchEnterpriseQuerySession(sessionId: string): Promise<EnterpriseQueryResponse> {
+  const res = await fetch(`${BASE}/api/enterprise/query/session?id=${encodeURIComponent(sessionId)}`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Enterprise query session failed');
+  return res.json();
+}
+
+export async function fetchEnterpriseQuerySessions(limit = 20): Promise<{ sessions: EnterpriseQuerySessionSummary[]; total: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/query/sessions?limit=${encodeURIComponent(String(limit))}`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Enterprise query history failed');
+  return res.json();
+}
+
+export async function fetchEnterpriseQueryHistory(limit = 100): Promise<{ records: EnterpriseQueryHistoryRecord[]; total: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/query/history?limit=${encodeURIComponent(String(limit))}`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Query record list failed');
+  return res.json();
+}
+
+export async function renameEnterpriseQueryRecord(sessionId: string, name: string): Promise<EnterpriseQueryHistoryRecord> {
+  const res = await fetch(`${BASE}/api/enterprise/query/history/record?id=${encodeURIComponent(sessionId)}`, { method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+  if (!res.ok) throw await responseError(res, 'Query record rename failed');
+  return res.json();
+}
+
+export async function moveEnterpriseQueryRecord(sessionId: string, groupId?: string): Promise<EnterpriseQueryHistoryRecord> {
+  const res = await fetch(`${BASE}/api/enterprise/query/history/record/group?id=${encodeURIComponent(sessionId)}`, { method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ group_id: groupId || null }) });
+  if (!res.ok) throw await responseError(res, 'Query record group update failed');
+  return res.json();
+}
+
+export async function deleteEnterpriseQueryRecord(sessionId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/query/history/record?id=${encodeURIComponent(sessionId)}`, { method: 'DELETE', headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Query record delete failed');
+}
+
+export async function packageEnterpriseQueryRecord(sessionId: string, regenerate = false): Promise<EnterpriseQueryPackage> {
+  const res = await fetch(`${BASE}/api/enterprise/query/history/record/package`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId, regenerate }) });
+  if (!res.ok) throw await responseError(res, 'Query record package failed');
+  return res.json();
+}
+
+export async function fetchEnterpriseQueryGroups(): Promise<{ groups: EnterpriseQueryGroup[]; total: number }> {
+  const res = await fetch(`${BASE}/api/enterprise/query/groups`, { headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Query group list failed');
+  return res.json();
+}
+
+export async function createEnterpriseQueryGroup(name: string, sessionIds: string[]): Promise<EnterpriseQueryGroup> {
+  const res = await fetch(`${BASE}/api/enterprise/query/groups`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ name, session_ids: sessionIds }) });
+  if (!res.ok) throw await responseError(res, 'Query group creation failed');
+  return res.json();
+}
+
+export async function renameEnterpriseQueryGroup(groupId: string, name: string): Promise<EnterpriseQueryGroup> {
+  const res = await fetch(`${BASE}/api/enterprise/query/group?id=${encodeURIComponent(groupId)}`, { method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+  if (!res.ok) throw await responseError(res, 'Query group rename failed');
+  return res.json();
+}
+
+export async function dissolveEnterpriseQueryGroup(groupId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/query/group/dissolve`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ group_id: groupId }) });
+  if (!res.ok) throw await responseError(res, 'Query group dissolve failed');
+}
+
+export async function deleteEnterpriseQueryGroup(groupId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/query/group?id=${encodeURIComponent(groupId)}`, { method: 'DELETE', headers: authHeaders() });
+  if (!res.ok) throw await responseError(res, 'Query group delete failed');
+}
+
+export async function packageEnterpriseQueryGroup(groupId: string, regenerate = false): Promise<EnterpriseQueryPackage> {
+  const res = await fetch(`${BASE}/api/enterprise/query/group/package`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ group_id: groupId, regenerate }) });
+  if (!res.ok) throw await responseError(res, 'Query group package failed');
+  return res.json();
+}
+
+export async function submitEnterpriseQueryFeedback(sessionId: string, rating: 'POSITIVE' | 'NEGATIVE' | 'NEUTRAL', category = '', comment = ''): Promise<void> {
+  const res = await fetch(`${BASE}/api/enterprise/query/feedback`, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId, rating, category, comment }) });
+  if (!res.ok) throw await responseError(res, 'Enterprise query feedback failed');
 }
 
 function pageQuery(params: object): string {

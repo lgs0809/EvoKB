@@ -2,6 +2,7 @@ package cn.lgs.knowledgebase.application.compilation;
 
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.CompilationRepository;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.EntityResolution;
+import cn.lgs.knowledgebase.application.compilation.CompilationContracts.GraphRelationRejection;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryFact;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryRecord;
 import cn.lgs.knowledgebase.application.port.Ports.GraphStore;
@@ -80,7 +81,11 @@ public final class GraphCompilationService {
             "Extract a strict enterprise knowledge graph from grounded summary facts. Return structured data only. "
                 + "Every relation must cite exact supporting fact IDs. Use only allowed entity/relation types. "
                 + "Emit one fact_decision for every input fact. Eligible facts must be cited by at least one relation; "
-                + "non-eligible facts require skip_reason. Business valid_from/valid_to must remain empty unless explicitly stated.",
+                + "non-eligible facts require skip_reason. Business valid_from/valid_to must remain empty unless explicitly stated. "
+                + "Set entities to an empty array; relation endpoints are carried by source_name/source_type and "
+                + "target_name/target_type. Copy every fact id exactly as shown between <fact id=...> tags; never invent, "
+                + "truncate, normalize, or substitute an id. fact_decisions must contain each input fact id exactly once, "
+                + "and relations may cite only those exact ids.",
             "Entity types:\n- "
                 + String.join("\n- ", ENTITY_TYPES.stream().sorted().toList())
                 + "\nRelation types:\n- "
@@ -90,6 +95,7 @@ public final class GraphCompilationService {
             Extraction.class);
 
     Validation validation = validateExtraction(facts, extraction);
+    repository.replaceGraphRejections(source.id(), validation.rejectedRelations());
     if (!validation.coverage().pass()) {
       throw new IllegalStateException(
           "graph coverage failed: uncovered eligible facts: "
@@ -174,6 +180,7 @@ public final class GraphCompilationService {
         List.copyOf(entities),
         List.copyOf(relations),
         validation.coverage(),
+        validation.rejectedRelations(),
         model.identity(ModelRole.LARGE));
   }
 
@@ -247,31 +254,25 @@ public final class GraphCompilationService {
 
     Set<String> covered = new LinkedHashSet<>();
     List<ProposedRelation> valid = new ArrayList<>();
+    List<GraphRelationRejection> rejected = new ArrayList<>();
+    int candidateIndex = 0;
     for (ProposedRelation raw : safe(extraction.relations())) {
-      ProposedRelation relation = normalize(raw);
-      validateRelation(relation);
+      candidateIndex++;
+      ProposedRelation relation;
+      try {
+        relation = normalize(raw);
+      } catch (RuntimeException invalid) {
+        rejected.add(rejected(candidateIndex, raw, invalid.getMessage()));
+        continue;
+      }
+      String rejectionReason = relationRejectionReason(relation, facts, decisions);
+      if (rejectionReason != null) {
+        rejected.add(rejected(candidateIndex, relation, rejectionReason));
+        continue;
+      }
       LinkedHashSet<String> uniqueFacts = new LinkedHashSet<>();
       for (String factId : relation.supportingFactIds()) {
         String id = trim(factId);
-        SummaryFact fact = facts.get(id);
-        if (fact == null)
-          throw new IllegalStateException(
-              "graph relation " + relation.relationType() + " references unknown fact " + id);
-        FactDecision decision = decisions.get(id);
-        if (!decision.graphEligible())
-          throw new IllegalStateException(
-              "graph relation "
-                  + relation.relationType()
-                  + " cites fact "
-                  + id
-                  + " marked non-eligible");
-        if (fact.evidenceIds().isEmpty())
-          throw new IllegalStateException(
-              "graph relation "
-                  + relation.relationType()
-                  + " cites fact "
-                  + id
-                  + " without raw evidence");
         if (uniqueFacts.add(id)) covered.add(id);
       }
       valid.add(relation);
@@ -289,7 +290,60 @@ public final class GraphCompilationService {
     return new Validation(
         new CoverageResult(
             missing.isEmpty(), eligible, eligible - missing.size(), skipped, List.copyOf(missing)),
-        List.copyOf(valid));
+        List.copyOf(valid),
+        List.copyOf(rejected));
+  }
+
+  private static String relationRejectionReason(
+      ProposedRelation relation,
+      Map<String, SummaryFact> facts,
+      Map<String, FactDecision> decisions) {
+    try {
+      validateRelation(relation);
+    } catch (RuntimeException invalid) {
+      return trim(invalid.getMessage()).isEmpty() ? "invalid relation" : invalid.getMessage();
+    }
+    for (String factId : relation.supportingFactIds()) {
+      String id = trim(factId);
+      SummaryFact fact = facts.get(id);
+      if (fact == null)
+        return "graph relation " + relation.relationType() + " references unknown fact " + id;
+      FactDecision decision = decisions.get(id);
+      if (decision == null)
+        return "graph relation " + relation.relationType() + " has no fact decision for " + id;
+      if (!decision.graphEligible())
+        return "graph relation "
+            + relation.relationType()
+            + " cites fact "
+            + id
+            + " marked non-eligible";
+      if (fact.evidenceIds().isEmpty())
+        return "graph relation "
+            + relation.relationType()
+            + " cites fact "
+            + id
+            + " without raw evidence";
+    }
+    return null;
+  }
+
+  private static GraphRelationRejection rejected(
+      int candidateIndex, ProposedRelation relation, String reason) {
+    ProposedRelation candidate = relation;
+    if (candidate == null) {
+      candidate = new ProposedRelation("", "", "", "", "", List.of(), "", "", 0);
+    }
+    return new GraphRelationRejection(
+        candidateIndex,
+        trim(candidate.sourceName()),
+        normalizeType(candidate.sourceType()),
+        normalizeType(candidate.relationType()),
+        trim(candidate.targetName()),
+        normalizeType(candidate.targetType()),
+        candidate.supportingFactIds() == null
+            ? List.of()
+            : List.copyOf(candidate.supportingFactIds()),
+        trim(reason).isEmpty() ? "invalid relation" : trim(reason));
   }
 
   private static void validateRelation(ProposedRelation relation) {
@@ -484,7 +538,10 @@ public final class GraphCompilationService {
 
   private record RelationRule(Set<String> sourceTypes, Set<String> targetTypes) {}
 
-  private record Validation(CoverageResult coverage, List<ProposedRelation> relations) {}
+  private record Validation(
+      CoverageResult coverage,
+      List<ProposedRelation> relations,
+      List<GraphRelationRejection> rejectedRelations) {}
 
   public record ProposedEntity(String name, String type) {}
 
@@ -518,5 +575,12 @@ public final class GraphCompilationService {
       List<Entity> entities,
       List<Relation> relations,
       CoverageResult coverage,
-      String extractor) {}
+      List<GraphRelationRejection> rejectedRelations,
+      String extractor) {
+    public CompileResult {
+      entities = entities == null ? List.of() : List.copyOf(entities);
+      relations = relations == null ? List.of() : List.copyOf(relations);
+      rejectedRelations = rejectedRelations == null ? List.of() : List.copyOf(rejectedRelations);
+    }
+  }
 }

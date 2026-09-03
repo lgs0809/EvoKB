@@ -74,9 +74,33 @@ final class HttpViews {
         evidence.documentId(),
         evidence.versionId(),
         evidence.objectKey(),
+        sourceFilename(evidence.objectKey()),
         evidence.location(),
-        evidence.content(),
+        originalEvidenceContent(evidence),
         evidence.hash());
+  }
+
+  private static String originalEvidenceContent(Evidence evidence) {
+    String content = evidence.content() == null ? "" : evidence.content().trim();
+    Object rawHeadings = evidence.location().get("heading_path");
+    if (!(rawHeadings instanceof java.util.List<?> headings) || headings.isEmpty()) return content;
+    String remaining = content;
+    for (Object value : headings) {
+      String heading = value == null ? "" : value.toString().trim();
+      if (heading.isBlank()) continue;
+      if (remaining.equals(heading)) return "";
+      String prefix = heading + "\n";
+      if (remaining.startsWith(prefix))
+        remaining = remaining.substring(prefix.length()).stripLeading();
+    }
+    return remaining;
+  }
+
+  private static String sourceFilename(String objectKey) {
+    if (objectKey == null || objectKey.isBlank()) return "";
+    String normalized = objectKey.replace('\\', '/');
+    int slash = normalized.lastIndexOf('/');
+    return slash >= 0 ? normalized.substring(slash + 1) : normalized;
   }
 
   private static int count(Batch batch, FileStatus status) {
@@ -92,6 +116,7 @@ final class HttpViews {
       String documentId,
       String versionId,
       String objectKey,
+      String sourceFilename,
       java.util.Map<String, Object> rawLocation,
       String rawContent,
       String contentHash) {}

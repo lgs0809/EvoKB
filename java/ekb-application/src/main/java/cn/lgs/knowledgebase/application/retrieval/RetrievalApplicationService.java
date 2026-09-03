@@ -3,6 +3,7 @@ package cn.lgs.knowledgebase.application.retrieval;
 import cn.lgs.knowledgebase.application.port.Ports.EvidenceResolver;
 import cn.lgs.knowledgebase.application.port.Ports.RerankerPort;
 import cn.lgs.knowledgebase.application.port.Ports.RetrievalLane;
+import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.SearchFilters;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Candidate;
@@ -18,6 +19,9 @@ import java.util.Set;
 import java.util.UUID;
 
 public final class RetrievalApplicationService {
+  private static final System.Logger LOGGER =
+      System.getLogger(RetrievalApplicationService.class.getName());
+
   private final Map<LaneType, RetrievalLane> lanes;
   private final RerankerPort reranker;
   private final EvidenceResolver resolver;
@@ -49,7 +53,20 @@ public final class RetrievalApplicationService {
     for (LaneType laneType : LaneType.values()) {
       RetrievalLane lane = lanes.get(laneType);
       if (lane == null) continue;
-      for (Candidate candidate : lane.search(query.trim(), filters, quotas.forLane(laneType))) {
+      List<Candidate> candidates;
+      try {
+        candidates = lane.search(query.trim(), filters, quotas.forLane(laneType));
+      } catch (RuntimeException unavailable) {
+        if (laneType == LaneType.RAW) throw unavailable;
+        LOGGER.log(
+            System.Logger.Level.WARNING,
+            "retrieval lane {0} unavailable; continuing without it: {1}",
+            laneType,
+            unavailable.getMessage());
+        continue;
+      }
+      if (candidates == null) continue;
+      for (Candidate candidate : candidates) {
         if (candidate.knowledge() == null || candidate.knowledge().isBlank()) continue;
         String key = candidate.lane() + "\u0000" + candidate.id();
         if (seen.add(key)) merged.add(candidate);
@@ -58,7 +75,11 @@ public final class RetrievalApplicationService {
     String searchId = UUID.randomUUID().toString();
     if (merged.isEmpty()) return new SearchResponse(searchId, List.of());
 
-    List<Candidate> pool = RetrievalDomain.balancedRerankPool(merged, maxRerankCandidates);
+    int resultScaledRerankLimit =
+        limit > Integer.MAX_VALUE / 2 ? Integer.MAX_VALUE : Math.max(limit, limit * 2);
+    List<Candidate> pool =
+        RetrievalDomain.balancedRerankPool(
+            merged, Math.min(maxRerankCandidates, resultScaledRerankLimit));
     List<String> documents =
         pool.stream().map(c -> bounded(c.knowledge(), maxRerankChars)).toList();
     List<Candidate> reranked;
@@ -90,6 +111,7 @@ public final class RetrievalApplicationService {
           candidate.evidenceIds().stream()
               .map(evidenceById::get)
               .filter(java.util.Objects::nonNull)
+              .filter(RetrievalApplicationService::substantiveEvidence)
               .toList();
       if (evidence.isEmpty()) continue;
       results.add(new Result(candidate, evidence));
@@ -98,6 +120,21 @@ public final class RetrievalApplicationService {
   }
 
   public record SearchResponse(String searchId, List<Result> results) {}
+
+  private static boolean substantiveEvidence(Evidence evidence) {
+    Object blockType = evidence.location().get("block_type");
+    String type =
+        blockType == null ? "" : blockType.toString().trim().toLowerCase(java.util.Locale.ROOT);
+    if (Set.of("header", "footer", "page_number").contains(type)) return false;
+    Object headingPath = evidence.location().get("heading_path");
+    if (headingPath instanceof List<?> headings && !headings.isEmpty()) {
+      String last =
+          String.valueOf(headings.get(headings.size() - 1)).trim().replaceAll("\\s+", " ");
+      String content = evidence.content().trim().replaceAll("\\s+", " ");
+      if (!last.isEmpty() && content.equals(last)) return false;
+    }
+    return true;
+  }
 
   private static String bounded(String value, int maxChars) {
     if (value.length() <= maxChars) return value;

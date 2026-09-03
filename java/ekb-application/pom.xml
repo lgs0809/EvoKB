@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
-  <parent><groupId>cn.lgs.knowledgebase</groupId><artifactId>enterprise-knowledge-base</artifactId><version>0.1.0-SNAPSHOT</version></parent>
+  <parent><groupId>cn.lgs.knowledgebase</groupId><artifactId>evokb</artifactId><version>0.1.0-SNAPSHOT</version></parent>
   <artifactId>ekb-application</artifactId>
   <dependencies>
     <dependency><groupId>cn.lgs.knowledgebase</groupId><artifactId>ekb-domain</artifactId><version>${project.version}</version></dependency>

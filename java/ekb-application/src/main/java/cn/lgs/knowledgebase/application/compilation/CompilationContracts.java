@@ -78,6 +78,24 @@ public final class CompilationContracts {
     }
   }
 
+  public record ConceptRecord(
+      String id,
+      String summaryId,
+      String versionId,
+      String preferredLabel,
+      List<String> aliases,
+      String conceptTypeHint,
+      String description,
+      List<String> factIds,
+      String lifecycle,
+      String model,
+      Instant createdAt) {
+    public ConceptRecord {
+      aliases = aliases == null ? List.of() : List.copyOf(aliases);
+      factIds = factIds == null ? List.of() : List.copyOf(factIds);
+    }
+  }
+
   public record EntityResolution(
       String sourceEntityId,
       String versionId,
@@ -87,6 +105,20 @@ public final class CompilationContracts {
       String canonicalEntityId,
       double confidence,
       String decidedBy) {}
+
+  public record GraphRelationRejection(
+      int candidateIndex,
+      String sourceName,
+      String sourceType,
+      String relationType,
+      String targetName,
+      String targetType,
+      List<String> supportingFactIds,
+      String reason) {
+    public GraphRelationRejection {
+      supportingFactIds = supportingFactIds == null ? List.of() : List.copyOf(supportingFactIds);
+    }
+  }
 
   public record WikiClaim(
       String id,
@@ -130,13 +162,34 @@ public final class CompilationContracts {
 
     void replaceDocumentUnits(String versionId, List<DocumentUnit> units);
 
+    /**
+     * Return the units currently persisted for a version. Implementations may return an empty list
+     * when the repository does not expose persisted unit metadata (for example, lightweight test
+     * fakes); callers must then retain their deterministic proposals.
+     */
+    default List<DocumentUnit> loadDocumentUnits(String versionId) {
+      return List.of();
+    }
+
     void saveSummary(SummaryRecord summary);
 
     Optional<SummaryRecord> findSummary(String summaryId);
 
     List<SummaryRecord> loadSummaries(List<String> summaryIds);
 
+    List<SummaryRecord> loadActiveSummariesForVersion(String versionId);
+
+    List<SummaryRecord> loadActiveSummariesForCompany(String company);
+
+    void replaceConceptsForSummary(String summaryId, List<ConceptRecord> concepts);
+
+    List<ConceptRecord> loadActiveConceptsForSummary(String summaryId);
+
+    List<ConceptRecord> loadActiveConceptsForVersion(String versionId);
+
     Entity resolveEntity(String name, String entityType);
+
+    void replaceGraphRejections(String summaryId, List<GraphRelationRejection> rejections);
 
     void saveGraph(
         String summaryId,

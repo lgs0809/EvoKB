@@ -1,8 +1,10 @@
 package cn.lgs.knowledgebase.infrastructure.persistence;
 
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.CompilationRepository;
+import cn.lgs.knowledgebase.application.compilation.CompilationContracts.ConceptRecord;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.DocumentUnit;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.EntityResolution;
+import cn.lgs.knowledgebase.application.compilation.CompilationContracts.GraphRelationRejection;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryFact;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryRecord;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.VersionSource;
@@ -118,11 +120,25 @@ public final class JdbcCompilationRepository implements CompilationRepository {
   public void replaceDocumentUnits(String versionId, List<DocumentUnit> units) {
     transactions.executeWithoutResult(
         status -> {
+          // Keep the durable unit primary key stable when a later classification changes its
+          // descriptive fields or boundaries. The database enforces (version_id, unit_no) as a
+          // unique key, and MySQL's ON DUPLICATE KEY UPDATE retains the existing unit_id. Resolve
+          // that key before writing so the cleanup below never deletes a just-updated parent (and
+          // so summaries keep pointing at the same unit after a retry).
+          Map<Integer, String> existingIds = new LinkedHashMap<>();
+          for (Map<String, Object> row :
+              jdbc.queryForList(
+                  "SELECT unit_no,unit_id FROM document_unit WHERE version_id=?", versionId)) {
+            existingIds.put(((Number) row.get("unit_no")).intValue(), (String) row.get("unit_id"));
+          }
+          List<Integer> unitNumbers = new ArrayList<>();
           for (DocumentUnit unit : units) {
+            String unitId = existingIds.getOrDefault(unit.unitNo(), unit.id());
+            unitNumbers.add(unit.unitNo());
             jdbc.update(
                 "INSERT INTO document_unit(unit_id,version_id,unit_no,title,structure_type,document_type,boundary_json) VALUES(?,?,?,?,?,?,?) "
                     + "ON DUPLICATE KEY UPDATE title=VALUES(title),structure_type=VALUES(structure_type),document_type=VALUES(document_type),boundary_json=VALUES(boundary_json)",
-                unit.id(),
+                unitId,
                 unit.versionId(),
                 unit.unitNo(),
                 nullable(unit.title()),
@@ -132,18 +148,42 @@ public final class JdbcCompilationRepository implements CompilationRepository {
                     Map.of(
                         "start_block_no", unit.startBlockNo(), "end_block_no", unit.endBlockNo())));
           }
-          List<String> ids = units.stream().map(DocumentUnit::id).toList();
-          if (ids.isEmpty()) return;
-          String placeholders = String.join(",", Collections.nCopies(ids.size(), "?"));
+          if (unitNumbers.isEmpty()) {
+            jdbc.update(
+                "DELETE FROM document_unit WHERE version_id=? AND unit_id NOT IN (SELECT unit_id FROM summary)",
+                versionId);
+            return;
+          }
+          String placeholders = String.join(",", Collections.nCopies(unitNumbers.size(), "?"));
           List<Object> args = new ArrayList<>();
           args.add(versionId);
-          args.addAll(ids);
+          args.addAll(unitNumbers);
           jdbc.update(
-              "DELETE FROM document_unit WHERE version_id=? AND unit_id NOT IN ("
+              "DELETE FROM document_unit WHERE version_id=? AND unit_no NOT IN ("
                   + placeholders
                   + ") AND unit_id NOT IN (SELECT unit_id FROM summary)",
               args.toArray());
         });
+  }
+
+  @Override
+  public List<DocumentUnit> loadDocumentUnits(String versionId) {
+    return jdbc.query(
+        "SELECT unit_id,version_id,unit_no,COALESCE(title,''),structure_type,COALESCE(document_type,''),"
+            + "CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(boundary_json,'$.start_block_no')),'0') AS UNSIGNED),"
+            + "CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(boundary_json,'$.end_block_no')),'0') AS UNSIGNED) "
+            + "FROM document_unit WHERE version_id=? ORDER BY unit_no",
+        (rs, rowNum) ->
+            new DocumentUnit(
+                rs.getString(1),
+                rs.getString(2),
+                rs.getInt(3),
+                rs.getString(4),
+                rs.getString(5),
+                rs.getString(6),
+                rs.getInt(7),
+                rs.getInt(8)),
+        versionId);
   }
 
   @Override
@@ -195,6 +235,138 @@ public final class JdbcCompilationRepository implements CompilationRepository {
   @Override
   public List<SummaryRecord> loadSummaries(List<String> summaryIds) {
     return readSummaries(unique(summaryIds));
+  }
+
+  @Override
+  public List<SummaryRecord> loadActiveSummariesForVersion(String versionId) {
+    List<String> ids =
+        jdbc.query(
+            "SELECT summary_id FROM summary WHERE version_id=? AND lifecycle='ACTIVE' AND grounding_status='PASS' AND coverage_status='PASS' ORDER BY created_at,summary_id",
+            (rs, rowNum) -> rs.getString(1),
+            versionId);
+    return readSummaries(ids);
+  }
+
+  @Override
+  public List<SummaryRecord> loadActiveSummariesForCompany(String company) {
+    String subject = requireText(company, "company");
+    List<String> ids =
+        jdbc.query(
+            "SELECT s.summary_id FROM summary s "
+                + "JOIN document_version v ON v.version_id=s.version_id "
+                + "JOIN document d ON d.document_id=v.document_id "
+                + "JOIN document_metadata m ON m.version_id=v.version_id "
+                + "WHERE d.status='ACTIVE' AND v.lifecycle='ACTIVE' "
+                + "AND s.lifecycle='ACTIVE' AND s.grounding_status='PASS' AND s.coverage_status='PASS' "
+                + "AND m.company=? ORDER BY s.created_at,s.summary_id",
+            (rs, rowNum) -> rs.getString(1),
+            subject);
+    return readSummaries(ids);
+  }
+
+  @Override
+  public void replaceConceptsForSummary(String summaryId, List<ConceptRecord> concepts) {
+    transactions.executeWithoutResult(
+        status -> {
+          jdbc.update(
+              "UPDATE concept_candidate SET lifecycle='STALE' WHERE summary_id=? AND lifecycle='ACTIVE'",
+              summaryId);
+          for (ConceptRecord concept : concepts == null ? List.<ConceptRecord>of() : concepts) {
+            jdbc.update(
+                "INSERT INTO concept_candidate(concept_id,summary_id,version_id,preferred_label,concept_type_hint,description,lifecycle,model) VALUES(?,?,?,?,?,?,?,?) "
+                    + "ON DUPLICATE KEY UPDATE preferred_label=VALUES(preferred_label),concept_type_hint=VALUES(concept_type_hint),description=VALUES(description),lifecycle=VALUES(lifecycle),model=VALUES(model),updated_at=CURRENT_TIMESTAMP(6)",
+                concept.id(),
+                concept.summaryId(),
+                concept.versionId(),
+                concept.preferredLabel(),
+                concept.conceptTypeHint(),
+                nullable(concept.description()),
+                concept.lifecycle(),
+                nullable(concept.model()));
+            jdbc.update("DELETE FROM concept_alias WHERE concept_id=?", concept.id());
+            for (String alias : unique(concept.aliases())) {
+              String normalized =
+                  cn.lgs.knowledgebase.application.compilation.GraphCompilationService.canonicalKey(
+                      alias);
+              if (normalized.isBlank()) continue;
+              String aliasKey =
+                  cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.sha256(normalized);
+              String aliasId =
+                  cn.lgs.knowledgebase.application.compilation.GraphCompilationService.stableId(
+                      "concept-alias", concept.id(), aliasKey);
+              jdbc.update(
+                  "INSERT INTO concept_alias(alias_id,concept_id,alias_text,alias_key) VALUES(?,?,?,?)",
+                  aliasId,
+                  concept.id(),
+                  alias,
+                  aliasKey);
+            }
+            jdbc.update("DELETE FROM concept_fact_support WHERE concept_id=?", concept.id());
+            for (String factId : unique(concept.factIds())) {
+              jdbc.update(
+                  "INSERT INTO concept_fact_support(concept_id,fact_id) VALUES(?,?)",
+                  concept.id(),
+                  factId);
+            }
+          }
+        });
+  }
+
+  @Override
+  public List<ConceptRecord> loadActiveConceptsForSummary(String summaryId) {
+    return readConcepts("summary_id=?", summaryId);
+  }
+
+  @Override
+  public List<ConceptRecord> loadActiveConceptsForVersion(String versionId) {
+    return readConcepts("version_id=?", versionId);
+  }
+
+  private List<ConceptRecord> readConcepts(String selector, String value) {
+    List<ConceptHeader> headers =
+        jdbc.query(
+            "SELECT concept_id,summary_id,version_id,preferred_label,concept_type_hint,COALESCE(description,''),COALESCE(model,''),created_at "
+                + "FROM concept_candidate WHERE "
+                + selector
+                + " AND lifecycle='ACTIVE' ORDER BY created_at,concept_id",
+            (rs, rowNum) ->
+                new ConceptHeader(
+                    rs.getString(1),
+                    rs.getString(2),
+                    rs.getString(3),
+                    rs.getString(4),
+                    rs.getString(5),
+                    rs.getString(6),
+                    rs.getString(7),
+                    instant(rs.getTimestamp(8))),
+            value);
+    List<ConceptRecord> concepts = new ArrayList<>(headers.size());
+    for (ConceptHeader header : headers) {
+      List<String> aliases =
+          jdbc.query(
+              "SELECT alias_text FROM concept_alias WHERE concept_id=? ORDER BY alias_text",
+              (rs, rowNum) -> rs.getString(1),
+              header.id());
+      List<String> factIds =
+          jdbc.query(
+              "SELECT fact_id FROM concept_fact_support WHERE concept_id=? ORDER BY fact_id",
+              (rs, rowNum) -> rs.getString(1),
+              header.id());
+      concepts.add(
+          new ConceptRecord(
+              header.id(),
+              header.summaryId(),
+              header.versionId(),
+              header.preferredLabel(),
+              aliases,
+              header.conceptTypeHint(),
+              header.description(),
+              factIds,
+              "ACTIVE",
+              header.model(),
+              header.createdAt()));
+    }
+    return List.copyOf(concepts);
   }
 
   private List<SummaryRecord> readSummaries(List<String> ids) {
@@ -314,6 +486,33 @@ public final class JdbcCompilationRepository implements CompilationRepository {
         .stream()
         .findFirst()
         .orElseThrow(() -> new IllegalStateException("canonical entity resolve failed"));
+  }
+
+  @Override
+  public void replaceGraphRejections(String summaryId, List<GraphRelationRejection> rejections) {
+    String id = requireText(summaryId, "summary id");
+    List<GraphRelationRejection> rows = rejections == null ? List.of() : List.copyOf(rejections);
+    transactions.executeWithoutResult(
+        status -> {
+          jdbc.update("DELETE FROM graph_relation_rejection WHERE summary_id=?", id);
+          for (GraphRelationRejection rejection : rows) {
+            String rejectionId =
+                cn.lgs.knowledgebase.application.compilation.GraphCompilationService.stableId(
+                    "graph_rejection", id, Integer.toString(rejection.candidateIndex()));
+            jdbc.update(
+                "INSERT INTO graph_relation_rejection(rejection_id,summary_id,candidate_index,source_name,source_type,relation_type,target_name,target_type,supporting_fact_ids,reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                rejectionId,
+                id,
+                rejection.candidateIndex(),
+                nullable(rejection.sourceName()),
+                nullable(rejection.sourceType()),
+                nullable(rejection.relationType()),
+                nullable(rejection.targetName()),
+                nullable(rejection.targetType()),
+                json(rejection.supportingFactIds()),
+                rejection.reason());
+          }
+        });
   }
 
   @Override
@@ -582,6 +781,12 @@ public final class JdbcCompilationRepository implements CompilationRepository {
     return value == null || value.isBlank() ? null : value.trim();
   }
 
+  private static String requireText(String value, String name) {
+    String text = nullable(value);
+    if (text == null) throw new IllegalArgumentException(name + " is required");
+    return text;
+  }
+
   private static <T> List<T> unique(List<T> values) {
     return values == null ? List.of() : new ArrayList<>(new LinkedHashSet<>(values));
   }
@@ -607,6 +812,17 @@ public final class JdbcCompilationRepository implements CompilationRepository {
       String grounding,
       String coverage,
       String lifecycle,
+      String model,
+      Instant createdAt) {}
+
+  private record ConceptHeader(
+      // Header projection keeps Concept fan-out queries independent from Summary materialization.
+      String id,
+      String summaryId,
+      String versionId,
+      String preferredLabel,
+      String conceptTypeHint,
+      String description,
       String model,
       Instant createdAt) {}
 

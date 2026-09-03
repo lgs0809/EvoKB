@@ -5,6 +5,7 @@ import cn.lgs.knowledgebase.application.port.Ports.DerivedSearchIndex;
 import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.Claim;
 import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.SummaryArtifact;
 import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.WikiPage;
+import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Metadata;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.SearchFilters;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Candidate;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.LaneType;
@@ -165,6 +166,7 @@ public final class OpenSearchDerivedIndexAdapter implements DerivedSearchIndex {
 
   private List<Candidate> searchBm25(
       String type, LaneType lane, String query, SearchFilters filters, int limit) {
+    if (!client.indexExists(index)) return List.of();
     int effectiveLimit = limit <= 0 ? 20 : limit;
     JsonNode response =
         client.json(
@@ -184,6 +186,7 @@ public final class OpenSearchDerivedIndexAdapter implements DerivedSearchIndex {
 
   private List<Candidate> searchVector(
       String type, LaneType lane, List<Float> vector, SearchFilters filters, int limit) {
+    if (!client.indexExists(index)) return List.of();
     int effectiveLimit = limit <= 0 ? 20 : limit;
     JsonNode response =
         client.json(
@@ -205,6 +208,35 @@ public final class OpenSearchDerivedIndexAdapter implements DerivedSearchIndex {
                             "filter",
                             Map.of("bool", Map.of("filter", filters(type, filters))))))));
     return decode(response, lane);
+  }
+
+  @Override
+  public void updateMetadata(String versionId, Metadata metadata) {
+    if (versionId == null || versionId.isBlank() || metadata == null || !client.indexExists(index))
+      return;
+    Map<String, Object> params = new LinkedHashMap<>();
+    params.put("source_department", singleton(metadata.sourceDepartment()));
+    params.put("material_category", singleton(metadata.materialCategory()));
+    params.put("manual_tags", metadata.manualTags() == null ? List.of() : metadata.manualTags());
+    params.put("company", singleton(metadata.company()));
+    params.put("document_type", singleton(metadata.documentType()));
+    Map<String, Object> script =
+        Map.of(
+            "lang",
+            "painless",
+            "source",
+            "ctx._source.source_department=params.source_department; ctx._source.material_category=params.material_category; ctx._source.manual_tags=params.manual_tags; ctx._source.company=params.company; ctx._source.document_type=params.document_type;",
+            "params",
+            params);
+    List<Object> metadataFilters =
+        List.of(
+            Map.of("term", Map.of("knowledge_type", "SUMMARY")),
+            Map.of("term", Map.of("version_id", versionId)));
+    Map<String, Object> query = Map.of("bool", Map.of("filter", metadataFilters));
+    client.json(
+        "POST",
+        path("/_update_by_query?refresh=true&conflicts=proceed"),
+        Map.of("script", script, "query", query));
   }
 
   @Override
@@ -232,7 +264,6 @@ public final class OpenSearchDerivedIndexAdapter implements DerivedSearchIndex {
     if (filters == null) return clauses;
     addTerm(clauses, "source_department", filters.sourceDepartment());
     addTerm(clauses, "material_category", filters.materialCategory());
-    addTerm(clauses, "company", filters.company());
     addTerm(clauses, "document_type", filters.documentType());
     if (filters.versionIds() != null && !filters.versionIds().isEmpty())
       clauses.add(Map.of("terms", Map.of("version_id", filters.versionIds())));
@@ -285,6 +316,10 @@ public final class OpenSearchDerivedIndexAdapter implements DerivedSearchIndex {
 
   private static void addTerm(List<Object> clauses, String field, String value) {
     if (value != null && !value.isBlank()) clauses.add(Map.of("term", Map.of(field, value)));
+  }
+
+  private static List<String> singleton(String value) {
+    return value == null || value.isBlank() ? List.of() : List.of(value.trim());
   }
 
   private static Map<String, Object> keyword() {

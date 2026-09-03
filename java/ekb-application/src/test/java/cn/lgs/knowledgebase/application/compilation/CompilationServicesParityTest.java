@@ -3,8 +3,10 @@ package cn.lgs.knowledgebase.application.compilation;
 import static org.junit.jupiter.api.Assertions.*;
 
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.CompilationRepository;
+import cn.lgs.knowledgebase.application.compilation.CompilationContracts.ConceptRecord;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.DocumentUnit;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.EntityResolution;
+import cn.lgs.knowledgebase.application.compilation.CompilationContracts.GraphRelationRejection;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryRecord;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.VersionSource;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.WikiRecord;
@@ -217,6 +219,7 @@ class CompilationServicesParityTest {
   private static final class InMemoryRepository implements CompilationRepository {
     VersionSource source;
     final Map<String, SummaryRecord> summaries = new LinkedHashMap<>();
+    final Map<String, List<ConceptRecord>> conceptsBySummary = new LinkedHashMap<>();
     final Map<String, WikiRecord> wikis = new LinkedHashMap<>();
     final Map<String, Entity> entities = new LinkedHashMap<>();
     List<DocumentUnit> units = List.of();
@@ -247,6 +250,43 @@ class CompilationServicesParityTest {
     public List<SummaryRecord> loadSummaries(List<String> summaryIds) {
       return summaryIds.stream().map(summaries::get).filter(java.util.Objects::nonNull).toList();
     }
+
+    @Override
+    public List<SummaryRecord> loadActiveSummariesForVersion(String versionId) {
+      return summaries.values().stream()
+          .filter(summary -> summary.versionId().equals(versionId) && summary.activeAndGrounded())
+          .toList();
+    }
+
+    @Override
+    public List<SummaryRecord> loadActiveSummariesForCompany(String company) {
+      return summaries.values().stream().filter(SummaryRecord::activeAndGrounded).toList();
+    }
+
+    @Override
+    public void replaceConceptsForSummary(String summaryId, List<ConceptRecord> concepts) {
+      conceptsBySummary.put(summaryId, List.copyOf(concepts));
+    }
+
+    @Override
+    public List<ConceptRecord> loadActiveConceptsForSummary(String summaryId) {
+      return conceptsBySummary.getOrDefault(summaryId, List.of()).stream()
+          .filter(concept -> "ACTIVE".equals(concept.lifecycle()))
+          .toList();
+    }
+
+    @Override
+    public List<ConceptRecord> loadActiveConceptsForVersion(String versionId) {
+      return conceptsBySummary.values().stream()
+          .flatMap(List::stream)
+          .filter(
+              concept ->
+                  versionId.equals(concept.versionId()) && "ACTIVE".equals(concept.lifecycle()))
+          .toList();
+    }
+
+    @Override
+    public void replaceGraphRejections(String summaryId, List<GraphRelationRejection> rejections) {}
 
     @Override
     public Entity resolveEntity(String name, String entityType) {
@@ -325,6 +365,11 @@ class CompilationServicesParityTest {
     public String presignGet(String key, java.time.Duration expiry) {
       return "https://example.invalid/" + key;
     }
+
+    @Override
+    public void delete(String key) {
+      values.remove(key);
+    }
   }
 
   private static final class FakeEmbedding implements Ports.EmbeddingPort {
@@ -394,6 +439,11 @@ class CompilationServicesParityTest {
         int limit) {
       return List.of();
     }
+
+    @Override
+    public void updateMetadata(
+        String versionId,
+        cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Metadata metadata) {}
 
     @Override
     public void deactivateVersion(String versionId) {}

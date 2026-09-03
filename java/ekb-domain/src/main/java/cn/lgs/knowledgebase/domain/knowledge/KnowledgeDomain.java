@@ -160,7 +160,9 @@ public final class KnowledgeDomain {
       if (block.pageStart() != null) location.put("page_start", block.pageStart());
       if (block.pageEnd() != null) location.put("page_end", block.pageEnd());
       location.put("bbox", block.bbox());
+      location.put("bbox_space", "normalized_1000");
       location.put("page_size", block.pageSize());
+      String contextualContent = contextualEvidenceContent(block.headingPath(), block.content());
       return new Evidence(
           id,
           documentId,
@@ -168,20 +170,33 @@ public final class KnowledgeDomain {
           block.id(),
           objectKey,
           location,
-          block.content(),
-          block.contentHash());
+          contextualContent,
+          sha256(contextualContent));
     }
   }
 
   public record SearchFilters(
       String sourceDepartment,
       String materialCategory,
-      String company,
       String documentType,
       List<String> versionIds) {
     public SearchFilters {
       versionIds = versionIds == null ? List.of() : List.copyOf(versionIds);
     }
+  }
+
+  public static String contextualEvidenceContent(List<String> headingPath, String content) {
+    String body = content == null ? "" : content.trim();
+    java.util.LinkedHashSet<String> parts = new java.util.LinkedHashSet<>();
+    if (headingPath != null) {
+      for (String heading : headingPath) {
+        if (heading == null || heading.isBlank()) continue;
+        String normalized = heading.trim().replaceAll("\\s+", " ");
+        if (!normalized.equals(body.replaceAll("\\s+", " "))) parts.add(normalized);
+      }
+    }
+    if (!body.isBlank()) parts.add(body);
+    return String.join("\n", parts);
   }
 
   public static String sha256(String value) {

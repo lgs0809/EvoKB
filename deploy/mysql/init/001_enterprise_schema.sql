@@ -1,6 +1,3 @@
-CREATE DATABASE IF NOT EXISTS enterprise_kb CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
-USE enterprise_kb;
-
 CREATE TABLE IF NOT EXISTS document (
   document_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,
   logical_name VARCHAR(512) NOT NULL,

@@ -9,7 +9,7 @@ FROM maven:3.9.11-eclipse-temurin-17 AS java-build
 WORKDIR /src
 COPY java ./java
 RUN mvn -f java/pom.xml -DskipTests package \
-    && cp java/ekb-bootstrap/target/enterprise-knowledge-base.jar /out.jar
+    && cp java/ekb-bootstrap/target/evokb.jar /out.jar
 
 FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app

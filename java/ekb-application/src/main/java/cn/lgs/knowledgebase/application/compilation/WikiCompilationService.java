@@ -20,7 +20,6 @@ import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -32,7 +31,6 @@ import java.util.regex.Pattern;
 
 public final class WikiCompilationService {
   private static final Pattern WIKILINK = Pattern.compile("\\[\\[([^]\\n]+)]]");
-  private static final Map<String, Template> TEMPLATES = templates();
 
   private final CompilationRepository repository;
   private final KnowledgeModel model;
@@ -74,9 +72,7 @@ public final class WikiCompilationService {
   public CompileResult compile(CompileRequest request) {
     if (request == null) throw new IllegalArgumentException("wiki compile request is required");
     String wikiType = normalizeType(request.wikiType());
-    Template template = TEMPLATES.get(wikiType);
-    if (template == null)
-      throw new IllegalArgumentException("unsupported wiki type " + request.wikiType());
+    if (wikiType.isEmpty()) wikiType = "GENERIC_TOPIC";
     String title = trim(request.title());
     if (title.isEmpty() || request.summaryIds() == null || request.summaryIds().isEmpty()) {
       throw new IllegalArgumentException("wiki title and source summaries are required");
@@ -96,7 +92,7 @@ public final class WikiCompilationService {
         model.generateStructured(
             ModelRole.LARGE,
             ModelTask.WIKI_WRITE,
-            writerPrompt(template),
+            writerPrompt(wikiType),
             sourcePrompt(summaries, facts),
             Proposal.class);
     if (proposal == null) throw new IllegalStateException("wiki writer returned empty proposal");
@@ -111,12 +107,7 @@ public final class WikiCompilationService {
     long version = repository.nextWikiVersion(wikiId);
     GroundingResult grounded =
         groundClaims(
-            wikiId,
-            version,
-            template,
-            safe(proposal.claims()),
-            facts,
-            decisionValidation.decisions());
+            wikiId, version, safe(proposal.claims()), facts, decisionValidation.decisions());
 
     List<String> missing = new ArrayList<>();
     for (Map.Entry<String, FactDecision> entry : decisionValidation.decisions().entrySet()) {
@@ -134,8 +125,10 @@ public final class WikiCompilationService {
     if (!coverage.pass())
       throw new IllegalStateException("wiki coverage failed: " + String.join(",", missing));
 
+    if (grounded.claims().isEmpty())
+      throw new IllegalStateException("wiki writer produced no grounded claims");
     List<String> keywords = extractWikiLinks(grounded.claims());
-    String markdown = render(template, title, grounded.claims());
+    String markdown = render(title, grounded.claims());
     String objectKey = "wiki/" + wikiId + "/v" + version + ".md";
     byte[] bytes = markdown.getBytes(StandardCharsets.UTF_8);
     objects.put(
@@ -181,12 +174,11 @@ public final class WikiCompilationService {
   private GroundingResult groundClaims(
       String wikiId,
       long version,
-      Template template,
       List<ProposedClaim> proposed,
       Map<String, SummaryFact> facts,
       Map<String, FactDecision> decisions) {
-    List<WikiClaim> claims = new ArrayList<>();
-    Set<String> covered = new LinkedHashSet<>();
+    List<ClaimCandidate> candidates = new ArrayList<>();
+    int candidateNo = 0;
     for (ProposedClaim raw : proposed) {
       if (raw == null) throw new IllegalStateException("wiki claim is null");
       String section = trim(raw.section());
@@ -199,7 +191,7 @@ public final class WikiCompilationService {
                   .filter(v -> !v.isEmpty())
                   .distinct()
                   .toList();
-      if (text.isEmpty() || !template.sectionNames().contains(section) || factIds.isEmpty()) {
+      if (section.isEmpty() || text.isEmpty() || factIds.isEmpty()) {
         throw new IllegalStateException("wiki claim is incomplete");
       }
       List<SummaryFact> support = new ArrayList<>();
@@ -215,13 +207,21 @@ public final class WikiCompilationService {
         support.add(fact);
         evidenceIds.addAll(fact.evidenceIds());
       }
-      SupportDecision decision =
-          model.generateStructured(
-              ModelRole.SMALL,
-              ModelTask.WIKI_JUDGE,
-              "你是独立 Wiki Claim Grounding Judge。只判断 claim 是否被给定的 grounded summary facts 直接支持。禁止使用常识补全；输出 supported 和 reason。",
-              "CLAIM=" + text + "\nSUPPORTING FACTS:\n" + renderFactSupport(support),
-              SupportDecision.class);
+      candidates.add(
+          new ClaimCandidate(
+              "C" + (++candidateNo),
+              section,
+              text,
+              factIds,
+              List.copyOf(support),
+              List.copyOf(evidenceIds)));
+    }
+
+    Map<String, SupportDecision> judged = judgeClaims(candidates);
+    List<WikiClaim> claims = new ArrayList<>(candidates.size());
+    Set<String> covered = new LinkedHashSet<>();
+    for (ClaimCandidate candidate : candidates) {
+      SupportDecision decision = judged.get(candidate.judgeId());
       if (decision == null || !decision.supported())
         throw new IllegalStateException(
             "wiki claim is not grounded: " + trim(decision == null ? "" : decision.reason()));
@@ -230,23 +230,87 @@ public final class WikiCompilationService {
               "wiki-claim",
               wikiId,
               Long.toString(version),
-              section,
-              text,
-              String.join(",", factIds));
+              candidate.section(),
+              candidate.claimText(),
+              String.join(",", candidate.factIds()));
       claims.add(
           new WikiClaim(
               claimId,
               wikiId,
               version,
-              section,
-              text,
-              factIds,
-              List.copyOf(evidenceIds),
+              candidate.section(),
+              candidate.claimText(),
+              candidate.factIds(),
+              candidate.evidenceIds(),
               "PASS",
               "PASS"));
-      covered.addAll(factIds);
+      covered.addAll(candidate.factIds());
     }
     return new GroundingResult(List.copyOf(claims), Set.copyOf(covered));
+  }
+
+  private Map<String, SupportDecision> judgeClaims(List<ClaimCandidate> candidates) {
+    if (candidates.isEmpty()) return Map.of();
+    if (candidates.size() == 1) {
+      ClaimCandidate candidate = candidates.get(0);
+      SupportDecision decision =
+          model.generateStructured(
+              ModelRole.SMALL,
+              ModelTask.WIKI_JUDGE,
+              "你是独立 Wiki Claim Grounding Judge。只判断 claim 是否被给定的 grounded summary facts 直接支持。禁止使用常识补全；输出 supported 和 reason。",
+              "CLAIM="
+                  + candidate.claimText()
+                  + "\nSUPPORTING FACTS:\n"
+                  + renderFactSupport(candidate.support()),
+              SupportDecision.class);
+      return Map.of(candidate.judgeId(), decision);
+    }
+
+    SupportDecisionSet result =
+        model.generateStructured(
+            ModelRole.SMALL,
+            ModelTask.WIKI_JUDGE,
+            "你是独立 Wiki Claim Grounding Judge。逐条判断每个 candidate claim 是否被它自己的 grounded summary facts 直接支持。"
+                + "必须为每个 candidate_id 恰好返回一条 decision，不得遗漏、增加或改写 candidate_id；禁止使用常识补全。",
+            renderClaimCandidates(candidates),
+            SupportDecisionSet.class);
+    if (result == null || result.decisions() == null)
+      throw new IllegalStateException("wiki grounding batch returned empty decisions");
+    Set<String> expected =
+        candidates.stream()
+            .map(ClaimCandidate::judgeId)
+            .collect(java.util.stream.Collectors.toSet());
+    Map<String, SupportDecision> decisions = new LinkedHashMap<>();
+    for (SupportDecisionItem raw : result.decisions()) {
+      if (raw == null)
+        throw new IllegalStateException("wiki grounding batch contains null decision");
+      String candidateId = trim(raw.candidateId());
+      if (!expected.contains(candidateId))
+        throw new IllegalStateException(
+            "wiki grounding batch references unknown candidate " + candidateId);
+      if (decisions.putIfAbsent(
+              candidateId, new SupportDecision(raw.supported(), trim(raw.reason())))
+          != null)
+        throw new IllegalStateException("wiki grounding batch duplicated candidate " + candidateId);
+    }
+    for (String candidateId : expected)
+      if (!decisions.containsKey(candidateId))
+        throw new IllegalStateException("wiki grounding batch missing candidate " + candidateId);
+    return Map.copyOf(decisions);
+  }
+
+  private static String renderClaimCandidates(List<ClaimCandidate> candidates) {
+    StringBuilder out = new StringBuilder("CANDIDATES:\n");
+    for (ClaimCandidate candidate : candidates) {
+      out.append("candidate_id=")
+          .append(candidate.judgeId())
+          .append("\nCLAIM=")
+          .append(candidate.claimText())
+          .append("\nSUPPORTING FACTS:\n")
+          .append(renderFactSupport(candidate.support()))
+          .append("\n===\n");
+    }
+    return out.toString();
   }
 
   private static DecisionValidation validateDecisions(
@@ -300,46 +364,45 @@ public final class WikiCompilationService {
     return List.copyOf(links);
   }
 
-  private static String render(Template template, String title, List<WikiClaim> claims) {
+  private static String render(String title, List<WikiClaim> claims) {
     StringBuilder out = new StringBuilder("# ").append(title).append("\n\n");
-    for (String section : template.sections()) {
+    LinkedHashSet<String> sections = new LinkedHashSet<>();
+    for (WikiClaim claim : claims) sections.add(trim(claim.section()));
+    for (String section : sections) {
       out.append("## ").append(section).append("\n\n");
-      List<WikiClaim> sectionClaims =
-          claims.stream()
-              .filter(c -> c.section().equals(section))
-              .sorted(Comparator.comparing(WikiClaim::id))
-              .toList();
-      if (sectionClaims.isEmpty()) out.append("- 未从已验证事实中确认。\n\n");
-      else {
-        for (WikiClaim claim : sectionClaims)
+      for (WikiClaim claim : claims)
+        if (section.equals(trim(claim.section())))
           out.append("- ").append(claim.claimText()).append("\n");
-        out.append('\n');
-      }
+      out.append('\n');
     }
     return out.toString();
   }
 
-  private static String writerPrompt(Template template) {
-    return "你是企业 Wiki Writer。仅基于输入的 grounded facts 编写候选 claims。wiki_type 必须为 "
-        + template.wikiType()
-        + "，section 只能来自 "
-        + template.sections()
-        + "。每条 claim 必须引用 supporting_fact_ids。每个输入 fact 必须输出一个 fact_decision；"
+  private static String writerPrompt(String wikiType) {
+    return "你是企业 Wiki Writer。仅基于输入的 grounded facts 编写候选 claims。wiki_type 使用 "
+        + wikiType
+        + " 作为页面分类标签，但 section 不受固定模板限制，应根据事实自然组织为少量清晰、稳定的栏目。"
+        + "每条 claim 必须引用 supporting_fact_ids。每个输入 fact 必须输出一个 fact_decision；"
         + "适合 Wiki 的 fact 标记 wiki_eligible=true 且最终必须至少被一个 claim 使用；不适合的必须给 skip_reason。"
+        + "逐字复制每个输入 fact 的 id，fact_decisions 中每个 id 恰好出现一次，不得发明、截断或改写 id。"
+        + "Claim 只能陈述 supporting facts 明确写出的内容，可忠实改写但不得补充因果、职责、审批要求、人数或时间等隐含信息；"
+        + "若事实没有明确表达某个关系或义务，就不要在 claim 中添加该关系或义务。"
+        + "为确保可验证，优先将 claim_text 直接复制为 supporting fact 的完整原文；只有在不增加任何信息的情况下才可做极短改写。"
+        + "只把你能用这种原文式 claim 覆盖的事实标记为 wiki_eligible=true，其余事实标记为 false 并说明原因。"
         + "Claim 必须原子化：一条 claim 只表达一个可独立验证的事实，不要把多个关系或多个时间事件拼在同一句。"
-        + "若 claim 表达两个实体之间的关系，应恰好使用两个 [[实体名]]，并把明确的关系词放在两个 wikilink 之间，例如 [[A]] 控制 [[B]]、[[A]] 投资 [[B]]、[[A]] supplies to [[B]]。"
+        + "若 claim 表达两个实体之间的关系，应恰好使用两个 [[实体名]]，并把明确的关系词放在两个 wikilink 之间，例如 [[A]] 控制 [[B]]、[[A]] 投资 [[B]]。"
         + "一个 grounded fact 若包含多个二元关系，可以拆成多条 claims，并复用同一个 supporting_fact_id。不得为了造链接或关系而改写事实。";
   }
 
   private static String sourcePrompt(
       List<SummaryRecord> summaries, Map<String, SummaryFact> facts) {
     StringBuilder out = new StringBuilder();
+    // Wiki writing is grounded on the normalized facts below.  Re-sending the full derived
+    // Summary markdown is redundant and can make an otherwise valid provider request exceed its
+    // transport budget; retaining the summary ids keeps provenance visible without dropping any
+    // raw evidence or fact text.
     for (SummaryRecord summary : summaries)
-      out.append("<summary id=\"")
-          .append(summary.id())
-          .append("\">\n")
-          .append(summary.markdown())
-          .append("\n</summary>\n");
+      out.append("<summary id=\"").append(summary.id()).append("\"/>\n");
     out.append("<facts>\n");
     for (SummaryFact fact : facts.values())
       out.append("<fact id=\"")
@@ -360,45 +423,6 @@ public final class WikiCompilationService {
     return out.toString();
   }
 
-  private static Map<String, Template> templates() {
-    Map<String, Template> map = new LinkedHashMap<>();
-    map.put(
-        "COMPANY",
-        new Template(
-            "COMPANY",
-            List.of("Profile", "Ownership and Control", "Governance", "Material Matters")));
-    map.put(
-        "PERSON",
-        new Template(
-            "PERSON", List.of("Identity and Roles", "Ownership and Control", "Material Matters")));
-    map.put(
-        "CONTRACT",
-        new Template(
-            "CONTRACT", List.of("Overview", "Parties", "Key Terms", "Performance and Risks")));
-    map.put(
-        "LEGAL_CASE",
-        new Template(
-            "LEGAL_CASE",
-            List.of("Overview", "Parties", "Claims and Issues", "Decision and Progress")));
-    map.put(
-        "PROJECT",
-        new Template(
-            "PROJECT", List.of("Overview", "Key Relationships", "Material Matters", "Risks")));
-    map.put(
-        "CONTROL_TOPIC",
-        new Template("CONTROL_TOPIC", List.of("Overview", "Key Relationships", "Timeline")));
-    map.put(
-        "EQUITY_TOPIC",
-        new Template("EQUITY_TOPIC", List.of("Overview", "Key Relationships", "Timeline")));
-    map.put(
-        "GENERIC_TOPIC",
-        new Template("GENERIC_TOPIC", List.of("Overview", "Key Relationships", "Timeline")));
-    map.put(
-        "GENERIC_ENTITY",
-        new Template("GENERIC_ENTITY", List.of("Overview", "Relationships", "Material Matters")));
-    return Map.copyOf(map);
-  }
-
   private static String normalizeType(String value) {
     return trim(value).toUpperCase(Locale.ROOT);
   }
@@ -414,12 +438,6 @@ public final class WikiCompilationService {
   private static <T> T require(T value, String name) {
     if (value == null) throw new IllegalArgumentException(name + " is required");
     return value;
-  }
-
-  private record Template(String wikiType, List<String> sections) {
-    Set<String> sectionNames() {
-      return Set.copyOf(sections);
-    }
   }
 
   private record DecisionValidation(
@@ -441,6 +459,18 @@ public final class WikiCompilationService {
       List<FactDecision> factDecisions) {}
 
   public record SupportDecision(boolean supported, String reason) {}
+
+  public record SupportDecisionItem(String candidateId, boolean supported, String reason) {}
+
+  public record SupportDecisionSet(List<SupportDecisionItem> decisions) {}
+
+  private record ClaimCandidate(
+      String judgeId,
+      String section,
+      String claimText,
+      List<String> factIds,
+      List<SummaryFact> support,
+      List<String> evidenceIds) {}
 
   public record CoverageResult(
       boolean pass,

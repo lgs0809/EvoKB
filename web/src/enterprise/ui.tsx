@@ -4,7 +4,9 @@ export type IconName =
   | 'dashboard' | 'search' | 'documents' | 'wiki' | 'graph' | 'evidence'
   | 'tasks' | 'admin' | 'refresh' | 'arrow' | 'check' | 'warning' | 'clock'
   | 'file' | 'layers' | 'shield' | 'sparkles' | 'download' | 'filter' | 'close'
-  | 'chevron' | 'link' | 'database' | 'server' | 'activity' | 'menu' | 'sun' | 'moon';
+  | 'chevron' | 'link' | 'database' | 'server' | 'activity' | 'menu' | 'sun' | 'moon'
+  | 'models' | 'chat' | 'embedding' | 'rerank' | 'copy' | 'eye' | 'trash' | 'settings'
+  | 'history' | 'upload' | 'quality' | 'test' | 'audit' | 'users' | 'edit';
 
 export function Icon({ name, size = 18, class: className = '' }: { name: IconName; size?: number; class?: string }) {
   const paths: Record<IconName, ComponentChildren> = {
@@ -36,6 +38,21 @@ export function Icon({ name, size = 18, class: className = '' }: { name: IconNam
     menu: <path d="M4 7h16M4 12h16M4 17h16"/>,
     sun: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></>,
     moon: <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>,
+    models: <><rect x="5" y="5" width="14" height="14" rx="3"/><path d="M9 9h6v6H9zM9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></>,
+    chat: <><path d="M4 5h16v11H9l-5 4z"/><path d="M8 9h8M8 12h5"/></>,
+    embedding: <><circle cx="5" cy="12" r="2"/><circle cx="12" cy="5" r="2"/><circle cx="19" cy="12" r="2"/><circle cx="12" cy="19" r="2"/><path d="m6.5 10.5 4-4M13.5 6.5l4 4M17.5 13.5l-4 4M10.5 17.5l-4-4"/></>,
+    rerank: <><path d="M6 4h12M6 10h9M6 16h6"/><path d="m17 14 3 3-3 3M20 17h-6"/></>,
+    copy: <><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></>,
+    eye: <><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="2.5"/></>,
+    trash: <><path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14"/><path d="M10 11v6M14 11v6"/></>,
+    settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21h-4v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1-2.8-2.8.1-.1A1.7 1.7 0 0 0 4.6 15 1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 2.8-2.8.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6V3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1 2.8 2.8-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1v4H21a1.7 1.7 0 0 0-1.6 1z"/></>,
+    history: <><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v6h6M12 7v5l3 2"/></>,
+    upload: <><path d="M12 16V4M8 8l4-4 4 4"/><path d="M5 14v5h14v-5"/></>,
+    quality: <><path d="M12 3 4 6v5c0 5.2 3.4 8.5 8 10 4.6-1.5 8-4.8 8-10V6z"/><path d="M8 12h2l1.2 2.5L14 9l1 3h2"/></>,
+    test: <><path d="M9 3h6M10 3v5l-5 9a3 3 0 0 0 2.6 4h8.8A3 3 0 0 0 19 17l-5-9V3"/><path d="M8 15h8"/></>,
+    audit: <><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 3.5h6v3H9zM9 11h6M9 15h4"/><path d="m14.5 17 1.5 1.5 3-3"/></>,
+    users: <><circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2"/><path d="M3 20a6 6 0 0 1 12 0M14 20a5 5 0 0 1 7 0"/></>,
+    edit: <><path d="M4 20h4l11-11-4-4L4 16z"/><path d="m13.5 6.5 4 4M4 20h16"/></>,
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class={className} aria-hidden="true">{paths[name]}</svg>;
 }
@@ -44,7 +61,7 @@ export function StatusBadge({ value }: { value: string }) {
   const normalized = (value || 'UNKNOWN').toUpperCase();
   const labels: Record<string, string> = {
     ACTIVE: '可用', PASS: '通过', SUCCEEDED: '已完成', RECOMMENDED: '建议生成', READY: '就绪',
-    PENDING: '等待处理', RUNNING: '处理中', STALE: '需要更新', UNDER_REVIEW: '检查中', STAGED: '待确认', QUEUED: '已排队',
+    PENDING: '等待处理', RUNNING: '处理中', STALE: '需要更新', UNDER_REVIEW: '检查中', STAGED: '待确认', QUEUED: '排队中',
     FAILED: '失败', FAIL: '未通过', INACTIVE: '已停用', CANCELLED: '已取消', CONFLICT: '冲突',
     ADMIN: '管理员', USER: '普通用户', DISABLED: '已禁用', PARTIAL: '部分完成',
   };

@@ -1,3 +1,4 @@
+# Keep the legacy Compose project ID so existing volumes remain attached after the EvoKB rename.
 name: enterprise-knowledge-base
 
 services:
@@ -94,7 +95,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: enterprise-knowledge-base:latest
+    image: evokb:latest
     restart: unless-stopped
     environment:
       EKB_JDBC_URL: jdbc:mysql://mysql:3306/${EKB_MYSQL_DATABASE:-enterprise_kb}?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
@@ -115,23 +116,33 @@ services:
       EKB_NEO4J_DATABASE: ${EKB_NEO4J_DATABASE:-neo4j}
       EKB_MINERU_URL: ${EKB_MINERU_URL}
       EKB_MINERU_POLL_MS: ${EKB_MINERU_POLL_MS:-500}
+      EKB_MINERU_TASK_TIMEOUT_SECONDS: ${EKB_MINERU_TASK_TIMEOUT_SECONDS:-14400}
       EKB_MINERU_PARSE_METHOD: ${EKB_MINERU_PARSE_METHOD:-auto}
       EKB_MINERU_LANGUAGE: ${EKB_MINERU_LANGUAGE:-ch}
-      EKB_CHAT_BASE_URL: ${EKB_CHAT_BASE_URL}
+      EKB_CHAT_BASE_URL: ${EKB_CHAT_BASE_URL:-}
       EKB_CHAT_API_KEY: ${EKB_CHAT_API_KEY:-}
-      EKB_SMALL_MODEL: ${EKB_SMALL_MODEL}
-      EKB_LARGE_MODEL: ${EKB_LARGE_MODEL}
+      # Optional host proxy for providers that reject direct Linux-container TLS handshakes.
+      # Leave blank in deployments without a proxy; the application then connects directly.
+      EKB_CHAT_PROXY_HOST: ${EKB_CHAT_PROXY_HOST:-}
+      EKB_CHAT_PROXY_PORT: ${EKB_CHAT_PROXY_PORT:-}
+      EKB_SMALL_MODEL: ${EKB_SMALL_MODEL:-}
+      EKB_LARGE_MODEL: ${EKB_LARGE_MODEL:-}
+      EKB_CHAT_TIMEOUT_SECONDS: ${EKB_CHAT_TIMEOUT_SECONDS:-120}
+      # Optional extractive fallback for compilation only; disabled unless explicitly enabled.
+      EKB_ASSISTANT_FALLBACK: ${EKB_ASSISTANT_FALLBACK:-disabled}
       EKB_QUERY_CONTEXT_CHARS: ${EKB_QUERY_CONTEXT_CHARS:-24000}
-      EKB_EMBEDDING_BASE_URL: ${EKB_EMBEDDING_BASE_URL}
+      EKB_EMBEDDING_BASE_URL: ${EKB_EMBEDDING_BASE_URL:-}
       EKB_EMBEDDING_API_KEY: ${EKB_EMBEDDING_API_KEY:-}
-      EKB_EMBEDDING_MODEL: ${EKB_EMBEDDING_MODEL}
+      EKB_EMBEDDING_MODEL: ${EKB_EMBEDDING_MODEL:-}
       EKB_EMBED_DIMS: ${EKB_EMBED_DIMS:-1024}
       EKB_EMBED_BATCH_SIZE: ${EKB_EMBED_BATCH_SIZE:-16}
       EKB_EMBED_TIMEOUT_SECONDS: ${EKB_EMBED_TIMEOUT_SECONDS:-120}
-      EKB_RERANK_BASE_URL: ${EKB_RERANK_BASE_URL}
+      EKB_EMBED_MAX_CONCURRENCY: ${EKB_EMBED_MAX_CONCURRENCY:-1}
+      EKB_RERANK_BASE_URL: ${EKB_RERANK_BASE_URL:-}
       EKB_RERANK_API_KEY: ${EKB_RERANK_API_KEY:-}
-      EKB_RERANK_MODEL: ${EKB_RERANK_MODEL}
+      EKB_RERANK_MODEL: ${EKB_RERANK_MODEL:-}
       EKB_RERANK_TIMEOUT_SECONDS: ${EKB_RERANK_TIMEOUT_SECONDS:-30}
+      EKB_RERANK_MAX_CONCURRENCY: ${EKB_RERANK_MAX_CONCURRENCY:-1}
       EKB_RERANK_MAX_CHARS: ${EKB_RERANK_MAX_CHARS:-400}
       EKB_RERANK_MAX_CANDIDATES: ${EKB_RERANK_MAX_CANDIDATES:-20}
       EKB_SERVER_PORT: 18080

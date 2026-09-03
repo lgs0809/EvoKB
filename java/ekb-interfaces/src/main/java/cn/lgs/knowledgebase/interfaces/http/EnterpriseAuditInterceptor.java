@@ -94,9 +94,11 @@ public final class EnterpriseAuditInterceptor implements HandlerInterceptor {
       case "PATCH /api/enterprise/user" -> "user.update";
       case "POST /api/enterprise/user/password/reset" -> "user.password.reset";
       case "PATCH /api/enterprise/access" -> "access.settings.update";
+      case "PUT /api/enterprise/model-configuration" -> "model_configuration.update";
       case "POST /api/enterprise/upload" -> "document.upload.create";
       case "POST /api/enterprise/batches" -> "ingestion.batch.create";
       case "PATCH /api/enterprise/batch/file" -> "ingestion.file.metadata.update";
+      case "PATCH /api/enterprise/document" -> "document.metadata.update";
       case "POST /api/enterprise/batch/start" -> "ingestion.batch.start";
       case "POST /api/enterprise/batch/file/retry" -> "ingestion.file.retry";
       case "POST /api/enterprise/generation/recommend", "POST /api/enterprise/distill" ->
@@ -124,6 +126,7 @@ public final class EnterpriseAuditInterceptor implements HandlerInterceptor {
     if (action.startsWith("evaluation.")) return "evaluation";
     if (action.startsWith("compilation.")) return "knowledge_artifact";
     if (action.startsWith("access.")) return "settings";
+    if (action.startsWith("model_configuration.")) return "model_configuration";
     return "auth";
   }
 

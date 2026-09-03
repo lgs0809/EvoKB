@@ -40,7 +40,7 @@ export function LoginPage({ setupRequired, onAuthenticated }: {
     <main class="flex min-h-screen items-center justify-center px-5 py-10">
       <div class="w-full max-w-md rounded-[28px] border border-slate-200/80 bg-white p-8 shadow-xl shadow-slate-200/40 dark:border-slate-800 dark:bg-slate-900 dark:shadow-none">
         <div class="flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-50 text-blue-700 dark:bg-blue-950/50 dark:text-blue-300"><Icon name={setupRequired ? 'sparkles' : 'shield'} size={21}/></div>
-        <h2 class="mt-5 text-2xl font-semibold tracking-tight">{setupRequired ? '初始化管理员账号' : '登录企业知识平台'}</h2>
+        <h2 class="mt-5 text-2xl font-semibold tracking-tight">{setupRequired ? '初始化 EvoKB 管理员' : '登录 EvoKB'}</h2>
         <p class="mt-2 text-sm leading-6 text-slate-500 dark:text-slate-400">{setupRequired ? '创建首个管理员账号。' : '登录后即可使用企业知识查询与资料管理。'}</p>
         <form class="mt-7 space-y-4" onSubmit={event => void submit(event)}>
           <label class="block"><div class="mb-1.5 text-xs font-semibold text-slate-600 dark:text-slate-300">用户名</div><input value={username} onInput={event => setUsername((event.target as HTMLInputElement).value)} placeholder="username" class={inputClass}/></label>
