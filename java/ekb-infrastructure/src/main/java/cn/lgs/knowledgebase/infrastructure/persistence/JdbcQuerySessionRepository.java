@@ -1,7 +1,9 @@
 package cn.lgs.knowledgebase.infrastructure.persistence;
 
+import cn.lgs.knowledgebase.application.port.Ports.QueryExecutionRecoveryRepository;
 import cn.lgs.knowledgebase.application.port.Ports.QueryHistoryRepository;
 import cn.lgs.knowledgebase.application.port.Ports.QuerySessionRepository;
+import cn.lgs.knowledgebase.application.query.QueryEvidenceContext;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.SearchFilters;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.Decision;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryEvidenceRef;
@@ -9,26 +11,34 @@ import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryGroup;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryPackage;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.QuerySession;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryTurn;
+import cn.lgs.knowledgebase.domain.query.QueryDomain.RetrievalReservation;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.RetrievalRound;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.SessionStatus;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.TurnRole;
+import cn.lgs.knowledgebase.domain.query.RetrievalBudget;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.charset.StandardCharsets;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
 public final class JdbcQuerySessionRepository
-    implements QuerySessionRepository, QueryHistoryRepository {
+    implements QuerySessionRepository, QueryHistoryRepository, QueryExecutionRecoveryRepository {
   private static final TypeReference<List<String>> STRING_LIST = new TypeReference<>() {};
   private final JdbcTemplate jdbc;
   private final TransactionTemplate transactions;
+  private final TransactionTemplate reservations;
   private final ObjectMapper mapper;
 
   public JdbcQuerySessionRepository(
@@ -38,8 +48,9 @@ public final class JdbcQuerySessionRepository
     if (mapper == null) throw new IllegalArgumentException("object mapper is required");
     this.jdbc = jdbc;
     this.transactions = transactions;
+    this.reservations = new TransactionTemplate(transactions.getTransactionManager());
+    this.reservations.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     this.mapper = mapper;
-    ensureSchema();
   }
 
   @Override
@@ -65,7 +76,7 @@ public final class JdbcQuerySessionRepository
   public void updateSession(QuerySession session) {
     int rows =
         jdbc.update(
-            "UPDATE query_session SET status=?,final_answer=?,evidence_only=?,clarification_question=?,choices_json=?,citation_evidence_ids=?,updated_at=? WHERE session_id=? AND deleted_at IS NULL",
+            "UPDATE query_session SET status=?,final_answer=?,evidence_only=?,clarification_question=?,choices_json=?,citation_evidence_ids=?,updated_at=? WHERE session_id=? AND deleted_at IS NULL AND user_id=? AND status=?",
             session.status().name(),
             nullable(session.finalAnswer()),
             session.evidenceOnly(),
@@ -73,9 +84,67 @@ public final class JdbcQuerySessionRepository
             json(session.choices()),
             json(session.citationEvidenceIds()),
             ts(session.updatedAt()),
-            session.sessionId());
+            session.sessionId(),
+            session.userId(),
+            session.status().requiredPreviousStatus().name());
     if (rows == 0)
-      throw new IllegalStateException("query session not found: " + session.sessionId());
+      throw new cn.lgs.knowledgebase.application.query.QueryStateChanged(session.sessionId());
+  }
+
+  @Override
+  public void createSessionWithTurn(QuerySession session, QueryTurn initialTurn) {
+    requireBoundTurn(session, initialTurn);
+    transactions.executeWithoutResult(
+        ignored -> {
+          createSession(session);
+          appendTurn(initialTurn);
+        });
+  }
+
+  @Override
+  public void transitionSessionWithTurn(QuerySession session, QueryTurn turn) {
+    requireBoundTurn(session, turn);
+    transactions.executeWithoutResult(
+        ignored -> {
+          updateSession(session);
+          appendTurn(turn);
+        });
+  }
+
+  private static void requireBoundTurn(QuerySession session, QueryTurn turn) {
+    if (session == null || turn == null || !session.sessionId().equals(turn.sessionId()))
+      throw new IllegalArgumentException(
+          "session transition and history message must share an identity");
+  }
+
+  @Override
+  public int expireRunningSessions(Instant staleBefore, Instant now, String explanation) {
+    if (staleBefore == null
+        || now == null
+        || !staleBefore.isBefore(now)
+        || explanation == null
+        || explanation.isBlank())
+      throw new IllegalArgumentException("valid query expiry bounds and explanation are required");
+    return transactions.execute(
+        ignored -> {
+          List<String> expired =
+              jdbc.query(
+                  "WITH stale AS (SELECT session_id FROM query_session WHERE status='RUNNING' AND updated_at<? AND deleted_at IS NULL ORDER BY updated_at,session_id LIMIT 100 FOR UPDATE SKIP LOCKED) "
+                      + "UPDATE query_session s SET status='FAILED',final_answer=?,evidence_only=true,clarification_question=NULL,choices_json='[]',updated_at=? FROM stale WHERE s.session_id=stale.session_id AND s.status='RUNNING' RETURNING s.session_id",
+                  (rs, row) -> rs.getString(1),
+                  ts(staleBefore),
+                  explanation,
+                  ts(now));
+          for (String id : expired)
+            appendTurn(
+                new QueryTurn(
+                    UUID.randomUUID().toString(),
+                    id,
+                    TurnRole.SYSTEM_EVENT,
+                    "QUERY_EXECUTION_EXPIRED",
+                    now));
+          return expired.size();
+        });
   }
 
   @Override
@@ -125,19 +194,176 @@ public final class JdbcQuerySessionRepository
   }
 
   @Override
+  public Optional<RetrievalReservation> reserveRound(
+      String userId,
+      String sessionId,
+      List<String> proposedQueries,
+      int maxRounds,
+      int maxQueries) {
+    return reservations.execute(
+        ignored -> {
+          List<String> states =
+              jdbc.query(
+                  "SELECT status FROM query_session WHERE session_id=? AND user_id=? AND deleted_at IS NULL FOR UPDATE",
+                  (rs, row) -> rs.getString(1),
+                  sessionId,
+                  userId);
+          if (states.size() != 1 || !SessionStatus.RUNNING.name().equals(states.get(0)))
+            throw new IllegalStateException("query session is not runnable");
+          RetrievalBudget budget =
+              new RetrievalBudget(listReservations(sessionId), maxRounds, maxQueries);
+          List<String> queries =
+              budget.freshQueries(
+                  proposedQueries, proposedQueries == null ? 0 : proposedQueries.size());
+          if (queries.isEmpty()) return Optional.empty();
+          String id = UUID.randomUUID().toString();
+          jdbc.update(
+              "INSERT INTO query_retrieval_reservation(reservation_id,session_id,round_no,input_queries) VALUES(?,?,?,?::jsonb)",
+              id,
+              sessionId,
+              budget.nextRoundNo(),
+              json(queries));
+          return listReservations(sessionId).stream()
+              .filter(r -> r.reservationId().equals(id))
+              .findFirst();
+        });
+  }
+
+  @Override
+  public List<RetrievalReservation> listReservations(String sessionId) {
+    return jdbc.query(
+        "SELECT reservation_id,session_id,round_no,input_queries,started_at FROM query_retrieval_reservation WHERE session_id=? ORDER BY round_no",
+        (rs, row) ->
+            new RetrievalReservation(
+                rs.getString(1),
+                rs.getString(2),
+                rs.getInt(3),
+                strings(rs.getString(4)),
+                instant(rs.getTimestamp(5))),
+        sessionId);
+  }
+
+  @Override
+  public void recordEvidenceSelection(
+      String userId, RetrievalReservation reservation, QueryEvidenceContext.Snapshot snapshot) {
+    snapshot.validate();
+    reservations.executeWithoutResult(
+        ignored -> {
+          Integer owned =
+              jdbc.queryForObject(
+                  "SELECT count(*) FROM query_session s JOIN enterprise_user u ON u.user_id=s.user_id "
+                      + "JOIN query_retrieval_reservation r ON r.session_id=s.session_id WHERE s.session_id=? AND s.user_id=? "
+                      + "AND s.deleted_at IS NULL AND u.status='ACTIVE' AND r.reservation_id=? AND r.round_no=?",
+                  Integer.class,
+                  reservation.sessionId(),
+                  userId,
+                  reservation.reservationId(),
+                  reservation.roundNo());
+          if (owned == null || owned != 1)
+            throw new IllegalStateException("context receipt owner or reservation is unavailable");
+          Map<String, Map<String, Object>> known = new LinkedHashMap<>();
+          for (var row :
+              jdbc.queryForList(
+                  "SELECT e.evidence_id,e.document_id,e.version_id FROM query_evidence q "
+                      + "JOIN evidence e ON e.evidence_id=q.evidence_id WHERE q.session_id=? AND q.first_seen_round<=?",
+                  reservation.sessionId(),
+                  reservation.roundNo())) known.put(row.get("evidence_id").toString(), row);
+          for (var source : snapshot.sources()) {
+            var row = known.get(source.evidenceId());
+            if (row == null
+                || !source.versionId().equals(row.get("version_id"))
+                || !source.documentId().equals(row.get("document_id")))
+              throw new IllegalStateException(
+                  "context source was not retrieved for this owned round");
+          }
+          String event =
+              UUID.nameUUIDFromBytes(
+                      ("query-context-v1:" + reservation.reservationId())
+                          .getBytes(StandardCharsets.UTF_8))
+                  .toString();
+          String details = json(snapshot);
+          int inserted =
+              jdbc.update(
+                  "INSERT INTO audit_event(event_id,actor_user_id,actor_username,actor_role,action,target_type,target_id,target_name,outcome,request_id,details_json) "
+                      + "SELECT ?,u.user_id,u.username,u.role,'QUERY_CONTEXT_SELECTED','query_session',s.session_id,'','SUCCESS',?,?::jsonb "
+                      + "FROM query_session s JOIN enterprise_user u ON u.user_id=s.user_id WHERE s.session_id=? AND s.user_id=? ON CONFLICT DO NOTHING",
+                  event,
+                  reservation.reservationId(),
+                  details,
+                  reservation.sessionId(),
+                  userId);
+          if (inserted == 0) {
+            String prior =
+                jdbc.queryForObject(
+                    "SELECT details_json::text FROM audit_event WHERE event_id=? AND target_id=? AND actor_user_id=?",
+                    String.class,
+                    event,
+                    reservation.sessionId(),
+                    userId);
+            try {
+              if (!mapper.readValue(prior, QueryEvidenceContext.Snapshot.class).equals(snapshot))
+                throw new IllegalStateException("context receipt already has different evidence");
+            } catch (JsonProcessingException failure) {
+              throw new IllegalStateException("context receipt cannot be decoded", failure);
+            }
+          }
+        });
+  }
+
+  @Override
   public void saveRound(RetrievalRound round) {
-    jdbc.update(
-        "INSERT INTO retrieval_round(round_id,session_id,round_no,input_queries,decision,missing_information,next_queries,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?) "
-            + "ON DUPLICATE KEY UPDATE input_queries=VALUES(input_queries),decision=VALUES(decision),missing_information=VALUES(missing_information),next_queries=VALUES(next_queries),started_at=VALUES(started_at),finished_at=VALUES(finished_at)",
-        round.roundId(),
-        round.sessionId(),
-        round.roundNo(),
-        json(round.inputQueries()),
-        round.decision().name(),
-        json(round.missingInformation()),
-        json(round.nextQueries()),
-        ts(round.startedAt()),
-        ts(round.finishedAt()));
+    transactions.executeWithoutResult(
+        ignored -> {
+          RetrievalReservation reserved =
+              jdbc
+                  .query(
+                      "SELECT reservation_id,session_id,round_no,input_queries,started_at FROM query_retrieval_reservation WHERE reservation_id=? FOR UPDATE",
+                      (rs, row) ->
+                          new RetrievalReservation(
+                              rs.getString(1),
+                              rs.getString(2),
+                              rs.getInt(3),
+                              strings(rs.getString(4)),
+                              instant(rs.getTimestamp(5))),
+                      round.roundId())
+                  .stream()
+                  .findFirst()
+                  .orElseThrow(() -> new IllegalStateException("retrieval round was not reserved"));
+          if (!reserved.sessionId().equals(round.sessionId())
+              || reserved.roundNo() != round.roundNo()
+              || !reserved.inputQueries().equals(round.inputQueries())
+              || !reserved.startedAt().equals(round.startedAt()))
+            throw new IllegalStateException("retrieval round does not match its reservation");
+          int rows =
+              jdbc.update(
+                  "INSERT INTO retrieval_round(round_id,session_id,round_no,input_queries,decision,missing_information,next_queries,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                  round.roundId(),
+                  round.sessionId(),
+                  round.roundNo(),
+                  json(round.inputQueries()),
+                  round.decision().name(),
+                  json(round.missingInformation()),
+                  json(round.nextQueries()),
+                  ts(round.startedAt()),
+                  ts(round.finishedAt()));
+          if (rows == 0
+              && listRounds(round.sessionId()).stream()
+                  .noneMatch(existing -> sameCompletion(existing, round)))
+            throw new IllegalStateException("retrieval round already has a different completion");
+        });
+  }
+
+  private static boolean sameCompletion(RetrievalRound existing, RetrievalRound next) {
+    return existing.roundId().equals(next.roundId())
+        && existing.roundNo() == next.roundNo()
+        && existing.inputQueries().equals(next.inputQueries())
+        && existing.decision() == next.decision()
+        && existing.missingInformation().equals(next.missingInformation())
+        && existing.nextQueries().equals(next.nextQueries())
+        && existing.startedAt().equals(next.startedAt())
+        && existing
+            .finishedAt()
+            .equals(next.finishedAt().truncatedTo(java.time.temporal.ChronoUnit.MICROS));
   }
 
   @Override
@@ -161,8 +387,7 @@ public final class JdbcQuerySessionRepository
   @Override
   public void addEvidence(QueryEvidenceRef evidence) {
     jdbc.update(
-        "INSERT INTO query_evidence(session_id,evidence_id,first_seen_round,supporting_query) VALUES(?,?,?,?) "
-            + "ON DUPLICATE KEY UPDATE first_seen_round=LEAST(first_seen_round,VALUES(first_seen_round)),supporting_query=IF(first_seen_round>VALUES(first_seen_round),VALUES(supporting_query),supporting_query)",
+        "INSERT INTO query_evidence(session_id,evidence_id,first_seen_round,supporting_query) VALUES(?,?,?,?) ON CONFLICT (session_id,evidence_id) DO UPDATE SET first_seen_round=LEAST(query_evidence.first_seen_round,EXCLUDED.first_seen_round),supporting_query=CASE WHEN query_evidence.first_seen_round>EXCLUDED.first_seen_round THEN EXCLUDED.supporting_query ELSE query_evidence.supporting_query END",
         evidence.sessionId(),
         evidence.evidenceId(),
         evidence.firstSeenRound(),
@@ -342,7 +567,7 @@ public final class JdbcQuerySessionRepository
     Instant changedAt = now == null ? Instant.now() : now;
     ensureOwnedActiveSession(userId, sessionId);
     jdbc.update(
-        "UPDATE query_group_member m JOIN query_group g ON g.group_id=m.group_id SET m.deleted_at=? WHERE m.session_id=? AND m.deleted_at IS NULL AND g.user_id=? AND g.deleted_at IS NULL",
+        "UPDATE query_group_member m SET deleted_at=? FROM query_group g WHERE g.group_id=m.group_id AND m.session_id=? AND m.deleted_at IS NULL AND g.user_id=? AND g.deleted_at IS NULL",
         ts(changedAt),
         sessionId,
         userId);
@@ -457,6 +682,92 @@ public final class JdbcQuerySessionRepository
         ownerId);
   }
 
+  @Override
+  public void addSourceVersions(String sessionId, List<String> versionIds) {
+    for (String versionId : versionIds)
+      jdbc.update(
+          "INSERT INTO query_source_dependency(session_id,version_id) VALUES(?,?) ON CONFLICT DO NOTHING",
+          sessionId,
+          versionId);
+  }
+
+  @Override
+  public List<String> listSourceVersions(String sessionId) {
+    return jdbc.query(
+        "SELECT version_id FROM query_source_dependency WHERE session_id=? ORDER BY version_id",
+        (rs, n) -> rs.getString(1),
+        sessionId);
+  }
+
+  @Override
+  public void addAssetExpansions(
+      String sessionId,
+      int roundNo,
+      List<cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Result> results) {
+    if (roundNo <= 0) throw new IllegalArgumentException("entry expansion round is required");
+    if (results == null || results.isEmpty()) return;
+    transactions.executeWithoutResult(
+        status -> {
+          var running =
+              jdbc.query(
+                  "SELECT session_id FROM query_session WHERE session_id=? AND status='RUNNING' AND deleted_at IS NULL FOR SHARE",
+                  (rs, n) -> rs.getString(1),
+                  sessionId);
+          if (running.isEmpty())
+            throw new IllegalStateException("entry expansion requires a running query");
+          for (var result : results) {
+            var candidate = result.candidate();
+            if (candidate.lane()
+                != cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.LaneType.WIKI) continue;
+            var attributes = candidate.attributes();
+            if (!attributes.containsKey("asset_version"))
+              continue; // Never invent legacy attribution.
+            Object value = attributes.get("asset_version");
+            if (!(value instanceof Number revision)
+                || revision.longValue() <= 0
+                || revision.doubleValue() != revision.longValue()
+                || !candidate.id().equals(attributes.get("asset_id")))
+              throw new IllegalArgumentException("invalid expanded entry identity");
+            for (var evidence : result.evidence()) {
+              // Membership must be supported by this exact entry revision and resolved raw
+              // evidence.
+              int inserted =
+                  jdbc.update(
+                      """
+              INSERT INTO query_asset_expansion(session_id,asset_id,asset_version,source_version_id,evidence_id,first_seen_round)
+              SELECT ?,s.asset_id,s.asset_version,s.source_version_id,e.evidence_id,?
+              FROM kb_asset_source s JOIN evidence e ON e.version_id=s.source_version_id AND e.document_id=s.document_id
+              WHERE s.asset_id=? AND s.asset_version=? AND e.evidence_id=? AND e.document_id=? AND e.version_id=? AND e.active=TRUE
+                AND s.evidence_ids @> jsonb_build_array(e.evidence_id)
+                AND EXISTS(SELECT 1 FROM query_evidence q WHERE q.session_id=? AND q.evidence_id=e.evidence_id)
+              ON CONFLICT DO NOTHING
+              """,
+                      sessionId,
+                      roundNo,
+                      candidate.id(),
+                      revision.longValue(),
+                      evidence.id(),
+                      evidence.documentId(),
+                      evidence.versionId(),
+                      sessionId);
+              if (inserted == 0) {
+                Integer prior =
+                    jdbc.queryForObject(
+                        "SELECT count(*) FROM query_asset_expansion WHERE session_id=? AND asset_id=? AND asset_version=? AND evidence_id=?",
+                        Integer.class,
+                        sessionId,
+                        candidate.id(),
+                        revision.longValue(),
+                        evidence.id());
+                if (prior == null || prior != 1)
+                  throw new IllegalArgumentException(
+                      "expanded evidence is not in the entry catalogue or query inputs");
+              }
+            }
+          }
+        });
+  }
+
   private List<String> groupSessionIds(String groupId) {
     return jdbc.query(
         "SELECT m.session_id FROM query_group_member m JOIN query_session s ON s.session_id=m.session_id WHERE m.group_id=? AND m.deleted_at IS NULL AND s.deleted_at IS NULL ORDER BY m.position,m.session_id",
@@ -477,12 +788,12 @@ public final class JdbcQuerySessionRepository
   private void moveSessionToGroupInternal(
       String userId, String sessionId, String groupId, int position, Instant now) {
     jdbc.update(
-        "UPDATE query_group_member m JOIN query_group g ON g.group_id=m.group_id SET m.deleted_at=? WHERE m.session_id=? AND m.deleted_at IS NULL AND g.user_id=? AND g.deleted_at IS NULL",
+        "UPDATE query_group_member m SET deleted_at=? FROM query_group g WHERE g.group_id=m.group_id AND m.session_id=? AND m.deleted_at IS NULL AND g.user_id=? AND g.deleted_at IS NULL",
         ts(now),
         sessionId,
         userId);
     jdbc.update(
-        "INSERT INTO query_group_member(group_id,session_id,position,created_at,deleted_at) VALUES(?,?,?,?,NULL) ON DUPLICATE KEY UPDATE position=VALUES(position),created_at=VALUES(created_at),deleted_at=NULL",
+        "INSERT INTO query_group_member(group_id,session_id,position,created_at,deleted_at) VALUES(?,?,?,?,NULL) ON CONFLICT (group_id,session_id) DO UPDATE SET position=EXCLUDED.position,created_at=EXCLUDED.created_at,deleted_at=NULL",
         groupId,
         sessionId,
         Math.max(0, position),
@@ -541,109 +852,6 @@ public final class JdbcQuerySessionRepository
     } catch (JsonProcessingException e) {
       throw new IllegalStateException("cannot encode query session JSON", e);
     }
-  }
-
-  private void ensureSchema() {
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS query_session ("
-            + "session_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,"
-            + "user_id CHAR(36) CHARACTER SET ascii NOT NULL,"
-            + "name VARCHAR(255) NOT NULL,"
-            + "original_question MEDIUMTEXT NOT NULL,filters_json JSON NOT NULL,"
-            + "status ENUM('RUNNING','WAITING_USER','ANSWERED','INSUFFICIENT','FAILED') NOT NULL DEFAULT 'RUNNING',"
-            + "final_answer MEDIUMTEXT NULL,evidence_only BOOLEAN NOT NULL DEFAULT FALSE,"
-            + "clarification_question TEXT NULL,choices_json JSON NOT NULL,citation_evidence_ids JSON NOT NULL,"
-            + "created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),"
-            + "updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),"
-            + "deleted_at TIMESTAMP(6) NULL,"
-            + "KEY idx_query_session_user (user_id,created_at),KEY idx_query_session_status (status,updated_at),KEY idx_query_session_deleted (user_id,deleted_at)) ENGINE=InnoDB");
-    ensureColumn(
-        "query_session",
-        "name",
-        "ALTER TABLE query_session ADD COLUMN name VARCHAR(255) NULL AFTER user_id");
-    ensureColumn(
-        "query_session",
-        "deleted_at",
-        "ALTER TABLE query_session ADD COLUMN deleted_at TIMESTAMP(6) NULL AFTER updated_at");
-    jdbc.update(
-        "UPDATE query_session SET name=LEFT(original_question,255),updated_at=updated_at WHERE name IS NULL OR TRIM(name)='' ");
-    jdbc.execute("ALTER TABLE query_session MODIFY COLUMN name VARCHAR(255) NOT NULL");
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS query_turn ("
-            + "turn_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,session_id CHAR(36) CHARACTER SET ascii NOT NULL,"
-            + "role ENUM('USER','ASSISTANT','SYSTEM_EVENT') NOT NULL,content MEDIUMTEXT NOT NULL,"
-            + "created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),KEY idx_query_turn_session (session_id,created_at),"
-            + "CONSTRAINT fk_query_turn_session FOREIGN KEY (session_id) REFERENCES query_session(session_id) ON DELETE CASCADE) ENGINE=InnoDB");
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS retrieval_round ("
-            + "round_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,session_id CHAR(36) CHARACTER SET ascii NOT NULL,"
-            + "round_no INT UNSIGNED NOT NULL,input_queries JSON NOT NULL,"
-            + "decision ENUM('ANSWER','CONTINUE_SEARCH','ASK_USER') NOT NULL,missing_information JSON NOT NULL,next_queries JSON NOT NULL,"
-            + "started_at TIMESTAMP(6) NOT NULL,finished_at TIMESTAMP(6) NOT NULL,"
-            + "UNIQUE KEY uq_retrieval_round_session_no (session_id,round_no),KEY idx_retrieval_round_session (session_id,started_at),"
-            + "CONSTRAINT fk_retrieval_round_session FOREIGN KEY (session_id) REFERENCES query_session(session_id) ON DELETE CASCADE) ENGINE=InnoDB");
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS query_evidence ("
-            + "session_id CHAR(36) CHARACTER SET ascii NOT NULL,evidence_id CHAR(36) CHARACTER SET ascii NOT NULL,"
-            + "first_seen_round INT UNSIGNED NOT NULL,supporting_query TEXT NOT NULL,PRIMARY KEY (session_id,evidence_id),"
-            + "KEY idx_query_evidence_evidence (evidence_id),"
-            + "CONSTRAINT fk_query_evidence_session FOREIGN KEY (session_id) REFERENCES query_session(session_id) ON DELETE CASCADE) ENGINE=InnoDB");
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS query_feedback ("
-            + "feedback_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,session_id CHAR(36) CHARACTER SET ascii NOT NULL,"
-            + "user_id CHAR(36) CHARACTER SET ascii NOT NULL,rating ENUM('POSITIVE','NEGATIVE','NEUTRAL') NOT NULL,"
-            + "category VARCHAR(64) CHARACTER SET ascii NULL,comment TEXT NULL,created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),"
-            + "KEY idx_query_feedback_session (session_id,created_at),KEY idx_query_feedback_user (user_id,created_at),"
-            + "CONSTRAINT fk_query_feedback_session FOREIGN KEY (session_id) REFERENCES query_session(session_id) ON DELETE CASCADE) ENGINE=InnoDB");
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS query_group ("
-            + "group_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,user_id CHAR(36) CHARACTER SET ascii NOT NULL,"
-            + "name VARCHAR(255) NOT NULL,created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),"
-            + "updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),"
-            + "deleted_at TIMESTAMP(6) NULL,KEY idx_query_group_user (user_id,updated_at),KEY idx_query_group_deleted (user_id,deleted_at)) ENGINE=InnoDB");
-    ensureColumn(
-        "query_group",
-        "deleted_at",
-        "ALTER TABLE query_group ADD COLUMN deleted_at TIMESTAMP(6) NULL AFTER updated_at");
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS query_group_member ("
-            + "group_id CHAR(36) CHARACTER SET ascii NOT NULL,session_id CHAR(36) CHARACTER SET ascii NOT NULL,position INT UNSIGNED NOT NULL DEFAULT 0,"
-            + "created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),deleted_at TIMESTAMP(6) NULL,PRIMARY KEY(group_id,session_id),"
-            + "KEY idx_query_group_member_session (session_id,deleted_at),"
-            + "CONSTRAINT fk_query_group_member_group FOREIGN KEY (group_id) REFERENCES query_group(group_id) ON DELETE CASCADE,"
-            + "CONSTRAINT fk_query_group_member_session FOREIGN KEY (session_id) REFERENCES query_session(session_id) ON DELETE CASCADE) ENGINE=InnoDB");
-    ensureColumn(
-        "query_group_member",
-        "deleted_at",
-        "ALTER TABLE query_group_member ADD COLUMN deleted_at TIMESTAMP(6) NULL AFTER created_at");
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS query_package ("
-            + "package_id CHAR(36) CHARACTER SET ascii PRIMARY KEY,user_id CHAR(36) CHARACTER SET ascii NOT NULL,"
-            + "owner_type ENUM('SESSION','GROUP') NOT NULL,owner_id CHAR(36) CHARACTER SET ascii NOT NULL,object_key VARCHAR(1024) NOT NULL,"
-            + "status ENUM('AVAILABLE','DELETED','MISSING') NOT NULL DEFAULT 'AVAILABLE',deleted_at TIMESTAMP(6) NULL,"
-            + "created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),"
-            + "KEY idx_query_package_owner (user_id,owner_type,owner_id,created_at)) ENGINE=InnoDB");
-    ensureColumn(
-        "query_package",
-        "status",
-        "ALTER TABLE query_package ADD COLUMN status ENUM('AVAILABLE','DELETED','MISSING') NOT NULL DEFAULT 'AVAILABLE' AFTER object_key");
-    ensureColumn(
-        "query_package",
-        "deleted_at",
-        "ALTER TABLE query_package ADD COLUMN deleted_at TIMESTAMP(6) NULL AFTER status");
-    jdbc.update(
-        "UPDATE query_session SET status='FAILED',final_answer=?,evidence_only=TRUE,updated_at=CURRENT_TIMESTAMP(6) WHERE status='RUNNING'",
-        "查询服务已重启，本次查询未完成，请重新发起。");
-  }
-
-  private void ensureColumn(String table, String column, String alterSql) {
-    Integer columns =
-        jdbc.queryForObject(
-            "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name=?",
-            Integer.class,
-            table,
-            column);
-    if (columns == null || columns == 0) jdbc.execute(alterSql);
   }
 
   private static Timestamp ts(Instant value) {

@@ -18,17 +18,32 @@ public final class QueryHistoryApplicationService {
   private final QuerySessionRepository sessions;
   private final QueryHistoryRepository history;
   private final SourcePackageService packages;
+  private final cn.lgs.knowledgebase.application.access.KnowledgeAccessService access;
 
   public QueryHistoryApplicationService(
       QuerySessionRepository sessions,
       QueryHistoryRepository history,
       SourcePackageService packages) {
+    this(sessions, history, packages, null);
+  }
+
+  public QueryHistoryApplicationService(
+      QuerySessionRepository sessions,
+      QueryHistoryRepository history,
+      SourcePackageService packages,
+      cn.lgs.knowledgebase.application.access.KnowledgeAccessService access) {
+    this.access = access;
     if (sessions == null) throw new IllegalArgumentException("query sessions are required");
     if (history == null) throw new IllegalArgumentException("query history repository is required");
     if (packages == null) throw new IllegalArgumentException("source package service is required");
     this.sessions = sessions;
     this.history = history;
     this.packages = packages;
+  }
+
+  private void requireCurrent(QuerySession session) {
+    if (access != null && !access.permitsSession(session))
+      throw new cn.lgs.knowledgebase.application.access.KnowledgeAccessService.Denied();
   }
 
   public List<RecordView> listRecords(String userId, int limit) {
@@ -88,6 +103,7 @@ public final class QueryHistoryApplicationService {
 
   public PackageView recordPackage(String userId, String sessionId, boolean regenerate) {
     QuerySession session = ownedSession(userId, sessionId);
+    requireCurrent(session);
     List<QueryPackage> previousPackages =
         history.packagesForOwner(userId, "SESSION", session.sessionId());
     Optional<QueryPackage> existing = previousPackages.stream().findFirst();
@@ -97,7 +113,8 @@ public final class QueryHistoryApplicationService {
     }
     if (session.citationEvidenceIds().isEmpty())
       throw new IllegalStateException("query record has no cited source material to package");
-    var published = packages.packageSources(session.citationEvidenceIds());
+    var published =
+        packages.packageAnswerSources(userId, session.sessionId(), session.citationEvidenceIds());
     QueryPackage queryPackage =
         new QueryPackage(
             published.packageId(),
@@ -184,6 +201,7 @@ public final class QueryHistoryApplicationService {
 
   public PackageView groupPackage(String userId, String groupId, boolean regenerate) {
     QueryGroup group = ownedGroup(userId, groupId);
+    for (String id : group.sessionIds()) requireCurrent(ownedSession(userId, id));
     List<QueryPackage> previousPackages =
         history.packagesForOwner(userId, "GROUP", group.groupId());
     Optional<QueryPackage> existing = previousPackages.stream().findFirst();
@@ -195,13 +213,16 @@ public final class QueryHistoryApplicationService {
     List<SourcePackageGroup> sourceGroups = new ArrayList<>();
     for (String sessionId : group.sessionIds()) {
       QuerySession session = ownedSession(userId, sessionId);
+      requireCurrent(session);
       if (!session.citationEvidenceIds().isEmpty()) {
-        sourceGroups.add(new SourcePackageGroup(session.name(), session.citationEvidenceIds()));
+        sourceGroups.add(
+            new SourcePackageGroup(
+                session.name(), session.citationEvidenceIds(), session.sessionId()));
       }
     }
     if (sourceGroups.isEmpty())
       throw new IllegalStateException("query group has no cited source material to package");
-    var published = packages.packageGroupedSources(sourceGroups);
+    var published = packages.packageGroupedSources(userId, sourceGroups);
     QueryPackage queryPackage =
         new QueryPackage(
             published.packageId(),
@@ -225,7 +246,8 @@ public final class QueryHistoryApplicationService {
   private RecordView recordView(String userId, QuerySession session) {
     PackageView latest = latestPackage(userId, "SESSION", session.sessionId());
     QueryGroup group = history.groupForSession(userId, session.sessionId()).orElse(null);
-    return new RecordView(session, group, latest);
+    var visible = access == null ? session : access.visibleSession(session);
+    return new RecordView(visible, group, latest, visible != session);
   }
 
   private GroupView groupView(String userId, QueryGroup group) {
@@ -248,13 +270,17 @@ public final class QueryHistoryApplicationService {
           queryPackage.packageId(), queryPackage.status(), null, null, queryPackage.createdAt());
     }
     try {
-      PackageAccess access = packages.accessPackage(queryPackage.objectKey());
+      PackageAccess access =
+          packages.accessPackage(queryPackage.userId(), queryPackage.objectKey());
       return new PackageView(
           queryPackage.packageId(),
           "AVAILABLE",
           access.downloadUrl(),
           access.expiresAt(),
           queryPackage.createdAt());
+    } catch (cn.lgs.knowledgebase.application.access.KnowledgeAccessService.Denied denied) {
+      return new PackageView(
+          queryPackage.packageId(), "ACCESS_CHANGED", null, null, queryPackage.createdAt());
     } catch (RuntimeException unavailable) {
       history.markPackageStatus(queryPackage.packageId(), "MISSING", null);
       return new PackageView(
@@ -317,7 +343,8 @@ public final class QueryHistoryApplicationService {
   public record PackageView(
       String packageId, String status, String downloadUrl, Instant expiresAt, Instant createdAt) {}
 
-  public record RecordView(QuerySession session, QueryGroup group, PackageView latestPackage) {}
+  public record RecordView(
+      QuerySession session, QueryGroup group, PackageView latestPackage, boolean evidenceChanged) {}
 
   public record GroupView(QueryGroup group, List<RecordView> records, PackageView latestPackage) {
     public GroupView {

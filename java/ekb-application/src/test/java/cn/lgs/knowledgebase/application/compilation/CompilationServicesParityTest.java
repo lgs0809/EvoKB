@@ -41,9 +41,13 @@ class CompilationServicesParityTest {
 
     var graph = f.graphCompilation.compileSummary(summary.id());
     assertTrue(graph.coverage().pass());
-    assertEquals(1, graph.relations().size());
+    assertEquals(3, graph.relations().size());
+    assertEquals(
+        1, graph.relations().stream().filter(r -> r.predicate().equals("SUPPLIES_TO")).count());
+    assertEquals(
+        2, graph.relations().stream().filter(r -> r.predicate().equals("DOCUMENTS")).count());
     assertEquals(List.of("ev1"), graph.relations().get(0).evidenceIds());
-    assertEquals(1, f.graphStore.relations.size());
+    assertEquals(3, f.graphStore.relations.size());
     assertFalse(f.repository.resolutions.isEmpty());
     assertTrue(f.repository.resolutions.stream().allMatch(r -> "v1".equals(r.versionId())));
     assertTrue(f.repository.resolutions.stream().allMatch(r -> "ev1".equals(r.evidenceId())));
@@ -54,7 +58,14 @@ class CompilationServicesParityTest {
     var wiki =
         f.wiki.compile(
             new WikiCompilationService.CompileRequest(
-                "COMPANY", "甲公司", graph.entities().get(0).canonicalId(), List.of(summary.id())));
+                "COMPANY",
+                "甲公司",
+                graph.entities().stream()
+                    .filter(e -> e.canonicalName().equals("甲公司"))
+                    .findFirst()
+                    .orElseThrow()
+                    .canonicalId(),
+                List.of(summary.id())));
     assertTrue(wiki.coverage().pass());
     assertEquals("ACTIVE", wiki.wiki().lifecycle());
     assertEquals(List.of("甲公司", "乙公司"), wiki.wiki().keywords());
@@ -168,8 +179,11 @@ class CompilationServicesParityTest {
                 List.of(
                     new SummaryCompilationService.FactProposal(
                         "项目与主体", "甲公司向乙公司供货。", List.of("rb1"))));
-      } else if (outputType == SummaryCompilationService.SupportDecision.class) {
-        result = new SummaryCompilationService.SupportDecision(true, "directly supported");
+      } else if (outputType
+          == cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision.class) {
+        result =
+            new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+                true, "directly supported");
       } else if (outputType == SummaryCompilationService.CoverageDecision.class) {
         result = new SummaryCompilationService.CoverageDecision(List.of());
       } else if (outputType == GraphCompilationService.Extraction.class) {
@@ -201,12 +215,76 @@ class CompilationServicesParityTest {
                     new WikiCompilationService.ProposedClaim(
                         "Profile", "[[甲公司]]向[[乙公司]]供货。", List.of(factId))),
                 List.of(new WikiCompilationService.FactDecision(factId, true, "")));
-      } else if (outputType == WikiCompilationService.SupportDecision.class) {
-        result = new WikiCompilationService.SupportDecision(true, "directly supported");
       } else {
         throw new AssertionError("unexpected output type " + outputType);
       }
-      return (T) result;
+      return (T) withFixtureAudit(result, userPrompt);
+    }
+
+    // Explicit model fixture, not a semantic judge. Source and candidate spans are real prompt
+    // spans so the production audit gate remains active in these orchestration regressions.
+    private static Object withFixtureAudit(Object value, String prompt) {
+      if (value
+              instanceof
+              cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision d
+          && d.checks() == null)
+        return new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            d.supported(), d.reason(), fixtureChecks(prompt, ""));
+      if (value
+          instanceof cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch set)
+        return new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch(
+            set.decisions().stream()
+                .map(
+                    d ->
+                        d.checks() == null
+                            ? new cn.lgs.knowledgebase.application.compilation
+                                .GroundingJudgeProtocol.Item(
+                                d.candidateId(),
+                                d.supported(),
+                                d.reason(),
+                                fixtureChecks(prompt, d.candidateId()))
+                            : d)
+                .toList());
+      return value;
+    }
+
+    private static List<
+            cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Constraint>
+        fixtureChecks(String prompt, String id) {
+      String part = prompt;
+      int start = id.isEmpty() ? -1 : prompt.indexOf("candidate_id=" + id + "\n");
+      if (start >= 0) part = prompt.substring(start);
+      int end = part.indexOf("\n===\n");
+      if (end >= 0) part = part.substring(0, end);
+      String marker = part.contains("\nSUPPORTING FACTS:") ? "\nSUPPORTING FACTS:" : "\nEVIDENCE:";
+      int split = part.indexOf(marker);
+      int begin = part.indexOf("FACT: ");
+      int prefix = 6;
+      if (begin < 0) {
+        begin = part.indexOf("FACT=");
+        prefix = 5;
+      }
+      if (begin < 0) {
+        begin = part.indexOf("CLAIM=");
+        prefix = 6;
+      }
+      if (begin < 0 || split < 0)
+        throw new AssertionError("No grounding contract in fixture prompt");
+      String claim = part.substring(begin + prefix, split).trim();
+      String evidence = part.substring(split + marker.length()).trim();
+      return java.util.Arrays.stream(
+              cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit.Dimension
+                  .values())
+          .map(
+              d ->
+                  new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol
+                      .Constraint(
+                      d,
+                      cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit.Finding
+                          .SUPPORTED,
+                      List.of(evidence),
+                      "Explicit orchestration fixture support"))
+          .toList();
     }
 
     private static String firstFactId(String prompt) {

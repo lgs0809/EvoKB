@@ -132,7 +132,17 @@ class RawIngestionRetryResumeTest {
         };
     RawIngestionApplicationService service =
         new RawIngestionApplicationService(
-            files, objects, repository, parser, encoder, search, embedder, null);
+            files,
+            objects,
+            repository,
+            parser,
+            encoder,
+            search,
+            embedder,
+            null,
+            RawTestFixtures.TOKENS,
+            RawChunkProfile.DEFAULT,
+            RawTestFixtures.encoder(embedder));
     List<ProgressStage> progress = new ArrayList<>();
 
     var result =
@@ -261,6 +271,12 @@ class RawIngestionRetryResumeTest {
 
     @Override
     public void ensureIndex(int embeddingDimensions) {}
+
+    @Override
+    public int indexedChunkCount(String versionId) {
+      throw new AssertionError(
+          "A count cannot prove that any exact chunk/profile was durably indexed");
+    }
 
     @Override
     public void indexRaw(String documentId, String versionId, List<RawIndexDocument> chunks) {

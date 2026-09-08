@@ -25,6 +25,24 @@ import org.junit.jupiter.api.Test;
 
 class ObjectStoreSourcePackageServiceTest {
   @Test
+  void originalSourceMetadataKeepsUserFilenameWhenObjectKeyHasNoExtension() throws Exception {
+    var objects = new MemoryObjectStore();
+    String objectKey = "upload-sessions/enterprise/fixture/session/original";
+    objects.seed(objectKey, "付款需要验收与合法发票");
+    var service = service(Map.of("e1", ref("e1", "d1", "v1", "采购补充协议.md", objectKey)), objects);
+
+    var source = service.source("e1");
+
+    assertEquals("采购补充协议.md", source.sourceFilename());
+    assertEquals(objectKey, source.objectKey());
+    assertEquals(objects.stat(objectKey).contentType(), source.contentType());
+    assertEquals("/api/enterprise/evidence/source/file?id=e1", source.viewUrl());
+    try (var original = service.openOriginal("e1").stream()) {
+      assertArrayEquals(objects.bytes(objectKey), original.readAllBytes());
+    }
+  }
+
+  @Test
   void singleQueryPackageUsesRootFilenamesAndReadableDuplicateSuffix() throws Exception {
     var refs =
         Map.of(

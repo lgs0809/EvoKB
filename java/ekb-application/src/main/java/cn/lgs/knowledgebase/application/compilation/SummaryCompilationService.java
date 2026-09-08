@@ -36,7 +36,7 @@ public final class SummaryCompilationService {
   // return the complete decision array reliably.  Every candidate is still judged exactly once
   // and the aggregate remains fail-closed: unknown, duplicate, missing, or null decisions abort
   // compilation rather than being accepted implicitly.
-  private static final int GROUNDING_JUDGE_BATCH_SIZE = 4;
+  private static final int GROUNDING_JUDGE_BATCH_SIZE = GroundingJudgeProtocol.MAX_BATCH_CANDIDATES;
   // Keep each summary extraction request bounded for large real-world reports while
   // preserving every RawBlock in full. Batches are split only at block boundaries;
   // coverage/repair remains responsible for finding facts that span adjacent batches.
@@ -111,7 +111,13 @@ public final class SummaryCompilationService {
   }
 
   public List<PreparedSummary> compileVersion(String versionId) {
+    return compileVersion(versionId, repository.newPublication());
+  }
+
+  public List<PreparedSummary> compileVersion(
+      String versionId, CompilationPublication publication) {
     VersionSource source = repository.loadVersionSource(versionId);
+    publication.captureInputs(List.of(source.versionId()));
     if (source.blocks().isEmpty() || source.evidenceByBlock().isEmpty()) {
       throw new IllegalStateException("active version has incomplete raw evidence: " + versionId);
     }
@@ -139,7 +145,8 @@ public final class SummaryCompilationService {
         units = fallbackDocumentUnits(source);
       }
     }
-    repository.replaceDocumentUnits(versionId, units);
+    List<DocumentUnit> plannedUnits = units;
+    publication.publish(() -> repository.replaceDocumentUnits(versionId, plannedUnits));
     // The database keeps (version_id, unit_no) unique for idempotency. If a later model
     // classification changes a unit's descriptive fields, the upsert intentionally retains the
     // existing primary key because summaries may already reference it. Re-read persisted units
@@ -154,7 +161,7 @@ public final class SummaryCompilationService {
     String currentLargeModel = model.identity(ModelRole.LARGE);
     Map<String, SummaryRecord> resumable = new LinkedHashMap<>();
     for (SummaryRecord summary : repository.loadActiveSummariesForVersion(versionId)) {
-      if (summary.activeAndGrounded()
+      if (GroundingConstraintAudit.currentSummary(summary, source)
           && currentLargeModel.equals(summary.model())
           && resumable.putIfAbsent(summary.unitId(), summary) != null) {
         throw new IllegalStateException(
@@ -167,7 +174,7 @@ public final class SummaryCompilationService {
       if (checkpoint != null) {
         results.add(new PreparedSummary(unit, checkpoint, 0));
       } else {
-        results.add(compileUnit(source, unit));
+        results.add(compileUnit(source, unit, publication));
       }
     }
     return List.copyOf(results);
@@ -194,7 +201,8 @@ public final class SummaryCompilationService {
     return List.copyOf(resolved);
   }
 
-  private PreparedSummary compileUnit(VersionSource source, DocumentUnit unit) {
+  private PreparedSummary compileUnit(
+      VersionSource source, DocumentUnit unit, CompilationPublication publication) {
     List<RawBlock> blocks =
         source.blocks().stream()
             .filter(
@@ -261,7 +269,11 @@ public final class SummaryCompilationService {
                 + ":"
                 + model.identity(ModelRole.LARGE)
                 + ":"
-                + sha256(markdown));
+                + GroundingConstraintAudit.POLICY_VERSION
+                + ":"
+                + sha256(markdown)
+                + ":"
+                + publication.objectKey("summary-revision"));
     List<SummaryFact> withSummary = new ArrayList<>(facts.size());
     for (SummaryFact fact : facts) {
       String storedFactId =
@@ -281,9 +293,10 @@ public final class SummaryCompilationService {
               fact.evidenceBlockIds(),
               fact.evidenceIds(),
               fact.groundingStatus(),
-              fact.groundingReason()));
+              fact.groundingReason(),
+              fact.groundingAudit()));
     }
-    String objectKey =
+    String logicalObjectKey =
         "summary/"
             + source.documentId()
             + "/"
@@ -293,6 +306,7 @@ public final class SummaryCompilationService {
             + "/"
             + summaryId
             + ".md";
+    String objectKey = publication.objectKey(logicalObjectKey);
     byte[] bytes = markdown.getBytes(StandardCharsets.UTF_8);
     objects.put(
         objectKey, new ByteArrayInputStream(bytes), bytes.length, "text/markdown; charset=utf-8");
@@ -312,7 +326,7 @@ public final class SummaryCompilationService {
             markdown,
             withSummary,
             clock.instant());
-    repository.saveSummary(stored);
+    Runnable indexPublication = () -> {};
     if (stored.activeAndGrounded()) {
       List<Claim> claims =
           withSummary.stream().map(f -> new Claim(f.factText(), f.evidenceIds(), 1.0)).toList();
@@ -328,18 +342,25 @@ public final class SummaryCompilationService {
       List<List<Float>> vectors = embedding.embed(List.of(markdown));
       if (vectors.size() != 1)
         throw new IllegalStateException("summary embedding response mismatch");
-      derived.indexSummary(
-          artifact,
-          new DerivedContext(
-              List.of(source.documentId()),
-              List.of(source.versionId()),
-              values(source.metadata().sourceDepartment()),
-              values(source.metadata().materialCategory()),
-              values(source.metadata().company()),
-              values(source.metadata().documentType()),
-              source.metadata().manualTags()),
-          vectors.get(0));
+      indexPublication =
+          derived.prepareSummary(
+              artifact,
+              new DerivedContext(
+                  List.of(source.documentId()),
+                  List.of(source.versionId()),
+                  values(source.metadata().sourceDepartment()),
+                  values(source.metadata().materialCategory()),
+                  values(source.metadata().company()),
+                  values(source.metadata().documentType()),
+                  source.metadata().manualTags()),
+              vectors.get(0));
     }
+    Runnable publishIndex = indexPublication;
+    publication.publish(
+        () -> {
+          repository.saveSummary(stored);
+          publishIndex.run();
+        });
     return new PreparedSummary(unit, stored, repairs);
   }
 
@@ -532,7 +553,9 @@ public final class SummaryCompilationService {
               candidate.blockIds(),
               candidate.evidence().stream().map(Evidence::id).distinct().toList(),
               "PASS",
-              trim(decision.reason())));
+              GroundingConstraintAudit.describe(decision.reason(), decision.checks()),
+              GroundingConstraintAudit.acceptedFullCandidate(
+                  candidate.factText(), decision.checks())));
     }
     return List.copyOf(facts);
   }
@@ -616,24 +639,31 @@ public final class SummaryCompilationService {
           "summary grounding candidate has empty evidence " + candidate.judgeId());
     SupportDecision supported = null;
     for (String evidence : evidenceFragments) {
-      SupportDecision decision =
+      GroundingJudgeProtocol.Decision decision =
           model.generateStructured(
               ModelRole.SMALL,
               ModelTask.SUMMARY_JUDGE,
               "你是独立事实 Grounding Judge。仅判断 FACT 是否被给定 RAW EVIDENCE 直接支持。"
+                  + groundingCriteria()
                   + "EVIDENCE 可能是同一原始证据的完整分片；只依据当前分片，严禁使用常识补全。"
-                  + "严格输出 supported/reason。",
+                  + "严格输出 supported、reason 和 checks。",
               "FACT: " + candidate.factText() + "\nEVIDENCE:\n" + evidence,
-              SupportDecision.class);
-      if (decision == null)
-        throw new IllegalStateException(
-            "summary grounding individual judge returned empty decision for "
-                + candidate.judgeId());
-      if (decision.supported()) supported = decision;
+              GroundingJudgeProtocol.Decision.class);
+      GroundingConstraintAudit.requireModelDecision(
+          decision, "summary grounding individual judge for " + candidate.judgeId());
+      GroundingJudgeProtocol.requireVersion(decision.protocolVersion());
+      var checks = GroundingJudgeProtocol.bind(candidate.factText(), decision.checks());
+      if (GroundingConstraintAudit.modelSupported(
+          candidate.factText(), evidence, decision.supported(), checks))
+        supported = new SupportDecision(true, decision.reason(), checks);
     }
     return supported == null
         ? new SupportDecision(false, "no evidence fragment directly supports the fact")
         : supported;
+  }
+
+  private static String groundingCriteria() {
+    return GroundingJudgeProtocol.criteria();
   }
 
   private static boolean missingResponseContent(Throwable failure, ModelTask task) {
@@ -728,16 +758,17 @@ public final class SummaryCompilationService {
   }
 
   private Map<String, SupportDecision> judgeGroundingBatch(List<GroundingCandidate> candidates) {
-    SupportDecisionSet result;
+    GroundingJudgeProtocol.Batch result;
     try {
       result =
           model.generateStructured(
               ModelRole.SMALL,
               ModelTask.SUMMARY_JUDGE,
               "你是独立事实 Grounding Judge。逐条判断每个 candidate 是否被它自己的 RAW EVIDENCE 直接支持。"
+                  + groundingCriteria()
                   + "必须为每个 candidate_id 恰好返回一条 decision，不得遗漏、增加或改写 candidate_id；禁止使用常识补全。",
               renderGroundingCandidates(candidates),
-              SupportDecisionSet.class);
+              GroundingJudgeProtocol.Batch.class);
     } catch (RuntimeException failure) {
       throw new IllegalStateException(
           "summary grounding judge failed for "
@@ -746,29 +777,29 @@ public final class SummaryCompilationService {
               + failure.getMessage(),
           failure);
     }
-    if (result == null || result.decisions() == null)
-      throw new IllegalStateException("summary grounding batch returned empty decisions");
+    GroundingConstraintAudit.requireModelDecision(result, "summary grounding batch");
+    GroundingJudgeProtocol.requireVersion(result.protocolVersion());
     Map<String, SupportDecision> decisions = new LinkedHashMap<>();
-    Set<String> expected =
-        candidates.stream()
-            .map(GroundingCandidate::judgeId)
-            .collect(java.util.stream.Collectors.toSet());
-    for (SupportDecisionItem raw : result.decisions()) {
-      if (raw == null)
-        throw new IllegalStateException("summary grounding batch contains null decision");
-      String candidateId = trim(raw.candidateId());
-      if (!expected.contains(candidateId))
-        throw new IllegalStateException(
-            "summary grounding batch references unknown candidate " + candidateId);
-      if (decisions.putIfAbsent(
-              candidateId, new SupportDecision(raw.supported(), trim(raw.reason())))
-          != null)
-        throw new IllegalStateException(
-            "summary grounding batch duplicated candidate " + candidateId);
+    var records =
+        GroundingConstraintAudit.modelDecisions(
+            result == null ? null : result.decisions(),
+            candidates.stream().map(GroundingCandidate::judgeId).toList(),
+            GroundingJudgeProtocol.Item::candidateId,
+            "summary grounding batch");
+    for (var record : records.entrySet()) {
+      String candidateId = record.getKey();
+      GroundingJudgeProtocol.Item raw = record.getValue();
+      var candidate =
+          candidates.stream()
+              .filter(c -> c.judgeId().equals(candidateId))
+              .findFirst()
+              .orElseThrow();
+      var checks = GroundingJudgeProtocol.bind(candidate.factText(), raw.checks());
+      boolean supported =
+          GroundingConstraintAudit.modelSupported(
+              candidate.factText(), renderEvidence(candidate.evidence()), raw.supported(), checks);
+      decisions.put(candidateId, new SupportDecision(supported, trim(raw.reason()), checks));
     }
-    for (String candidateId : expected)
-      if (!decisions.containsKey(candidateId))
-        throw new IllegalStateException("summary grounding batch missing candidate " + candidateId);
     return Map.copyOf(decisions);
   }
 
@@ -1296,7 +1327,12 @@ public final class SummaryCompilationService {
                 List.of(blockId),
                 List.of(evidence.id()),
                 "PASS",
-                "direct raw evidence projection"));
+                GroundingConstraintAudit.describe(
+                    "direct raw evidence projection",
+                    GroundingConstraintAudit.exactCopyChecks(content, List.of(block.content()))),
+                GroundingConstraintAudit.accepted(
+                    content,
+                    GroundingConstraintAudit.exactCopyChecks(content, List.of(block.content())))));
       }
     }
     return List.copyOf(out);
@@ -1384,9 +1420,22 @@ public final class SummaryCompilationService {
 
   public record FactProposal(String section, String factText, List<String> evidenceBlockIds) {}
 
-  public record SupportDecision(boolean supported, String reason) {}
+  public record SupportDecision(
+      boolean supported, String reason, List<GroundingConstraintAudit.Check> checks) {
+    public SupportDecision(boolean supported, String reason) {
+      this(supported, reason, null);
+    }
+  }
 
-  public record SupportDecisionItem(String candidateId, boolean supported, String reason) {}
+  public record SupportDecisionItem(
+      String candidateId,
+      boolean supported,
+      String reason,
+      List<GroundingConstraintAudit.Check> checks) {
+    public SupportDecisionItem(String candidateId, boolean supported, String reason) {
+      this(candidateId, supported, reason, null);
+    }
+  }
 
   public record SupportDecisionSet(List<SupportDecisionItem> decisions) {}
 

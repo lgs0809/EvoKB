@@ -9,13 +9,16 @@ import static cn.lgs.knowledgebase.application.port.Ports.ModelTask.SUMMARY_JUDG
 import static cn.lgs.knowledgebase.application.port.Ports.ModelTask.WIKI_JUDGE;
 import static cn.lgs.knowledgebase.application.port.Ports.ModelTask.WIKI_WRITE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import cn.lgs.knowledgebase.application.compilation.ConceptCompilationService.ConceptProposalSet;
 import cn.lgs.knowledgebase.application.compilation.GraphCompilationService.Extraction;
+import cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit;
 import cn.lgs.knowledgebase.application.compilation.SummaryCompilationService.CoverageDecision;
 import cn.lgs.knowledgebase.application.compilation.SummaryCompilationService.FactProposalSet;
 import cn.lgs.knowledgebase.application.compilation.SummaryCompilationService.SupportDecision;
+import cn.lgs.knowledgebase.application.compilation.SummaryCompilationService.SupportDecisionSet;
 import cn.lgs.knowledgebase.application.compilation.WikiCompilationService.Proposal;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -104,10 +107,80 @@ class AssistantEvidenceFallbackKnowledgeModelTest {
         model.generateStructured(
             SMALL, SUMMARY_JUDGE, "", "FACT: x\nEVIDENCE:\ny", SupportDecision.class);
 
-    assertTrue(result.supported());
+    assertFalse(result.supported(), "Provider failure cannot certify an unrelated candidate");
     assertTrue(
         model.identity(SMALL).contains(AssistantEvidenceFallbackKnowledgeModel.IDENTITY_MARKER));
     assertEquals(1, calls.get());
+  }
+
+  @Test
+  void summaryBatchFallbackKeepsCandidateIdentityAndCertifiesOnlyWholeCopies() {
+    var model = new AssistantEvidenceFallbackKnowledgeModel(new Delegate(), mapper, "always");
+    String source = "只有双方完成验收，甲方才须向乙方交付设备。";
+    var judged =
+        model.generateStructured(
+            SMALL,
+            SUMMARY_JUDGE,
+            "",
+            "CANDIDATES:\ncandidate_id=C1\nFACT="
+                + source
+                + "\nEVIDENCE:\n---\n"
+                + source
+                + "\n===\ncandidate_id=C2\nFACT=甲方须向乙方交付设备。\nEVIDENCE:\n---\n"
+                + source,
+            SupportDecisionSet.class);
+    assertEquals(
+        java.util.List.of("C1", "C2"),
+        judged.decisions().stream().map(d -> d.candidateId()).toList());
+    assertTrue(
+        GroundingConstraintAudit.supported(
+            source,
+            source,
+            judged.decisions().get(0).supported(),
+            judged.decisions().get(0).checks()));
+    assertFalse(judged.decisions().get(1).supported());
+  }
+
+  @Test
+  void wikiBatchFallbackKeepsConditionsAndRejectsPartialMultiSourceCopies() {
+    var model = new AssistantEvidenceFallbackKnowledgeModel(new Delegate(), mapper, "always");
+    String source = "只有双方完成验收，甲方才须向乙方交付设备。";
+    var judged =
+        model.generateStructured(
+            SMALL,
+            WIKI_JUDGE,
+            "",
+            "CANDIDATES:\ncandidate_id=C1\nCLAIM="
+                + source
+                + "\nSUPPORTING FACTS:\n[f1] "
+                + source
+                + "\n===\ncandidate_id=C2\nCLAIM="
+                + source
+                + "\nSUPPORTING FACTS:\n[f1] "
+                + source
+                + "\n[f2] 仍须满足合同的书面通知条件。",
+            cn.lgs.knowledgebase.application.compilation.WikiCompilationService.SupportDecisionSet
+                .class);
+    assertEquals(
+        java.util.List.of("C1", "C2"),
+        judged.decisions().stream().map(d -> d.candidateId()).toList());
+    assertTrue(judged.decisions().get(0).supported());
+    assertFalse(judged.decisions().get(1).supported());
+  }
+
+  @Test
+  void doesNotApproveActorReversalOrRemovedPreconditions() {
+    var model = new AssistantEvidenceFallbackKnowledgeModel(new Delegate(), mapper, "always");
+    for (String candidate : java.util.List.of("乙方应向甲方交付货物。", "甲方应交付货物。")) {
+      var result =
+          model.generateStructured(
+              SMALL,
+              SUMMARY_JUDGE,
+              "",
+              "FACT: " + candidate + "\nEVIDENCE:\n验收通过后，甲方应向乙方交付货物。",
+              SupportDecision.class);
+      assertFalse(result.supported());
+    }
   }
 
   private static final class Delegate

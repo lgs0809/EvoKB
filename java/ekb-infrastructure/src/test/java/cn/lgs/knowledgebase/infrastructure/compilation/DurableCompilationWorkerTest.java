@@ -3,6 +3,7 @@ package cn.lgs.knowledgebase.infrastructure.compilation;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
+import cn.lgs.knowledgebase.application.compilation.CompilationCommands;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.CompilationRepository;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.ConceptRecord;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.DocumentUnit;
@@ -12,8 +13,12 @@ import cn.lgs.knowledgebase.application.compilation.CompilationContracts.Summary
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryRecord;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.VersionSource;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.WikiRecord;
+import cn.lgs.knowledgebase.application.compilation.CompilationExecutionBudget;
+import cn.lgs.knowledgebase.application.compilation.CompilationPublication;
 import cn.lgs.knowledgebase.application.compilation.ConceptCompilationService;
+import cn.lgs.knowledgebase.application.compilation.EntryAssociationService;
 import cn.lgs.knowledgebase.application.compilation.GraphCompilationService;
+import cn.lgs.knowledgebase.application.compilation.KnowledgeEntryCatalogue;
 import cn.lgs.knowledgebase.application.compilation.SummaryCompilationService;
 import cn.lgs.knowledgebase.application.compilation.WikiCompilationService;
 import cn.lgs.knowledgebase.application.compilation.WikiKeywordProjectionService;
@@ -46,6 +51,35 @@ class DurableCompilationWorkerTest {
   private static final Instant NOW = Instant.parse("2026-08-20T00:00:00Z");
 
   @Test
+  void queuedForegroundWorkPausesNewCompilationClaimsWithoutConsumingAnAttempt() {
+    Fixture f = new Fixture(false, false);
+    var busy = new java.util.concurrent.atomic.AtomicBoolean(true);
+    f.worker.withForegroundActivity(busy::get);
+    f.tasks.queue("v1", GenerationTaskType.SUMMARY, "", NOW);
+    assertEquals(0, f.worker.runOneCycle());
+    assertEquals(GenerationTaskStatus.PENDING, f.tasks.only(GenerationTaskType.SUMMARY).status());
+    assertEquals(0, f.tasks.only(GenerationTaskType.SUMMARY).attempt());
+    busy.set(false);
+    assertEquals(1, f.worker.runOneCycle());
+    assertEquals(GenerationTaskStatus.SUCCEEDED, f.tasks.only(GenerationTaskType.SUMMARY).status());
+  }
+
+  @Test
+  void foregroundArrivalAfterClaimDefersAtTheExistingExternalCallFence() {
+    Fixture f = new Fixture(false, false);
+    f.model.enforceBudget = true;
+    var checks = new java.util.concurrent.atomic.AtomicInteger();
+    f.worker.withForegroundActivity(() -> checks.getAndIncrement() > 0);
+    f.tasks.queue("v1", GenerationTaskType.SUMMARY, "", NOW);
+    assertEquals(1, f.worker.runOneCycle());
+    assertEquals(
+        GenerationTaskStatus.RETRY_WAIT, f.tasks.only(GenerationTaskType.SUMMARY).status());
+    assertEquals("FOREGROUND_BUSY", f.tasks.only(GenerationTaskType.SUMMARY).errorCode());
+    assertEquals(0, f.repository.summaries.size());
+    assertEquals(1, f.tasks.only(GenerationTaskType.SUMMARY).attempt());
+  }
+
+  @Test
   void summaryConceptFanOutQueuesGraphAndWikiIndependently() {
     Fixture f = new Fixture(false, false);
     f.tasks.queue("v1", GenerationTaskType.SUMMARY, "", NOW);
@@ -63,6 +97,55 @@ class DurableCompilationWorkerTest {
   }
 
   @Test
+  void actualSummaryCapturesInputsBeforeItsFirstExternalCallAndKeepsOneAuthority() {
+    Fixture f = new Fixture(false, false);
+    f.tasks.enforceCapturedInputs = true;
+    f.model.enforceBudget = true;
+    f.model.authorityChecks = () -> f.tasks.externalChecks;
+    f.tasks.queue("v1", GenerationTaskType.SUMMARY, "", NOW);
+    assertEquals(1, f.worker.runOneCycle());
+    assertEquals(GenerationTaskStatus.SUCCEEDED, f.tasks.only(GenerationTaskType.SUMMARY).status());
+    assertEquals(1, f.tasks.publicationInstances);
+    org.junit.jupiter.api.Assertions.assertTrue(f.tasks.externalChecks > 0);
+    assertEquals(
+        Duration.ofSeconds(120), CompilationExecutionBudget.limit(Duration.ofSeconds(120)));
+  }
+
+  @Test
+  void wrappedStageExpiryKeepsItsOwnFailureCodeAndTheExistingBoundedRetryPolicy() {
+    Fixture f = new Fixture(false, false);
+    f.tasks.queue("v1", GenerationTaskType.SUMMARY, "", NOW);
+    var task = f.tasks.claimPending(1, NOW).get(0);
+    var failure =
+        new IllegalStateException(
+            "wrapped stage failure", new CompilationExecutionBudget.StageDeadlineExpired());
+    GenerationTaskFailureHandler.persist(f.tasks, task, "SUMMARY_GENERATION_FAILED", failure, NOW);
+    assertEquals(GenerationTaskStatus.RETRY_WAIT, f.tasks.byId(task.taskId()).status());
+    assertEquals("STAGE_DEADLINE_EXPIRED", f.tasks.byId(task.taskId()).errorCode());
+    assertEquals(1, f.tasks.byId(task.taskId()).attempt());
+    assertEquals(0, f.repository.summaries.size());
+  }
+
+  @Test
+  void theFifthExpiredStageWaitsWithoutResettingItsAttemptCounter() {
+    Fixture f = new Fixture(false, false);
+    f.tasks.queue("v1", GenerationTaskType.SUMMARY, "", NOW);
+    var first = f.tasks.claimPending(1, NOW).get(0);
+    f.tasks.replace(first, GenerationTaskStatus.RUNNING, 5, "", "");
+    var fifth = f.tasks.byId(first.taskId());
+    GenerationTaskFailureHandler.persist(
+        f.tasks,
+        fifth,
+        "SUMMARY_GENERATION_FAILED",
+        new CompilationExecutionBudget.StageDeadlineExpired(),
+        NOW);
+    assertEquals(GenerationTaskStatus.RETRY_WAIT, f.tasks.byId(first.taskId()).status());
+    assertEquals("STAGE_DEADLINE_EXPIRED", f.tasks.byId(first.taskId()).errorCode());
+    assertEquals(5, f.tasks.byId(first.taskId()).attempt());
+    assertEquals(0, f.repository.summaries.size());
+  }
+
+  @Test
   void companyWikiAggregatesActiveGroundedSummariesAcrossDocuments() {
     Fixture f = new Fixture(false, false);
     SummaryFact legacyFact =
@@ -74,7 +157,11 @@ class DurableCompilationWorkerTest {
             List.of("rb-old"),
             List.of("ev-old"),
             "PASS",
-            "direct");
+            "synthetic audited prior source",
+            cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit.accepted(
+                "甲公司的既有跨文档事实。",
+                cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit
+                    .exactCopyChecks("甲公司的既有跨文档事实。", List.of("甲公司的既有跨文档事实。"))));
     f.repository.summaries.put(
         "s-old",
         new SummaryRecord(
@@ -129,7 +216,17 @@ class DurableCompilationWorkerTest {
     assertEquals(GenerationTaskStatus.SUCCEEDED, f.tasks.only(GenerationTaskType.GRAPH).status());
     assertEquals(GenerationTaskStatus.FAILED, f.tasks.only(GenerationTaskType.WIKI).status());
     assertEquals("WIKI_GENERATION_FAILED", f.tasks.only(GenerationTaskType.WIKI).errorCode());
-    assertEquals(1, f.graphStore.relations.size());
+    assertEquals(3, f.graphStore.relations.size());
+    assertEquals(
+        1,
+        f.graphStore.relations.stream()
+            .filter(relation -> "SUPPLIES_TO".equals(relation.predicate()))
+            .count());
+    assertEquals(
+        2,
+        f.graphStore.relations.stream()
+            .filter(relation -> "DOCUMENTS".equals(relation.predicate()))
+            .count());
   }
 
   @Test
@@ -143,14 +240,15 @@ class DurableCompilationWorkerTest {
     assertEquals(GenerationTaskType.CONCEPT, claimed.get(0).taskType());
     assertEquals(GenerationTaskStatus.RUNNING, f.tasks.only(GenerationTaskType.CONCEPT).status());
 
-    f.tasks.resetInterrupted(NOW.plusSeconds(2));
+    f.tasks.resetInterrupted(List.of(GenerationTaskType.CONCEPT), NOW.plusSeconds(2));
     assertEquals(GenerationTaskStatus.PENDING, f.tasks.only(GenerationTaskType.CONCEPT).status());
 
     assertEquals(1, f.worker.runOneCycle());
     assertEquals(1, f.tasks.count(GenerationTaskType.GRAPH));
     assertEquals(1, f.tasks.count(GenerationTaskType.WIKI));
 
-    f.tasks.resetInterrupted(NOW.plusSeconds(3));
+    f.tasks.resetInterrupted(
+        List.of(GenerationTaskType.GRAPH, GenerationTaskType.WIKI), NOW.plusSeconds(3));
     runCycles(f, 2);
 
     assertEquals(1, f.tasks.count(GenerationTaskType.GRAPH));
@@ -161,6 +259,149 @@ class DurableCompilationWorkerTest {
 
   private static void runCycles(Fixture fixture, int cycles) {
     for (int i = 0; i < cycles; i++) assertEquals(1, fixture.worker.runOneCycle());
+  }
+
+  @Test
+  void explicitWikiCommandPreservesItsRequestedIdentityInsteadOfInferringFromSource() {
+    Fixture f = new Fixture(false, false);
+    f.tasks.queue("v1", GenerationTaskType.SUMMARY, "", NOW);
+    runCycles(f, 4);
+    String summary = f.repository.summaries.keySet().iterator().next();
+    CommandStore commands = new CommandStore();
+    var task = f.tasks.queue("v1", GenerationTaskType.WIKI, "command/explicit-wiki", NOW);
+    commands.add(
+        task,
+        new CompilationCommands.Request(
+            CompilationCommands.Kind.WIKI,
+            "",
+            List.of(summary),
+            "CONTRACT",
+            "用户指定的合同专题",
+            "requested-contract-identity",
+            "",
+            0));
+    f.model.wikiType = "CONTRACT";
+
+    assertEquals(1, f.commandWorker(commands).runOneCycle());
+
+    assertEquals(GenerationTaskStatus.SUCCEEDED, f.tasks.byId(task.taskId()).status());
+    var published =
+        f.repository.wikis.values().stream()
+            .filter(w -> w.title().equals("用户指定的合同专题"))
+            .findFirst()
+            .orElseThrow();
+    assertEquals("CONTRACT", published.wikiType());
+    assertEquals("requested-contract-identity", published.canonicalSubjectId());
+    assertEquals(List.of(summary), f.repository.lastDerivedSummaryIds);
+    assertEquals(1, commands.publications);
+  }
+
+  @Test
+  void revokedCommandCannotCallModelOrPublishWiki() {
+    Fixture f = new Fixture(false, false);
+    f.tasks.queue("v1", GenerationTaskType.SUMMARY, "", NOW);
+    runCycles(f, 4);
+    String summary = f.repository.summaries.keySet().iterator().next();
+    CommandStore commands = new CommandStore();
+    commands.denied = true;
+    var task = f.tasks.queue("v1", GenerationTaskType.WIKI, "command/revoked", NOW);
+    commands.add(
+        task,
+        new CompilationCommands.Request(
+            CompilationCommands.Kind.WIKI, "", List.of(summary), "CONTRACT", "不得发布", "", "", 0));
+    int modelCalls = f.model.structuredCalls;
+    int wikiCount = f.repository.wikis.size();
+
+    assertEquals(1, f.commandWorker(commands).runOneCycle());
+
+    assertEquals(GenerationTaskStatus.FAILED, f.tasks.byId(task.taskId()).status());
+    assertEquals(modelCalls, f.model.structuredCalls);
+    assertEquals(wikiCount, f.repository.wikis.size());
+    assertEquals(0, commands.publications);
+  }
+
+  @Test
+  void keywordProjectionRunsInsideOwnedCommitWithoutCallingModel() {
+    Fixture f = new Fixture(false, false);
+    CommandStore commands = new CommandStore();
+    var task = f.tasks.queue("v1", GenerationTaskType.WIKI, "command/keywords", NOW);
+    commands.add(
+        task,
+        new CompilationCommands.Request(
+            CompilationCommands.Kind.WIKI_KEYWORDS,
+            "",
+            List.of(),
+            "",
+            "",
+            "",
+            "requested-wiki",
+            7));
+
+    assertEquals(1, f.commandWorker(commands).runOneCycle());
+
+    assertEquals(GenerationTaskStatus.SUCCEEDED, f.tasks.byId(task.taskId()).status());
+    assertEquals(0, f.model.structuredCalls);
+    assertEquals(List.of("v1"), commands.capturedInputs);
+    assertEquals(1, commands.publications);
+  }
+
+  @Test
+  void missingDurableCommandDoesNotFallBackToLegacyWikiGeneration() {
+    Fixture f = new Fixture(false, false);
+    var task = f.tasks.queue("v1", GenerationTaskType.WIKI, "command/missing", NOW);
+
+    assertEquals(1, f.commandWorker(new CommandStore()).runOneCycle());
+
+    var failed = f.tasks.byId(task.taskId());
+    assertEquals(GenerationTaskStatus.FAILED, failed.status());
+    assertEquals("compilation command store is unavailable", failed.errorMessage());
+    assertEquals(0, f.model.structuredCalls);
+  }
+
+  private static final class CommandStore implements CompilationCommands.Store {
+    final Map<String, CompilationCommands.Command> commands = new LinkedHashMap<>();
+    List<String> capturedInputs = List.of();
+    int publications;
+    boolean denied;
+
+    void add(GenerationTask task, CompilationCommands.Request request) {
+      commands.put(
+          task.taskId(),
+          new CompilationCommands.Command("synthetic-admin", request, List.of("v1")));
+    }
+
+    public GenerationTask submit(String actor, CompilationCommands.Request request) {
+      throw new UnsupportedOperationException("admission is tested against native PostgreSQL");
+    }
+
+    public Optional<CompilationCommands.Command> find(GenerationTask task) {
+      return Optional.ofNullable(commands.get(task.taskId()));
+    }
+
+    public CompilationPublication publication(
+        GenerationTask task, CompilationCommands.Command command, CompilationPublication owned) {
+      return new CompilationPublication() {
+        public void captureInputs(List<String> versions) {
+          check();
+          capturedInputs = List.copyOf(versions);
+        }
+
+        public void check() {
+          if (denied) throw new IllegalStateException("command actor is no longer authorized");
+        }
+
+        public void publish(Runnable writes) {
+          check();
+          writes.run();
+          publications++;
+        }
+
+        public String objectKey(String key) {
+          check();
+          return owned.objectKey(key);
+        }
+      };
+    }
   }
 
   private static final class Fixture {
@@ -232,6 +473,31 @@ class DurableCompilationWorkerTest {
               1,
               Clock.fixed(NOW, ZoneOffset.UTC));
     }
+
+    DurableCompilationWorker commandWorker(CompilationCommands.Store commands) {
+      KnowledgeEntryCatalogue entries =
+          (KnowledgeEntryCatalogue)
+              java.lang.reflect.Proxy.newProxyInstance(
+                  KnowledgeEntryCatalogue.class.getClassLoader(),
+                  new Class<?>[] {KnowledgeEntryCatalogue.class},
+                  (proxy, method, args) -> {
+                    throw new AssertionError(
+                        "command unexpectedly accessed entry catalogue: " + method.getName());
+                  });
+      return new DurableCompilationWorker(
+          tasks,
+          repository,
+          new SummaryCompilationService(repository, model, objects, embedding, derived),
+          new ConceptCompilationService(repository, model),
+          new GraphCompilationService(repository, model, graphStore),
+          new WikiCompilationService(repository, model, objects, embedding, derived),
+          new WikiKeywordProjectionService(new EmptyWikiProjectionRepository(), graphStore),
+          Duration.ofHours(1),
+          1,
+          entries,
+          new EntryAssociationService(repository, entries, model, tasks),
+          commands);
+    }
   }
 
   private static final class FakeModel implements Ports.KnowledgeModel {
@@ -239,6 +505,10 @@ class DurableCompilationWorkerTest {
     private static final Pattern CANDIDATE_ID = Pattern.compile("candidate_id=(C\\d+)");
     private final boolean failGraph;
     private final boolean failWiki;
+    int structuredCalls;
+    boolean enforceBudget;
+    java.util.function.IntSupplier authorityChecks = () -> 0;
+    String wikiType = "COMPANY";
 
     FakeModel(boolean failGraph, boolean failWiki) {
       this.failGraph = failGraph;
@@ -264,6 +534,15 @@ class DurableCompilationWorkerTest {
         String systemPrompt,
         String userPrompt,
         Class<T> outputType) {
+      if (enforceBudget) {
+        int before = authorityChecks.getAsInt();
+        CompilationExecutionBudget.limit(Duration.ofSeconds(120));
+        assertEquals(
+            before + 1,
+            authorityChecks.getAsInt(),
+            "same captured authority must fence the model call");
+      }
+      structuredCalls++;
       Object result;
       if (outputType == SummaryCompilationService.Classification.class) {
         result = new SummaryCompilationService.Classification("项目/尽调/业务材料", "single", List.of());
@@ -273,8 +552,11 @@ class DurableCompilationWorkerTest {
                 List.of(
                     new SummaryCompilationService.FactProposal(
                         "项目与主体", "甲公司向乙公司供货。", List.of("rb1"))));
-      } else if (outputType == SummaryCompilationService.SupportDecision.class) {
-        result = new SummaryCompilationService.SupportDecision(true, "directly supported");
+      } else if (outputType
+          == cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision.class) {
+        result =
+            new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+                true, "directly supported");
       } else if (outputType == SummaryCompilationService.CoverageDecision.class) {
         result = new SummaryCompilationService.CoverageDecision(List.of());
       } else if (outputType == ConceptCompilationService.ConceptProposalSet.class) {
@@ -309,7 +591,7 @@ class DurableCompilationWorkerTest {
         List<String> factIds = allFactIds(userPrompt);
         result =
             new WikiCompilationService.Proposal(
-                "COMPANY",
+                wikiType,
                 "甲公司",
                 factIds.stream()
                     .map(
@@ -320,21 +602,86 @@ class DurableCompilationWorkerTest {
                 factIds.stream()
                     .map(factId -> new WikiCompilationService.FactDecision(factId, true, ""))
                     .toList());
-      } else if (outputType == WikiCompilationService.SupportDecision.class) {
-        result = new WikiCompilationService.SupportDecision(true, "directly supported");
-      } else if (outputType == WikiCompilationService.SupportDecisionSet.class) {
+      } else if (outputType
+          == cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch.class) {
         result =
-            new WikiCompilationService.SupportDecisionSet(
+            new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch(
                 candidateIds(userPrompt).stream()
                     .map(
                         candidateId ->
-                            new WikiCompilationService.SupportDecisionItem(
-                                candidateId, true, "directly supported"))
+                            new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol
+                                .Item(candidateId, true, "directly supported"))
                     .toList());
       } else {
         throw new AssertionError("unexpected output type " + outputType);
       }
-      return (T) result;
+      return (T) withFixtureAudit(result, userPrompt);
+    }
+
+    // Explicit model fixture, not a semantic judge. Source and candidate spans are real prompt
+    // spans so the production audit gate remains active in these orchestration regressions.
+    private static Object withFixtureAudit(Object value, String prompt) {
+      if (value
+              instanceof
+              cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision d
+          && d.checks() == null)
+        return new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            d.supported(), d.reason(), fixtureChecks(prompt, ""));
+      if (value
+          instanceof cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch set)
+        return new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch(
+            set.decisions().stream()
+                .map(
+                    d ->
+                        d.checks() == null
+                            ? new cn.lgs.knowledgebase.application.compilation
+                                .GroundingJudgeProtocol.Item(
+                                d.candidateId(),
+                                d.supported(),
+                                d.reason(),
+                                fixtureChecks(prompt, d.candidateId()))
+                            : d)
+                .toList());
+      return value;
+    }
+
+    private static List<
+            cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Constraint>
+        fixtureChecks(String prompt, String id) {
+      String part = prompt;
+      int start = id.isEmpty() ? -1 : prompt.indexOf("candidate_id=" + id + "\n");
+      if (start >= 0) part = prompt.substring(start);
+      int end = part.indexOf("\n===\n");
+      if (end >= 0) part = part.substring(0, end);
+      String marker = part.contains("\nSUPPORTING FACTS:") ? "\nSUPPORTING FACTS:" : "\nEVIDENCE:";
+      int split = part.indexOf(marker);
+      int begin = part.indexOf("FACT: ");
+      int prefix = 6;
+      if (begin < 0) {
+        begin = part.indexOf("FACT=");
+        prefix = 5;
+      }
+      if (begin < 0) {
+        begin = part.indexOf("CLAIM=");
+        prefix = 6;
+      }
+      if (begin < 0 || split < 0)
+        throw new AssertionError("No grounding contract in fixture prompt");
+      String claim = part.substring(begin + prefix, split).trim();
+      String evidence = part.substring(split + marker.length()).trim();
+      return java.util.Arrays.stream(
+              cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit.Dimension
+                  .values())
+          .map(
+              d ->
+                  new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol
+                      .Constraint(
+                      d,
+                      cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit.Finding
+                          .SUPPORTED,
+                      List.of(evidence),
+                      "Explicit orchestration fixture support"))
+          .toList();
     }
 
     private static String firstFactId(String prompt) {
@@ -361,6 +708,37 @@ class DurableCompilationWorkerTest {
   private static final class InMemoryTaskRepository implements Ports.GenerationTaskRepository {
     private final Map<String, GenerationTask> tasksByKey = new LinkedHashMap<>();
     private final Map<String, String> keyById = new LinkedHashMap<>();
+    boolean enforceCapturedInputs;
+    int publicationInstances;
+    int externalChecks;
+
+    @Override
+    public CompilationPublication publication(GenerationTask task) {
+      publicationInstances++;
+      if (!enforceCapturedInputs) return Ports.GenerationTaskRepository.super.publication(task);
+      return new CompilationPublication() {
+        boolean captured;
+
+        public void captureInputs(List<String> versions) {
+          if (versions.isEmpty()) throw new IllegalStateException("synthetic inputs are missing");
+          captured = true;
+        }
+
+        public void check() {
+          if (!captured) throw new IllegalStateException("external call preceded captureInputs");
+          externalChecks++;
+        }
+
+        public void publish(Runnable writes) {
+          check();
+          writes.run();
+        }
+
+        public String objectKey(String key) {
+          return "synthetic/" + key;
+        }
+      };
+    }
 
     @Override
     public GenerationTask queue(
@@ -421,9 +799,18 @@ class DurableCompilationWorkerTest {
     }
 
     @Override
-    public void fail(String taskId, String errorCode, String errorMessage, Instant now) {
-      GenerationTask task = byId(taskId);
+    public void fail(GenerationTask task, String errorCode, String errorMessage, Instant now) {
       replaceRunning(task, GenerationTaskStatus.FAILED, errorCode, errorMessage);
+    }
+
+    @Override
+    public void defer(
+        GenerationTask task,
+        String errorCode,
+        String errorMessage,
+        Instant nextAttemptAt,
+        Instant now) {
+      replaceRunning(task, GenerationTaskStatus.RETRY_WAIT, errorCode, errorMessage);
     }
 
     @Override
@@ -436,10 +823,11 @@ class DurableCompilationWorkerTest {
     }
 
     @Override
-    public void resetInterrupted(Instant now) {
+    public void resetInterrupted(List<GenerationTaskType> taskTypes, Instant now) {
       List<GenerationTask> running =
           tasksByKey.values().stream()
               .filter(task -> task.status() == GenerationTaskStatus.RUNNING)
+              .filter(task -> taskTypes.contains(task.taskType()))
               .toList();
       for (GenerationTask task : running) {
         replace(
@@ -518,10 +906,35 @@ class DurableCompilationWorkerTest {
 
     @Override
     public VersionSource loadVersionSource(String versionId) {
-      if (source == null || !source.versionId().equals(versionId)) {
-        throw new IllegalStateException("version not found: " + versionId);
+      if (source != null && source.versionId().equals(versionId)) return source;
+      var prior =
+          summaries.values().stream()
+              .filter(s -> s.versionId().equals(versionId))
+              .findFirst()
+              .orElseThrow();
+      var evidence = new LinkedHashMap<String, Evidence>();
+      for (var fact : prior.facts()) {
+        String block = fact.evidenceBlockIds().get(0);
+        evidence.put(
+            block,
+            new Evidence(
+                fact.evidenceIds().get(0),
+                prior.documentId(),
+                versionId,
+                block,
+                "synthetic-prior-original",
+                Map.of(),
+                fact.factText(),
+                "synthetic-prior-hash"));
       }
-      return source;
+      return new VersionSource(
+          prior.documentId(),
+          versionId,
+          "Synthetic audited prior source",
+          "",
+          source.metadata(),
+          List.of(),
+          evidence);
     }
 
     @Override

@@ -178,6 +178,7 @@ public final class CompilationDomain {
   }
 
   public enum GenerationTaskType {
+    SOURCE_ASSOCIATION,
     SUMMARY,
     CONCEPT,
     GRAPH,
@@ -188,6 +189,7 @@ public final class CompilationDomain {
 
   public enum GenerationTaskStatus {
     PENDING,
+    RETRY_WAIT,
     RUNNING,
     SUCCEEDED,
     FAILED,
@@ -203,7 +205,37 @@ public final class CompilationDomain {
       int attempt,
       String errorCode,
       String errorMessage,
-      Instant createdAt) {
+      Instant createdAt,
+      String ownerId,
+      long executionEpoch,
+      Instant stageDeadline,
+      long sourceAclVersion) {
+    public GenerationTask(
+        String taskId,
+        String versionId,
+        GenerationTaskType taskType,
+        String subjectId,
+        GenerationTaskStatus status,
+        int attempt,
+        String errorCode,
+        String errorMessage,
+        Instant createdAt) {
+      this(
+          taskId,
+          versionId,
+          taskType,
+          subjectId,
+          status,
+          attempt,
+          errorCode,
+          errorMessage,
+          createdAt,
+          "",
+          0,
+          null,
+          0);
+    }
+
     public GenerationTask {
       require(taskId, "generation task id");
       require(versionId, "generation task version id");
@@ -214,6 +246,9 @@ public final class CompilationDomain {
       errorCode = errorCode == null ? "" : errorCode.trim();
       errorMessage = errorMessage == null ? "" : errorMessage;
       Objects.requireNonNull(createdAt, "createdAt");
+      ownerId = ownerId == null ? "" : ownerId.trim();
+      if (executionEpoch < 0 || sourceAclVersion < 0)
+        throw new IllegalArgumentException("generation claim versions must be nonnegative");
     }
   }
 

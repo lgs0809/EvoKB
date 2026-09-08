@@ -1,5 +1,7 @@
 package cn.lgs.knowledgebase.interfaces.http;
 
+import static cn.lgs.knowledgebase.interfaces.http.QueryHttpContracts.*;
+
 import cn.lgs.knowledgebase.application.KnowledgeGenerationRecommendationService;
 import cn.lgs.knowledgebase.application.ask.AskApplicationService;
 import cn.lgs.knowledgebase.application.compilation.KnowledgeGenerationApplicationService;
@@ -13,13 +15,9 @@ import cn.lgs.knowledgebase.application.operations.EnterpriseOperations;
 import cn.lgs.knowledgebase.application.operations.EnterpriseOperations.DocumentMetadataUpdate;
 import cn.lgs.knowledgebase.application.operations.EnterpriseOperations.PageQuery;
 import cn.lgs.knowledgebase.application.port.Ports.SourcePackageService;
-import cn.lgs.knowledgebase.application.query.AsyncKnowledgeQueryService;
-import cn.lgs.knowledgebase.application.query.KnowledgeQueryOrchestrator;
-import cn.lgs.knowledgebase.application.query.QueryHistoryApplicationService;
 import cn.lgs.knowledgebase.application.raw.RawIngestionApplicationService;
 import cn.lgs.knowledgebase.application.retrieval.RetrievalApplicationService;
 import cn.lgs.knowledgebase.domain.identity.IdentityDomain.User;
-import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Metadata;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.SearchFilters;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -52,9 +50,9 @@ public final class EnterpriseApiController {
   private final ModelConfigurationApplicationService modelConfiguration;
   private final RetrievalApplicationService retrieval;
   private final AskApplicationService ask;
-  private final AsyncKnowledgeQueryService queries;
-  private final QueryHistoryApplicationService queryHistory;
+  private final EnterpriseEvidenceViewAssembler evidenceAssembler;
   private final SourcePackageService packages;
+  private final cn.lgs.knowledgebase.application.access.KnowledgeAccessService access;
   private final long maxSingleUploadBytes;
 
   public EnterpriseApiController(
@@ -68,9 +66,9 @@ public final class EnterpriseApiController {
       ModelConfigurationApplicationService modelConfiguration,
       RetrievalApplicationService retrieval,
       AskApplicationService ask,
-      AsyncKnowledgeQueryService queries,
-      QueryHistoryApplicationService queryHistory,
+      EnterpriseEvidenceViewAssembler evidenceAssembler,
       SourcePackageService packages,
+      cn.lgs.knowledgebase.application.access.KnowledgeAccessService access,
       @Value("${ekb.upload.max-single-bytes:536870912}") long maxSingleUploadBytes) {
     this.ingestion = ingestion;
     this.stager = stager;
@@ -82,9 +80,9 @@ public final class EnterpriseApiController {
     this.modelConfiguration = modelConfiguration;
     this.retrieval = retrieval;
     this.ask = ask;
-    this.queries = queries;
-    this.queryHistory = queryHistory;
+    this.evidenceAssembler = evidenceAssembler;
     this.packages = packages;
+    this.access = access;
     this.maxSingleUploadBytes = maxSingleUploadBytes;
   }
 
@@ -187,6 +185,7 @@ public final class EnterpriseApiController {
       @RequestParam(value = "document_type", required = false) String documentType,
       @RequestParam(value = "document_date", required = false) String documentDate,
       @RequestParam(value = "tags", required = false) String tags,
+      @RequestParam(value = "security_level", required = false) Integer securityLevel,
       HttpServletRequest request) {
     User actor = EnterpriseRequestContext.user(request);
     if (!ingestion.access(actor).canUpload())
@@ -197,28 +196,27 @@ public final class EnterpriseApiController {
       return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE)
           .body(Map.of("error", "file exceeds upload limit"));
     var staged = stager.stage(List.of(file), List.of(file.getOriginalFilename()), null);
-    try {
-      var draft = staged.drafts().get(0);
-      Metadata metadata =
-          new Metadata(
-              blank(sourceDepartment),
-              blank(materialCategory),
-              splitTags(tags),
-              blank(company),
-              parseDate(documentDate),
-              blank(documentType));
-      var result =
-          raw.ingest(
-              new RawIngestionApplicationService.IngestCommand(
-                  draft.stagingPath(),
-                  blank(logicalName),
-                  "web-upload:" + draft.originalFilename(),
-                  metadata),
-              null);
-      return ResponseEntity.status(HttpStatus.CREATED).body(result);
-    } finally {
-      stager.cleanup(staged.batchDirectory());
-    }
+    var draft = staged.drafts().get(0);
+    // Persistent retries retain the staged original. Only the owning successful worker removes it.
+    var configured =
+        new ManagedIngestionApplicationService.StagedDraft(
+            draft.relativePath(),
+            draft.originalFilename(),
+            draft.stagingPath(),
+            blank(logicalName) == null ? draft.originalFilename() : blank(logicalName),
+            blank(sourceDepartment),
+            blank(materialCategory),
+            blank(company),
+            blank(documentType),
+            parseDate(documentDate),
+            splitTags(tags),
+            securityLevel);
+    var result = ingestion.ingestNow(actor, configured, raw);
+    if (result.result() == null)
+      return ResponseEntity.accepted()
+          .body(
+              Map.of("batch", HttpViews.batch(ingestion.getBatch(actor, result.batchId()), true)));
+    return ResponseEntity.status(HttpStatus.CREATED).body(result.result());
   }
 
   @PostMapping(value = "/batches", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -231,6 +229,7 @@ public final class EnterpriseApiController {
       @RequestParam(value = "document_type", required = false) String documentType,
       @RequestParam(value = "document_date", required = false) String documentDate,
       @RequestParam(value = "tags", required = false) String tags,
+      @RequestParam(value = "security_level", required = false) Integer securityLevel,
       HttpServletRequest request) {
     User actor = EnterpriseRequestContext.user(request);
     if (!ingestion.access(actor).canUpload())
@@ -243,7 +242,8 @@ public final class EnterpriseApiController {
             blank(company),
             blank(documentType),
             parseDate(documentDate),
-            splitTags(tags));
+            splitTags(tags),
+            securityLevel);
     var staged = stager.stage(files, relativePaths, defaults);
     try {
       var batch = ingestion.createBatch(actor, staged.sourceCount(), staged.drafts());
@@ -297,7 +297,9 @@ public final class EnterpriseApiController {
             body.documentDate(),
             body.clearDocumentDate(),
             body.manualTags(),
-            true);
+            true,
+            body.securityLevel(),
+            body.clearSecurityLevel());
     return Map.of(
         "file",
         HttpViews.file(ingestion.patchMetadata(EnterpriseRequestContext.user(request), id, patch)));
@@ -313,27 +315,28 @@ public final class EnterpriseApiController {
 
   @PostMapping("/batch/file/retry")
   public Map<String, Object> retryFile(@RequestBody FileId body, HttpServletRequest request) {
-    ingestion.retryFile(EnterpriseRequestContext.user(request), body.fileId());
-    return Map.of("status", "queued");
+    var file = ingestion.retryFile(EnterpriseRequestContext.user(request), body.fileId());
+    return Map.of("status", "ACCEPTED", "file", HttpViews.file(file));
   }
 
   @GetMapping("/overview")
   public EnterpriseOperations.OverviewView overview(HttpServletRequest request) {
     EnterpriseRequestContext.user(request);
-    return operations.overview();
+    return operations.overview(access.clearance(EnterpriseRequestContext.user(request).id()));
   }
 
   @GetMapping("/quality")
   public EnterpriseOperations.QualityView quality(
       @RequestParam(defaultValue = "120") int limit, HttpServletRequest request) {
     EnterpriseRequestContext.admin(request);
-    return operations.quality(limit);
+    return operations.quality(
+        limit, access.clearance(EnterpriseRequestContext.admin(request).id()));
   }
 
   @GetMapping("/facets")
   public EnterpriseOperations.Facets facets(HttpServletRequest request) {
     EnterpriseRequestContext.user(request);
-    return operations.facets();
+    return operations.facets(access.clearance(EnterpriseRequestContext.user(request).id()));
   }
 
   @GetMapping("/documents")
@@ -368,7 +371,8 @@ public final class EnterpriseApiController {
                 null,
                 null,
                 null,
-                null));
+                null),
+            access.clearance(EnterpriseRequestContext.user(request).id()));
     return Map.of(
         "documents",
         result.items(),
@@ -380,6 +384,21 @@ public final class EnterpriseApiController {
         result.pageSize());
   }
 
+  @PostMapping("/document/reparse")
+  public Map<String, Object> reparseDocument(
+      @RequestParam("version_id") String versionId, HttpServletRequest request) {
+    var reserved = ingestion.reparse(EnterpriseRequestContext.user(request), versionId, raw);
+    return Map.of(
+        "batch_id",
+        reserved.batchId(),
+        "file_id",
+        reserved.fileId(),
+        "version_id",
+        reserved.versionId(),
+        "reused",
+        reserved.reused());
+  }
+
   @GetMapping("/document/detail")
   public EnterpriseOperations.DocumentDetailView documentDetail(
       @RequestParam(name = "version_id") String versionId,
@@ -387,8 +406,9 @@ public final class EnterpriseApiController {
       HttpServletRequest request) {
     EnterpriseRequestContext.user(request);
     return operations
-        .documentDetail(versionId, blockLimit)
-        .orElseThrow(() -> new IllegalStateException("document version not found"));
+        .documentDetail(
+            versionId, blockLimit, access.clearance(EnterpriseRequestContext.user(request).id()))
+        .orElseThrow(cn.lgs.knowledgebase.application.access.KnowledgeAccessService.Denied::new);
   }
 
   @PatchMapping("/document")
@@ -397,6 +417,9 @@ public final class EnterpriseApiController {
       @RequestBody DocumentMetadataRequest body,
       HttpServletRequest request) {
     User actor = EnterpriseRequestContext.user(request);
+    operations
+        .documentDetail(versionId, 1, access.clearance(actor.id()))
+        .orElseThrow(cn.lgs.knowledgebase.application.access.KnowledgeAccessService.Denied::new);
     return documentMetadata.update(
         actor,
         new DocumentMetadataUpdate(
@@ -406,7 +429,8 @@ public final class EnterpriseApiController {
             body.materialCategory(),
             body.documentType(),
             parseDate(body.documentDate()),
-            body.manualTags()));
+            body.manualTags(),
+            body.securityLevel()));
   }
 
   @PostMapping("/generation/start")
@@ -430,7 +454,7 @@ public final class EnterpriseApiController {
       @RequestBody GenerationTaskRetryRequest body, HttpServletRequest request) {
     EnterpriseRequestContext.admin(request);
     generation.retry(body.taskId());
-    return Map.of("task_id", body.taskId(), "status", "PENDING");
+    return Map.of("task_id", body.taskId(), "status", "ACCEPTED");
   }
 
   @PostMapping({"/generation/recommend", "/distill"})
@@ -464,7 +488,8 @@ public final class EnterpriseApiController {
         operations.wikis(
             query(
                 page, pageSize, q, lifecycle, null, null, null, null, null, null, null, wikiType,
-                wikiId, subject, null, null, null));
+                wikiId, subject, null, null, null),
+            access.clearance(EnterpriseRequestContext.user(request).id()));
     return Map.of(
         "wikis",
         result.items(),
@@ -483,8 +508,38 @@ public final class EnterpriseApiController {
       HttpServletRequest request) {
     EnterpriseRequestContext.user(request);
     return operations
-        .wiki(id, version)
+        .wiki(id, version, access.clearance(EnterpriseRequestContext.user(request).id()))
         .orElseThrow(() -> new IllegalStateException("wiki not found"));
+  }
+
+  @GetMapping("/knowledge-entries")
+  public Map<String, Object> knowledgeEntries(
+      @RequestParam(defaultValue = "1") int page,
+      @RequestParam(name = "page_size", defaultValue = "30") int pageSize,
+      @RequestParam(name = "q", required = false) String query,
+      @RequestParam(required = false) String stage,
+      HttpServletRequest request) {
+    var user = EnterpriseRequestContext.user(request);
+    var result =
+        operations.knowledgeEntries(
+            new EnterpriseOperations.EntryQuery(page, pageSize, query, stage),
+            access.clearance(user.id()));
+    return Map.of(
+        "entries",
+        result.items(),
+        "total",
+        result.total(),
+        "page",
+        result.page(),
+        "page_size",
+        result.pageSize());
+  }
+
+  @GetMapping("/knowledge-entry")
+  public ResponseEntity<EnterpriseOperations.KnowledgeEntryView> knowledgeEntry(
+      @RequestParam("id") String id, HttpServletRequest request) {
+    var user = EnterpriseRequestContext.user(request);
+    return ResponseEntity.of(operations.knowledgeEntry(id, access.clearance(user.id())));
   }
 
   @GetMapping("/evidence")
@@ -492,7 +547,7 @@ public final class EnterpriseApiController {
       @RequestParam("id") String id, HttpServletRequest request) {
     EnterpriseRequestContext.user(request);
     return operations
-        .evidence(id)
+        .evidence(id, access.clearance(EnterpriseRequestContext.user(request).id()))
         .orElseThrow(() -> new IllegalStateException("evidence not found"));
   }
 
@@ -508,7 +563,8 @@ public final class EnterpriseApiController {
         operations.evidences(
             query(
                 page, pageSize, q, null, null, active, null, null, null, null, null, null, null,
-                null, null, null, null));
+                null, null, null, null),
+            access.clearance(EnterpriseRequestContext.user(request).id()));
     return Map.of(
         "evidences",
         result.items(),
@@ -536,7 +592,8 @@ public final class EnterpriseApiController {
                 null, null, null, null),
             actor.id(),
             actor.administrator(),
-            source);
+            source,
+            access.clearance(actor.id()));
     return Map.of(
         "tasks",
         result.items(),
@@ -562,7 +619,9 @@ public final class EnterpriseApiController {
         operations.audit(
             query(
                 page, pageSize, q, null, null, null, null, null, null, null, null, null, null, null,
-                actor, action, outcome));
+                actor, action, outcome),
+            EnterpriseRequestContext.admin(request).id(),
+            access.clearance(EnterpriseRequestContext.admin(request).id()));
     return Map.of(
         "events",
         result.items(),
@@ -583,16 +642,27 @@ public final class EnterpriseApiController {
       @RequestParam(name = "valid_at", required = false) String validAt,
       HttpServletRequest request) {
     EnterpriseRequestContext.user(request);
-    var relations = operations.graph(q, depth, limit, blank(relationType), parseInstant(validAt));
+    var relations =
+        operations.graph(
+            q,
+            depth,
+            limit,
+            blank(relationType),
+            parseInstant(validAt),
+            access.clearance(EnterpriseRequestContext.user(request).id()));
     return Map.of("relations", relations, "total", relations.size());
   }
 
   @PostMapping("/search")
   public Map<String, Object> search(@RequestBody SearchRequest body, HttpServletRequest request) {
     EnterpriseRequestContext.user(request);
-    SearchFilters filters = filters(body.filters());
-    var response = retrieval.search(body.query(), filters, body.limit());
+    User actor = EnterpriseRequestContext.user(request);
+    SearchFilters filters = access.filters(actor.id(), QueryHttpContracts.filters(body.filters()));
+    var response =
+        retrieval.searchCurrent(
+            body.query(), () -> access.filters(actor.id(), filters), body.limit());
     recommendations.recordDeliveredSearch(body.query(), filters, response);
+    var evidenceViews = evidenceAssembler.forUser(actor.id());
     var results =
         response.results().stream()
             .map(
@@ -605,7 +675,7 @@ public final class EnterpriseApiController {
                         "score",
                         r.candidate().score(),
                         "evidence",
-                        r.evidence().stream().map(HttpViews::evidence).toList()))
+                        r.evidence().stream().map(evidenceViews).toList()))
             .toList();
     return Map.of("search_id", response.searchId(), "results", results);
   }
@@ -613,179 +683,46 @@ public final class EnterpriseApiController {
   @PostMapping("/ask")
   public AskView ask(@RequestBody AskRequest body, HttpServletRequest request) {
     EnterpriseRequestContext.user(request);
-    var result = ask.ask(body.question(), filters(body.filters()), body.limit());
+    User actor = EnterpriseRequestContext.user(request);
+    var requested = QueryHttpContracts.filters(body.filters());
+    var found =
+        retrieval.searchCurrent(
+            body.question(), () -> access.filters(actor.id(), requested), body.limit());
+    var inputs = access.revalidate(actor.id(), found.results(), requested);
+    access.requireResults(actor.id(), inputs, requested);
+    var result =
+        ask.answerFromResults(
+            body.question(),
+            found.searchId(),
+            inputs,
+            cn.lgs.knowledgebase.application.port.Ports.ModelRole.SMALL);
+    access.requireResults(actor.id(), inputs, requested);
+    var evidenceViews = evidenceAssembler.forUser(actor.id());
     return new AskView(
         result.searchId(),
         result.answer(),
         result.citations().stream()
-            .map(c -> new CitationView(c.index(), c.resultType(), HttpViews.evidence(c.evidence())))
+            .map(
+                c -> new CitationView(c.index(), c.resultType(), evidenceViews.apply(c.evidence())))
             .toList(),
         result.evidenceOnly());
-  }
-
-  @PostMapping("/query")
-  public QueryView query(@RequestBody AskRequest body, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    return queryView(
-        queries.start(actor.id(), body.question(), filters(body.filters()), body.limit()));
-  }
-
-  @PostMapping("/query/continue")
-  public QueryView continueQuery(
-      @RequestBody QueryContinueRequest body, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    return queryView(
-        queries.continueAfterClarification(
-            actor.id(), body.sessionId(), body.clarification(), body.limit()));
-  }
-
-  @GetMapping("/query/session")
-  public QueryView querySession(@RequestParam("id") String sessionId, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    return queryView(queries.get(actor.id(), sessionId));
-  }
-
-  @GetMapping("/query/sessions")
-  public Map<String, Object> querySessions(
-      @RequestParam(defaultValue = "20") int limit, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    var sessions =
-        queries.listSessions(actor.id(), limit).stream()
-            .map(
-                session ->
-                    new QuerySessionSummaryView(
-                        session.sessionId(),
-                        session.originalQuestion(),
-                        session.status().name(),
-                        session.finalAnswer(),
-                        session.createdAt(),
-                        session.updatedAt()))
-            .toList();
-    return Map.of("sessions", sessions, "total", sessions.size());
-  }
-
-  @PostMapping("/query/feedback")
-  public Map<String, Object> queryFeedback(
-      @RequestBody QueryFeedbackRequest body, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    queries.feedback(actor.id(), body.sessionId(), body.rating(), body.category(), body.comment());
-    return Map.of("saved", true, "session_id", body.sessionId());
-  }
-
-  @GetMapping("/query/history")
-  public Map<String, Object> queryHistory(
-      @RequestParam(defaultValue = "100") int limit, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    var records =
-        queryHistory.listRecords(actor.id(), limit).stream()
-            .map(EnterpriseApiController::historyRecordView)
-            .toList();
-    return Map.of("records", records, "total", records.size());
-  }
-
-  @PatchMapping("/query/history/record")
-  public QueryHistoryRecordView renameQueryRecord(
-      @RequestParam("id") String sessionId,
-      @RequestBody QueryRenameRequest body,
-      HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    return historyRecordView(queryHistory.renameRecord(actor.id(), sessionId, body.name()));
-  }
-
-  @PatchMapping("/query/history/record/group")
-  public QueryHistoryRecordView moveQueryRecord(
-      @RequestParam("id") String sessionId,
-      @RequestBody QueryRecordGroupRequest body,
-      HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    return historyRecordView(
-        body.groupId() == null || body.groupId().isBlank()
-            ? queryHistory.removeRecordFromGroup(actor.id(), sessionId)
-            : queryHistory.moveRecordToGroup(actor.id(), sessionId, body.groupId()));
-  }
-
-  @DeleteMapping("/query/history/record")
-  public Map<String, Object> deleteQueryRecord(
-      @RequestParam("id") String sessionId, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    queryHistory.deleteRecord(actor.id(), sessionId);
-    return Map.of("deleted", true, "session_id", sessionId);
-  }
-
-  @PostMapping("/query/history/record/package")
-  public QueryPackageView packageQueryRecord(
-      @RequestBody QueryRecordPackageRequest body, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    return historyPackageView(
-        queryHistory.recordPackage(actor.id(), body.sessionId(), body.regenerate()));
-  }
-
-  @GetMapping("/query/groups")
-  public Map<String, Object> queryGroups(HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    var groups =
-        queryHistory.listGroups(actor.id()).stream()
-            .map(EnterpriseApiController::historyGroupView)
-            .toList();
-    return Map.of("groups", groups, "total", groups.size());
-  }
-
-  @PostMapping("/query/groups")
-  public QueryHistoryGroupView createQueryGroup(
-      @RequestBody QueryGroupCreateRequest body, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    return historyGroupView(queryHistory.createGroup(actor.id(), body.name(), body.sessionIds()));
-  }
-
-  @PatchMapping("/query/group")
-  public QueryHistoryGroupView renameQueryGroup(
-      @RequestParam("id") String groupId,
-      @RequestBody QueryRenameRequest body,
-      HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    return historyGroupView(queryHistory.renameGroup(actor.id(), groupId, body.name()));
-  }
-
-  @PostMapping("/query/group/dissolve")
-  public Map<String, Object> dissolveQueryGroup(
-      @RequestBody QueryGroupIdRequest body, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    queryHistory.dissolveGroup(actor.id(), body.groupId());
-    return Map.of("dissolved", true, "group_id", body.groupId());
-  }
-
-  @DeleteMapping("/query/group")
-  public Map<String, Object> deleteQueryGroup(
-      @RequestParam("id") String groupId, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    queryHistory.deleteGroup(actor.id(), groupId);
-    return Map.of("deleted", true, "group_id", groupId);
-  }
-
-  @PostMapping("/query/group/package")
-  public QueryPackageView packageQueryGroup(
-      @RequestBody QueryGroupPackageRequest body, HttpServletRequest request) {
-    User actor = EnterpriseRequestContext.user(request);
-    return historyPackageView(
-        queryHistory.groupPackage(actor.id(), body.groupId(), body.regenerate()));
   }
 
   @GetMapping("/evidence/source")
   public Object source(@RequestParam("id") String id, HttpServletRequest request) {
     EnterpriseRequestContext.user(request);
-    return packages.source(id);
+    return packages.source(EnterpriseRequestContext.user(request).id(), id);
   }
 
   @GetMapping("/evidence/source/file")
   public void sourceFile(
       @RequestParam("id") String id, HttpServletRequest request, HttpServletResponse response) {
-    EnterpriseRequestContext.user(request);
-    var stored = packages.openOriginal(id);
-    response.setContentType(
-        stored.contentType() == null
-            ? MediaType.APPLICATION_OCTET_STREAM_VALUE
-            : stored.contentType());
-    response.setHeader(HttpHeaders.CONTENT_LENGTH, Long.toString(stored.size()));
+    var user = EnterpriseRequestContext.user(request);
+    var refs = operations.evidenceSources(List.of(id), access.clearance(user.id()));
+    if (refs.size() != 1)
+      throw new cn.lgs.knowledgebase.application.access.KnowledgeAccessService.Denied();
+    var stored = packages.openOriginal(user.id(), id);
+    SourceDownloadHeaders.apply(response, refs.get(0).originalFilename(), stored.size());
     try (InputStream in = stored.stream()) {
       in.transferTo(response.getOutputStream());
     } catch (Exception e) {
@@ -795,8 +732,39 @@ public final class EnterpriseApiController {
 
   @PostMapping("/package")
   public Object packageSources(@RequestBody PackageRequest body, HttpServletRequest request) {
-    EnterpriseRequestContext.user(request);
-    return packages.packageSources(body.evidenceIds());
+    String userId = EnterpriseRequestContext.user(request).id();
+    return body.sessionId() == null || body.sessionId().isBlank()
+        ? packages.packageSources(userId, body.evidenceIds())
+        : packages.packageAnswerSources(userId, body.sessionId(), body.evidenceIds());
+  }
+
+  @GetMapping("/package/file")
+  public void packageFile(
+      @RequestParam("id") String id, HttpServletRequest request, HttpServletResponse response) {
+    if (request.getHeader(HttpHeaders.RANGE) != null) {
+      response.setStatus(HttpServletResponse.SC_REQUESTED_RANGE_NOT_SATISFIABLE);
+      return;
+    }
+    String userId = EnterpriseRequestContext.user(request).id();
+    var stored = packages.openPackage(userId, id);
+    response.setContentType("application/zip");
+    response.setHeader(
+        HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=knowledge-sources.zip");
+    response.setHeader(HttpHeaders.CACHE_CONTROL, "private, no-store");
+    response.setHeader(HttpHeaders.CONTENT_LENGTH, Long.toString(stored.size()));
+    try {
+      if ("HEAD".equals(request.getMethod())) {
+        stored.stream().close();
+        return;
+      }
+      cn.lgs.knowledgebase.application.usage.CompletePackageTransfer.send(
+          stored,
+          response.getOutputStream(),
+          response::flushBuffer,
+          bytes -> packages.recordCompletedTransfer(userId, id, bytes));
+    } catch (Exception failure) {
+      throw new IllegalStateException("package streaming failed", failure);
+    }
   }
 
   @GetMapping("/capabilities")
@@ -829,57 +797,6 @@ public final class EnterpriseApiController {
         Map.entry("web", true));
   }
 
-  private static QueryHistoryRecordView historyRecordView(
-      QueryHistoryApplicationService.RecordView record) {
-    var session = record.session();
-    return new QueryHistoryRecordView(
-        session.sessionId(),
-        session.name(),
-        session.originalQuestion(),
-        session.status().name(),
-        session.finalAnswer(),
-        session.evidenceOnly(),
-        session.citationEvidenceIds().size(),
-        record.group() == null ? null : record.group().groupId(),
-        record.group() == null ? null : record.group().name(),
-        session.createdAt(),
-        session.updatedAt(),
-        record.latestPackage() == null ? null : historyPackageView(record.latestPackage()));
-  }
-
-  private static QueryHistoryGroupView historyGroupView(
-      QueryHistoryApplicationService.GroupView view) {
-    return new QueryHistoryGroupView(
-        view.group().groupId(),
-        view.group().name(),
-        view.records().stream().map(EnterpriseApiController::historyRecordView).toList(),
-        view.group().createdAt(),
-        view.group().updatedAt(),
-        view.latestPackage() == null ? null : historyPackageView(view.latestPackage()));
-  }
-
-  private static QueryPackageView historyPackageView(
-      QueryHistoryApplicationService.PackageView view) {
-    return new QueryPackageView(
-        view.packageId(), view.status(), view.downloadUrl(), view.expiresAt(), view.createdAt());
-  }
-
-  private static QueryView queryView(KnowledgeQueryOrchestrator.Response response) {
-    var session = response.session();
-    var citations =
-        response.citations().stream()
-            .map(c -> new CitationView(c.index(), c.resultType(), HttpViews.evidence(c.evidence())))
-            .toList();
-    return new QueryView(
-        session.sessionId(),
-        session.status().name(),
-        session.finalAnswer(),
-        session.evidenceOnly(),
-        session.clarificationQuestion(),
-        session.choices(),
-        citations);
-  }
-
   private static PageQuery query(
       int page,
       int pageSize,
@@ -901,16 +818,6 @@ public final class EnterpriseApiController {
     return new PageQuery(
         page, pageSize, q, lifecycle, status, active, company, dept, docType, category, docId,
         wikiType, wikiId, subject, actor, action, outcome);
-  }
-
-  private static SearchFilters filters(SearchFilterRequest f) {
-    return f == null
-        ? new SearchFilters(null, null, null, List.of())
-        : new SearchFilters(
-            blank(f.sourceDepartment()),
-            blank(f.materialCategory()),
-            blank(f.documentType()),
-            f.versionIds() == null ? List.of() : f.versionIds());
   }
 
   private static String blank(String v) {
@@ -1011,7 +918,53 @@ public final class EnterpriseApiController {
       String documentType,
       LocalDate documentDate,
       boolean clearDocumentDate,
-      List<String> manualTags) {}
+      List<String> manualTags,
+      Integer securityLevel,
+      boolean clearSecurityLevel) {
+    public BatchFilePatch(
+        String logicalName,
+        String sourceDepartment,
+        String materialCategory,
+        String company,
+        String documentType,
+        LocalDate documentDate,
+        boolean clearDocumentDate,
+        List<String> manualTags,
+        Integer securityLevel) {
+      this(
+          logicalName,
+          sourceDepartment,
+          materialCategory,
+          company,
+          documentType,
+          documentDate,
+          clearDocumentDate,
+          manualTags,
+          securityLevel,
+          false);
+    }
+
+    public BatchFilePatch(
+        String logicalName,
+        String sourceDepartment,
+        String materialCategory,
+        String company,
+        String documentType,
+        LocalDate documentDate,
+        boolean clearDocumentDate,
+        List<String> manualTags) {
+      this(
+          logicalName,
+          sourceDepartment,
+          materialCategory,
+          company,
+          documentType,
+          documentDate,
+          clearDocumentDate,
+          manualTags,
+          null);
+    }
+  }
 
   public record BatchId(String batchId) {}
 
@@ -1023,7 +976,8 @@ public final class EnterpriseApiController {
       String materialCategory,
       String documentType,
       String documentDate,
-      List<String> manualTags) {}
+      List<String> manualTags,
+      Integer securityLevel) {}
 
   public record GenerationStartRequest(String versionId) {}
 
@@ -1031,79 +985,10 @@ public final class EnterpriseApiController {
 
   public record GenerationRecommendationRequest(String versionId, String reason) {}
 
-  public record SearchFilterRequest(
-      String sourceDepartment,
-      String materialCategory,
-      String documentType,
-      List<String> versionIds) {}
-
   public record SearchRequest(String query, SearchFilterRequest filters, int limit) {}
 
-  public record AskRequest(String question, SearchFilterRequest filters, int limit) {}
-
-  public record QueryContinueRequest(String sessionId, String clarification, int limit) {}
-
-  public record QueryFeedbackRequest(
-      String sessionId, String rating, String category, String comment) {}
-
-  public record QueryRenameRequest(String name) {}
-
-  public record QueryRecordGroupRequest(String groupId) {}
-
-  public record QueryRecordPackageRequest(String sessionId, boolean regenerate) {}
-
-  public record QueryGroupCreateRequest(String name, List<String> sessionIds) {}
-
-  public record QueryGroupIdRequest(String groupId) {}
-
-  public record QueryGroupPackageRequest(String groupId, boolean regenerate) {}
-
-  public record QueryPackageView(
-      String packageId, String status, String downloadUrl, Instant expiresAt, Instant createdAt) {}
-
-  public record QueryHistoryRecordView(
-      String sessionId,
-      String name,
-      String question,
-      String status,
-      String answer,
-      boolean evidenceOnly,
-      int citationCount,
-      String groupId,
-      String groupName,
-      Instant createdAt,
-      Instant updatedAt,
-      QueryPackageView latestPackage) {}
-
-  public record QueryHistoryGroupView(
-      String groupId,
-      String name,
-      List<QueryHistoryRecordView> records,
-      Instant createdAt,
-      Instant updatedAt,
-      QueryPackageView latestPackage) {}
-
-  public record QuerySessionSummaryView(
-      String sessionId,
-      String question,
-      String status,
-      String answer,
-      Instant createdAt,
-      Instant updatedAt) {}
-
-  public record PackageRequest(List<String> evidenceIds) {}
-
-  public record CitationView(int index, String resultType, HttpViews.EvidenceView evidence) {}
+  public record PackageRequest(List<String> evidenceIds, String sessionId) {}
 
   public record AskView(
       String searchId, String answer, List<CitationView> citations, boolean evidenceOnly) {}
-
-  public record QueryView(
-      String sessionId,
-      String status,
-      String answer,
-      boolean evidenceOnly,
-      String clarificationQuestion,
-      List<String> choices,
-      List<CitationView> citations) {}
 }

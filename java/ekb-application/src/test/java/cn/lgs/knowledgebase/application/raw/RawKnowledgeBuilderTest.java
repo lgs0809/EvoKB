@@ -10,6 +10,105 @@ import org.junit.jupiter.api.Test;
 
 class RawKnowledgeBuilderTest {
   @Test
+  void completeChineseConditionsAndDecimalAmountsAreNeverUsedAsSentenceCutPoints() {
+    List<String> clauses =
+        java.util.stream.IntStream.range(0, 10)
+            .mapToObj(i -> "批次" + i + "金额768.50万元保持不变；合法发票且书面验收两项前提均继续有效，未验收不能请求付款。")
+            .toList();
+    var blocks =
+        RawKnowledgeBuilder.rawBlocks(
+            "conditions",
+            List.of(
+                new ParsedBlock(
+                    "text",
+                    String.join("", clauses),
+                    0,
+                    null,
+                    List.of(),
+                    List.of(),
+                    "",
+                    "",
+                    "",
+                    Map.of())));
+    var chunks =
+        RawKnowledgeBuilder.smartChunks(
+            "doc",
+            "conditions",
+            new Metadata("legal", "contract", List.of(), "", null, "CONTRACT"),
+            blocks,
+            new RawChunkProfile(90, 140, 0, 20),
+            RawTestFixtures.TOKENS);
+
+    assertTrue(chunks.size() > 1);
+    assertTrue(chunks.stream().allMatch(chunk -> chunk.tokenCount() <= 140));
+    clauses.forEach(
+        clause -> assertTrue(chunks.stream().anyMatch(chunk -> chunk.content().contains(clause))));
+  }
+
+  @Test
+  void aSentenceAboveTargetFitsWholeWithinHardBudgetUsingJdkBoundaries() {
+    String clause =
+        "Amount CNY 9,000.50; payment is due only with a valid invoice and written acceptance.";
+    var blocks =
+        RawKnowledgeBuilder.rawBlocks(
+            "english",
+            List.of(
+                new ParsedBlock(
+                    "text",
+                    (clause + " ").repeat(8).trim(),
+                    0,
+                    null,
+                    List.of(),
+                    List.of(),
+                    "",
+                    "",
+                    "",
+                    Map.of())));
+    var chunks =
+        RawKnowledgeBuilder.smartChunks(
+            "doc",
+            "english",
+            new Metadata("legal", "contract", List.of(), "", null, "CONTRACT"),
+            blocks,
+            new RawChunkProfile(60, 130, 0, 20),
+            RawTestFixtures.TOKENS);
+
+    assertTrue(chunks.size() > 1);
+    assertTrue(chunks.stream().allMatch(chunk -> chunk.tokenCount() <= 130));
+    assertEquals(8, chunks.stream().filter(chunk -> chunk.content().contains(clause)).count());
+  }
+
+  @Test
+  void anOversizedSentenceHasBoundedSlicesAndCompleteOriginalSourceCoverage() {
+    String original = "甲".repeat(501) + "付款必须有发票和书面验收。";
+    var blocks =
+        RawKnowledgeBuilder.rawBlocks(
+            "oversized",
+            List.of(
+                new ParsedBlock(
+                    "text", original, 0, null, List.of(), List.of(), "", "", "", Map.of())));
+    var chunks =
+        RawKnowledgeBuilder.smartChunks(
+            "doc",
+            "oversized",
+            new Metadata("legal", "contract", List.of(), "", null, "CONTRACT"),
+            blocks,
+            new RawChunkProfile(60, 120, 0, 10),
+            RawTestFixtures.TOKENS);
+
+    assertTrue(chunks.size() > 1);
+    assertTrue(
+        chunks.stream()
+            .allMatch(
+                chunk ->
+                    chunk.tokenCount() <= 120
+                        && chunk.sourceBlockIds().equals(List.of(blocks.get(0).id()))));
+    assertEquals(
+        original,
+        chunks.stream().map(RawKnowledgeBuilder.ChunkDraft::content).reduce("", String::concat));
+  }
+
+  @Test
   void rawBlocksPreserveHeadingPageBboxAndPageSize() {
     var parsed =
         List.of(
@@ -137,7 +236,7 @@ class RawKnowledgeBuilderTest {
     var blocks = RawKnowledgeBuilder.rawBlocks("v1", parsed);
     var evidence = RawKnowledgeBuilder.evidence("doc", "original/doc/v1/file.pdf", blocks);
     var chunks =
-        RawKnowledgeBuilder.smartChunks(
+        fixtureChunks(
             "doc", "v1", new Metadata("dept", "cat", List.of(), "", null, "POLICY"), blocks);
 
     assertEquals(3, blocks.size());
@@ -170,8 +269,8 @@ class RawKnowledgeBuilderTest {
             new ParsedBlock("text", "结尾", 0, 2, List.of(), List.of(), "", "", "", Map.of()));
     var blocks = RawKnowledgeBuilder.rawBlocks("v1", parsed);
     var md = new Metadata("dept", "cat", List.of(), "company", null, "REPORT");
-    var first = RawKnowledgeBuilder.smartChunks("d1", "v1", md, blocks);
-    var second = RawKnowledgeBuilder.smartChunks("d1", "v1", md, blocks);
+    var first = fixtureChunks("d1", "v1", md, blocks);
+    var second = fixtureChunks("d1", "v1", md, blocks);
 
     assertEquals(
         first.stream().map(RawKnowledgeBuilder.ChunkDraft::id).toList(),
@@ -199,18 +298,23 @@ class RawKnowledgeBuilderTest {
                 "table", "", 0, 1, List.of(), List.of(), "", html.toString(), "", Map.of()));
     var blocks = RawKnowledgeBuilder.rawBlocks("v-table", parsed);
     var chunks =
-        RawKnowledgeBuilder.smartChunks(
+        fixtureChunks(
             "doc",
             "v-table",
             new Metadata("dept", "cat", List.of(), "company", null, "REPORT"),
             blocks,
-            60,
+            600,
             0,
             10);
 
     assertTrue(chunks.size() > 1);
-    assertTrue(chunks.stream().allMatch(chunk -> chunk.tokenCount() <= 60));
-    assertTrue(chunks.stream().allMatch(chunk -> chunk.content().contains("<td>项目</td>")));
+    assertTrue(chunks.stream().allMatch(chunk -> chunk.tokenCount() <= 600));
+    assertTrue(
+        chunks.stream()
+            .allMatch(
+                chunk ->
+                    org.jsoup.Jsoup.parse(chunk.content()).select("td").stream()
+                        .anyMatch(cell -> cell.text().equals("项目"))));
     assertTrue(
         chunks.stream().allMatch(chunk -> chunk.sourceBlockIds().contains(blocks.get(0).id())));
     assertTrue(chunks.get(0).content().contains("项目0"));
@@ -235,7 +339,7 @@ class RawKnowledgeBuilderTest {
     assertTrue(blocks.get(0).tokenCount() < 608);
     assertTrue(html.length() > 1200);
     var chunks =
-        RawKnowledgeBuilder.smartChunks(
+        fixtureChunks(
             "doc",
             "v-table-char",
             new Metadata("dept", "cat", List.of(), "company", null, "REPORT"),
@@ -243,7 +347,12 @@ class RawKnowledgeBuilderTest {
 
     assertTrue(chunks.size() > 1);
     assertTrue(chunks.stream().allMatch(chunk -> chunk.content().length() <= 1200));
-    assertTrue(chunks.stream().allMatch(chunk -> chunk.content().contains("<td>项目</td>")));
+    assertTrue(
+        chunks.stream()
+            .allMatch(
+                chunk ->
+                    org.jsoup.Jsoup.parse(chunk.content()).select("td").stream()
+                        .anyMatch(cell -> cell.text().equals("项目"))));
     assertTrue(
         chunks.stream().allMatch(chunk -> chunk.sourceBlockIds().contains(blocks.get(0).id())));
     // The vector request uses the same complete chunk content as the raw index; table
@@ -293,7 +402,7 @@ class RawKnowledgeBuilderTest {
             new ParsedBlock("text", body, 0, 0, List.of(), List.of(), "", "", "", Map.of()));
     var blocks = RawKnowledgeBuilder.rawBlocks("v-long", parsed);
     var chunks =
-        RawKnowledgeBuilder.smartChunks(
+        fixtureChunks(
             "doc",
             "v-long",
             new Metadata("dept", "cat", List.of(), "", null, "POLICY"),
@@ -321,7 +430,7 @@ class RawKnowledgeBuilderTest {
                 new ParsedBlock("text", first, 0, 0, List.of(), List.of(), "", "", "", Map.of()),
                 new ParsedBlock("text", second, 0, 0, List.of(), List.of(), "", "", "", Map.of())));
     var chunks =
-        RawKnowledgeBuilder.smartChunks(
+        fixtureChunks(
             "doc",
             "v-boundary",
             new Metadata("dept", "cat", List.of(), "", null, "POLICY"),
@@ -352,5 +461,31 @@ class RawKnowledgeBuilderTest {
     assertEquals(36, a.id().length());
     assertEquals(blocks.get(0).contentHash(), a.hash());
     assertEquals(blocks.get(0).id(), a.location().get("block_id"));
+  }
+
+  private static java.util.List<RawKnowledgeBuilder.ChunkDraft> fixtureChunks(
+      String document,
+      String version,
+      Metadata metadata,
+      java.util.List<cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.RawBlock> blocks) {
+    return RawKnowledgeBuilder.smartChunks(
+        document, version, metadata, blocks, RawChunkProfile.DEFAULT, RawTestFixtures.TOKENS);
+  }
+
+  private static java.util.List<RawKnowledgeBuilder.ChunkDraft> fixtureChunks(
+      String document,
+      String version,
+      Metadata metadata,
+      java.util.List<cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.RawBlock> blocks,
+      int target,
+      int overlap,
+      int boundary) {
+    return RawKnowledgeBuilder.smartChunks(
+        document,
+        version,
+        metadata,
+        blocks,
+        new RawChunkProfile(target, target, overlap, Math.min(150, target)),
+        RawTestFixtures.TOKENS);
   }
 }

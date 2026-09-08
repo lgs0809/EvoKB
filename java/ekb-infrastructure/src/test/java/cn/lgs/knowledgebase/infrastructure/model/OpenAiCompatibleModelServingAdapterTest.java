@@ -30,13 +30,16 @@ class OpenAiCompatibleModelServingAdapterTest {
     server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
     server.createContext(
         "/v1/embeddings",
-        exchange -> respond(exchange, "{\"data\":[{\"index\":0,\"embedding\":[0.1,0.2,0.3]}]}"));
+        exchange ->
+            respond(
+                exchange,
+                "{\"object\":\"list\",\"model\":\"embedding-model\",\"usage\":{\"total_tokens\":3},\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2,0.3]}]}"));
     server.createContext(
         "/v1/rerank",
         exchange ->
             respond(
                 exchange,
-                "{\"results\":[{\"index\":0,\"relevance_score\":0.8},{\"index\":1,\"relevance_score\":0.2}]}"));
+                "{\"model\":\"rerank-model\",\"usage\":{\"total_tokens\":3},\"results\":[{\"index\":0,\"relevance_score\":0.8,\"document\":{\"text\":\"a\"}},{\"index\":1,\"relevance_score\":0.2,\"document\":{\"text\":\"b\"}}]}"));
     server.start();
     baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
   }
@@ -47,7 +50,100 @@ class OpenAiCompatibleModelServingAdapterTest {
   }
 
   @Test
-  void parsesJsonBodiesEvenWhenProviderUsesOctetStreamContentType() {
+  void rawDeadlineAlsoCancelsWaitingForTheSharedModelPermitBeforeHttp() throws Exception {
+    var adapter = retryAdapter();
+    var field = OpenAiCompatibleModelServingAdapter.class.getDeclaredField("embeddingPermits");
+    field.setAccessible(true);
+    var permit = (java.util.concurrent.Semaphore) field.get(adapter);
+    permit.acquire();
+    long start = System.nanoTime();
+    try (var budget =
+        cn.lgs.knowledgebase.application.raw.RawExecutionBudget.open(
+            java.time.Instant.now().plusMillis(200), () -> {}, java.time.Clock.systemUTC())) {
+      var failure =
+          assertThrows(
+              IllegalStateException.class, () -> adapter.embed(List.of("synthetic request")));
+      assertEquals(
+          "RAW_STAGE_EXPIRED",
+          cn.lgs.knowledgebase.application.raw.RawTaskRetryPolicy.code(failure, "missing"));
+      assertTrue(Duration.ofNanos(System.nanoTime() - start).toMillis() < 2000);
+      assertEquals(
+          0, permit.availablePermits(), "waiting caller never releases another request's permit");
+    } finally {
+      permit.release();
+    }
+    assertEquals(1, adapter.embed(List.of("synthetic request")).size());
+  }
+
+  @Test
+  void tokenBoundedRawInputIsSentIntactEvenBeyondLegacyCharacterLimit() {
+    server.removeContext("/v1/embeddings");
+    var bodies = new CopyOnWriteArrayList<String>();
+    server.createContext(
+        "/v1/embeddings",
+        exchange -> {
+          bodies.add(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+          respond(exchange, "{\"data\":[{\"index\":0,\"embedding\":[0.1,0.2,0.3]}]}");
+        });
+    var adapter =
+        new OpenAiCompatibleModelServingAdapter(
+            baseUrl,
+            "",
+            "embedding-model",
+            baseUrl,
+            "",
+            "rerank-model",
+            3,
+            1,
+            Duration.ofSeconds(5),
+            Duration.ofSeconds(5),
+            new ObjectMapper());
+    String complete =
+        "A complete exceptionallylongterm document paragraph. ".repeat(100)
+            + "FINAL SOURCE CONDITION";
+    assertTrue(complete.length() > 4000);
+    assertEquals(
+        List.of(List.of(0.1f, 0.2f, 0.3f)), adapter.rawEmbeddingPort().embed(List.of(complete)));
+    assertEquals(1, bodies.size());
+    try {
+      assertEquals(
+          complete, new ObjectMapper().readTree(bodies.get(0)).path("input").get(0).asText());
+    } catch (IOException error) {
+      throw new AssertionError(error);
+    }
+  }
+
+  @Test
+  void oversizeWholeRawInputFailsWithoutSplittingItsTextOrAveragingVectors() {
+    server.removeContext("/v1/embeddings");
+    var calls = new AtomicInteger();
+    server.createContext(
+        "/v1/embeddings",
+        exchange -> {
+          calls.incrementAndGet();
+          respondStatus(exchange, 413, "input too large");
+        });
+    var adapter =
+        new OpenAiCompatibleModelServingAdapter(
+            baseUrl,
+            "",
+            "embedding-model",
+            baseUrl,
+            "",
+            "rerank-model",
+            3,
+            1,
+            Duration.ofSeconds(5),
+            Duration.ofSeconds(5),
+            new ObjectMapper());
+    assertThrows(
+        IllegalStateException.class,
+        () -> adapter.rawEmbeddingPort().embed(List.of("unchanged original ".repeat(500))));
+    assertEquals(1, calls.get());
+  }
+
+  @Test
+  void parsesStandardProviderFieldsWithStrictMapperAndOctetStreamContentType() {
     var adapter =
         new OpenAiCompatibleModelServingAdapter(
             baseUrl,
@@ -67,7 +163,155 @@ class OpenAiCompatibleModelServingAdapterTest {
   }
 
   @Test
-  void splitsEmbeddingBatchAfterTimeoutUntilProviderCanServeIt() throws Exception {
+  void requestsFrozenOutputDimensionsInsteadOfUsingProviderDefault() {
+    server.removeContext("/v1/embeddings");
+    AtomicInteger requested = new AtomicInteger();
+    ObjectMapper mapper = new ObjectMapper();
+    server.createContext(
+        "/v1/embeddings",
+        exchange -> {
+          requested.set(mapper.readTree(exchange.getRequestBody()).path("dimensions").asInt());
+          respond(
+              exchange,
+              requested.get() == 3
+                  ? "{\"data\":[{\"index\":0,\"embedding\":[0.1,0.2,0.3]}]}"
+                  : "{\"data\":[{\"index\":0,\"embedding\":[0.1,0.2,0.3,0.4]}]}");
+        });
+    var adapter =
+        new OpenAiCompatibleModelServingAdapter(
+            baseUrl,
+            "",
+            "embedding-model",
+            baseUrl,
+            "",
+            "rerank-model",
+            3,
+            1,
+            Duration.ofSeconds(5),
+            Duration.ofSeconds(5),
+            mapper);
+    assertEquals(
+        List.of(List.of(0.1f, 0.2f, 0.3f)), adapter.embed(List.of("complete original input")));
+    assertEquals(3, requested.get());
+  }
+
+  @Test
+  void retriesTransientHttpResponsesAndRecoversTheUnchangedEmbeddingRequest() {
+    server.removeContext("/v1/embeddings");
+    AtomicInteger calls = new AtomicInteger();
+    List<String> bodies = new CopyOnWriteArrayList<>();
+    server.createContext(
+        "/v1/embeddings",
+        exchange -> {
+          bodies.add(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+          int count = calls.incrementAndGet();
+          if (count < 3) respondStatus(exchange, 503, "temporarily unavailable");
+          else respond(exchange, "{\"data\":[{\"index\":0,\"embedding\":[0.1,0.2,0.3]}]}");
+        });
+    var adapter = retryAdapter();
+    assertEquals(List.of(List.of(0.1f, 0.2f, 0.3f)), adapter.embed(List.of("完整问题")));
+    assertEquals(3, calls.get());
+    assertEquals(1, bodies.stream().distinct().count());
+  }
+
+  @Test
+  void exhaustedHttpRetriesRemainTypedTransientFailures() {
+    server.removeContext("/v1/embeddings");
+    AtomicInteger calls = new AtomicInteger();
+    server.createContext(
+        "/v1/embeddings",
+        exchange -> {
+          calls.incrementAndGet();
+          respondStatus(exchange, 429, "temporarily overloaded");
+        });
+    var failure =
+        assertThrows(IllegalStateException.class, () -> retryAdapter().embed(List.of("完整问题")));
+    assertTrue(
+        cn.lgs.knowledgebase.application.port.Ports.TransientDependencyFailure.causedBy(failure));
+    assertEquals(5, calls.get());
+  }
+
+  @Test
+  void permanentAuthorizationFailureDoesNotRetryOrBecomeTransient() {
+    server.removeContext("/v1/embeddings");
+    AtomicInteger calls = new AtomicInteger();
+    server.createContext(
+        "/v1/embeddings",
+        exchange -> {
+          calls.incrementAndGet();
+          respondStatus(exchange, 401, "unauthorized");
+        });
+    var failure =
+        assertThrows(IllegalStateException.class, () -> retryAdapter().embed(List.of("完整问题")));
+    assertTrue(
+        !cn.lgs.knowledgebase.application.port.Ports.TransientDependencyFailure.causedBy(failure));
+    assertEquals(1, calls.get());
+  }
+
+  @Test
+  void pairwiseRerankBatchesPreserveEveryCandidateAndItsGlobalScore() {
+    server.removeContext("/v1/rerank");
+    AtomicInteger calls = new AtomicInteger();
+    List<String> seen = new CopyOnWriteArrayList<>();
+    ObjectMapper mapper = new ObjectMapper();
+    server.createContext(
+        "/v1/rerank",
+        exchange -> {
+          var body = mapper.readTree(exchange.getRequestBody());
+          var docs = body.path("documents");
+          assertTrue(docs.size() <= 4);
+          assertEquals(docs.size(), body.path("top_n").asInt());
+          calls.incrementAndGet();
+          StringBuilder result = new StringBuilder("{\"results\":[");
+          for (int i = docs.size() - 1; i >= 0; i--) {
+            String document = docs.get(i).asText();
+            seen.add(document);
+            if (i != docs.size() - 1) result.append(',');
+            result
+                .append("{\"index\":")
+                .append(i)
+                .append(",\"relevance_score\":")
+                .append(Integer.parseInt(document.substring(4)) / 10.0)
+                .append('}');
+          }
+          result.append("]}");
+          respond(exchange, result.toString());
+        });
+    List<String> inputs = java.util.stream.IntStream.range(0, 9).mapToObj(i -> "doc-" + i).toList();
+    List<Double> expected = java.util.stream.IntStream.range(0, 9).mapToObj(i -> i / 10.0).toList();
+    assertEquals(expected, retryAdapter().rerank("原始问题", inputs));
+    assertEquals(3, calls.get());
+    assertEquals(new java.util.HashSet<>(inputs), new java.util.HashSet<>(seen));
+    assertEquals(inputs.size(), seen.size());
+  }
+
+  private OpenAiCompatibleModelServingAdapter retryAdapter() {
+    return new OpenAiCompatibleModelServingAdapter(
+        baseUrl,
+        "",
+        "embedding-model",
+        baseUrl,
+        "",
+        "rerank-model",
+        3,
+        1,
+        Duration.ofSeconds(5),
+        Duration.ofSeconds(5),
+        new ObjectMapper());
+  }
+
+  private static void respondStatus(HttpExchange exchange, int status, String text)
+      throws IOException {
+    byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+    exchange.sendResponseHeaders(status, bytes.length);
+    try (var stream = exchange.getResponseBody()) {
+      stream.write(bytes);
+    }
+  }
+
+  @Test
+  void embeddingTimeoutCannotCreateAnotherObservationWindowOrFanOutExpiredRequest()
+      throws Exception {
     server.stop(0);
     AtomicInteger multiRequests = new AtomicInteger();
     AtomicInteger singleRequests = new AtomicInteger();
@@ -116,16 +360,16 @@ class OpenAiCompatibleModelServingAdapterTest {
             Duration.ofSeconds(2),
             mapper);
 
-    var vectors = adapter.embed(List.of("one", "two", "three", "four"));
-
-    assertEquals(4, vectors.size());
-    assertEquals(List.of(0.1f, 0.2f, 0.3f), vectors.get(0));
-    // A timed-out child request can expire before the local HTTP handler is scheduled, so the
-    // observable multi-request count is scheduler-dependent. The upper bound still proves that a
-    // timeout never retries the same multi-item batch before bisection.
-    assertTrue(multiRequests.get() >= 1);
-    assertTrue(multiRequests.get() <= 3);
-    assertEquals(4, singleRequests.get());
+    long started = System.nanoTime();
+    var failure =
+        assertThrows(
+            IllegalStateException.class,
+            () -> adapter.embed(List.of("one", "two", "three", "four")));
+    assertTrue(
+        cn.lgs.knowledgebase.application.port.Ports.TransientDependencyFailure.causedBy(failure));
+    assertTrue((System.nanoTime() - started) / 1_000_000d < 1600);
+    assertEquals(1, multiRequests.get());
+    assertEquals(0, singleRequests.get());
   }
 
   @Test

@@ -17,53 +17,62 @@ import cn.lgs.knowledgebase.application.query.QueryHistoryApplicationService;
 import cn.lgs.knowledgebase.application.raw.RawEmbeddingRebuildService;
 import cn.lgs.knowledgebase.application.raw.RawIngestionApplicationService;
 import cn.lgs.knowledgebase.application.retrieval.RetrievalApplicationService;
+import cn.lgs.knowledgebase.application.upload.MultipartUploadApplicationService;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Quotas;
 import cn.lgs.knowledgebase.infrastructure.compilation.DurableCompilationWorker;
 import cn.lgs.knowledgebase.infrastructure.compilation.DurableEmbeddingRebuildWorker;
+import cn.lgs.knowledgebase.infrastructure.compilation.SelectiveGenerationScheduler;
 import cn.lgs.knowledgebase.infrastructure.evidence.ObjectStoreSourcePackageService;
-import cn.lgs.knowledgebase.infrastructure.graph.GraphRetrievalLane;
-import cn.lgs.knowledgebase.infrastructure.graph.Neo4jGraphStoreAdapter;
+import cn.lgs.knowledgebase.infrastructure.graph.PostgresGraphStoreAdapter;
 import cn.lgs.knowledgebase.infrastructure.ingestion.DurableIngestionWorker;
+import cn.lgs.knowledgebase.infrastructure.ingestion.RedisRawDeliveryQueue;
+import cn.lgs.knowledgebase.infrastructure.model.AssistantEvidenceFallbackKnowledgeModel;
 import cn.lgs.knowledgebase.infrastructure.model.JdbcModelConfigurationStore;
 import cn.lgs.knowledgebase.infrastructure.model.OpenAiCompatibleModelServingAdapter;
-import cn.lgs.knowledgebase.infrastructure.model.AssistantEvidenceFallbackKnowledgeModel;
 import cn.lgs.knowledgebase.infrastructure.model.SpringAiAlibabaKnowledgeModel;
 import cn.lgs.knowledgebase.infrastructure.parser.JacksonParsedArtifactEncoder;
 import cn.lgs.knowledgebase.infrastructure.parser.MinerUPipelineAdapter;
 import cn.lgs.knowledgebase.infrastructure.parser.RoutingParserAdapter;
 import cn.lgs.knowledgebase.infrastructure.parser.TextDocumentParserAdapter;
 import cn.lgs.knowledgebase.infrastructure.persistence.*;
+import cn.lgs.knowledgebase.infrastructure.raw.JdbcRawPublicationWriter;
 import cn.lgs.knowledgebase.infrastructure.search.CachedQueryEmbeddingPort;
-import cn.lgs.knowledgebase.infrastructure.search.HybridRetrievalLanes;
-import cn.lgs.knowledgebase.infrastructure.search.OpenSearchDerivedIndexAdapter;
-import cn.lgs.knowledgebase.infrastructure.search.OpenSearchRawIndexAdapter;
+import cn.lgs.knowledgebase.infrastructure.search.JdbcProjectionAuthority;
+import cn.lgs.knowledgebase.infrastructure.search.MilvusHybridRetrievalLane;
+import cn.lgs.knowledgebase.infrastructure.search.MilvusKnowledgeIndexAdapter;
 import cn.lgs.knowledgebase.infrastructure.security.BCryptPasswordHasher;
 import cn.lgs.knowledgebase.infrastructure.storage.LocalFileSourceAdapter;
 import cn.lgs.knowledgebase.infrastructure.storage.MinioObjectStoreAdapter;
+import cn.lgs.knowledgebase.infrastructure.upload.JdbcMultipartUploadRepository;
+import cn.lgs.knowledgebase.infrastructure.upload.MinioMultipartUploadAdapter;
+import cn.lgs.knowledgebase.infrastructure.upload.MultipartUploadRecovery;
 import cn.lgs.knowledgebase.interfaces.evaluation.GoldenJsonlLoader;
 import cn.lgs.knowledgebase.interfaces.http.EnterpriseAuditInterceptor;
 import cn.lgs.knowledgebase.interfaces.http.EnterpriseSessionInterceptor;
 import cn.lgs.knowledgebase.interfaces.http.SafeBatchUploadStager;
 import cn.lgs.knowledgebase.interfaces.mcp.EnterpriseMcpTools;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.milvus.v2.client.ConnectConfig;
+import io.milvus.v2.client.MilvusClientV2;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.tool.method.MethodToolCallbackProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
 import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
 @Configuration
+@EnableScheduling
 public class EnterpriseConfiguration {
   @Bean
   JdbcIdentityRepository identityRepository(JdbcTemplate jdbc) {
@@ -112,24 +121,31 @@ public class EnterpriseConfiguration {
   }
 
   @Bean
-  MinerUPipelineAdapter minerUParser(ObjectMapper mapper, Environment env) {
-    return new MinerUPipelineAdapter(
-        required(env, "EKB_MINERU_URL"),
-        mapper,
-        Duration.ofMillis(integer(env, "EKB_MINERU_POLL_MS", 500)),
-        Duration.ofSeconds(integer(env, "EKB_MINERU_TASK_TIMEOUT_SECONDS", 14400)),
-        value(env, "EKB_MINERU_PARSE_METHOD", "auto"),
-        value(env, "EKB_MINERU_LANGUAGE", "ch"));
-  }
-
-  @Bean
   TextDocumentParserAdapter textParser(ObjectMapper mapper) {
     return new TextDocumentParserAdapter(mapper);
   }
 
   @Bean
   RoutingParserAdapter parser(
-      TextDocumentParserAdapter textParser, MinerUPipelineAdapter minerUParser) {
+      TextDocumentParserAdapter textParser,
+      ObjectMapper mapper,
+      Environment env,
+      ObjectStore objects) {
+    String endpoint = value(env, "EKB_MINERU_URL", "");
+    ParserPort minerUParser =
+        endpoint.isBlank()
+            ? null
+            : new MinerUPipelineAdapter(
+                endpoint,
+                mapper,
+                Duration.ofMillis(integer(env, "EKB_MINERU_POLL_MS", 500)),
+                Duration.ofSeconds(integer(env, "EKB_MINERU_TASK_TIMEOUT_SECONDS", 600)),
+                value(env, "EKB_MINERU_PARSE_METHOD", "auto"),
+                value(env, "EKB_MINERU_LANGUAGE", "ch"),
+                value(env, "EKB_MINERU_BACKEND", "hybrid-engine"),
+                value(env, "EKB_MINERU_EFFORT", "medium"),
+                value(env, "EKB_MINERU_VERSION", "3.4.5"),
+                objects);
     return new RoutingParserAdapter(textParser, minerUParser);
   }
 
@@ -185,40 +201,49 @@ public class EnterpriseConfiguration {
     return new JdbcKnowledgeRepository(jdbc, tx, mapper);
   }
 
-  @Bean
-  OpenSearchRawIndexAdapter rawIndex(ObjectMapper mapper, Environment env) {
-    return new OpenSearchRawIndexAdapter(
-        value(env, "EKB_OPENSEARCH_URL", "http://127.0.0.1:19200"),
-        value(env, "EKB_RAW_INDEX", "ekb_raw_v1"),
-        mapper);
+  @Bean(destroyMethod = "close")
+  MilvusClientV2 milvusClient(Environment env) {
+    return new MilvusClientV2(
+        ConnectConfig.builder()
+            .uri(value(env, "EKB_MILVUS_URL", "http://127.0.0.1:19535"))
+            .token(value(env, "EKB_MILVUS_TOKEN", ""))
+            .rpcDeadlineMs(60000)
+            .build());
   }
 
   @Bean
-  OpenSearchDerivedIndexAdapter derivedIndex(ObjectMapper mapper, Environment env) {
-    return new OpenSearchDerivedIndexAdapter(
-        value(env, "EKB_OPENSEARCH_URL", "http://127.0.0.1:19200"),
-        value(env, "EKB_DERIVED_INDEX", "ekb_derived_v1"),
-        mapper);
+  MilvusKnowledgeIndexAdapter knowledgeIndex(
+      MilvusClientV2 client, JdbcTemplate jdbc, Environment env) {
+    var index =
+        new MilvusKnowledgeIndexAdapter(
+            client,
+            value(env, "EKB_MILVUS_COLLECTION", "knowledge_chunks"),
+            new JdbcProjectionAuthority(jdbc));
+    index.ensureIndex(1024);
+    return index;
   }
 
   @Bean
   JdbcEnterpriseOperations operations(
-      JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper) {
-    return new JdbcEnterpriseOperations(jdbc, tx, mapper);
+      JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper, Environment env) {
+    return new JdbcEnterpriseOperations(
+        jdbc, tx, mapper, value(env, "EKB_KNOWLEDGE_BASE_ID", "enterprise"));
   }
 
   @Bean
   DocumentMetadataApplicationService documentMetadataApplicationService(
       JdbcEnterpriseOperations operations,
       JdbcIdentityRepository identity,
-      OpenSearchRawIndexAdapter rawIndex,
-      OpenSearchDerivedIndexAdapter derivedIndex) {
+      RawSearchIndex rawIndex,
+      DerivedSearchIndex derivedIndex) {
     return new DocumentMetadataApplicationService(operations, identity, rawIndex, derivedIndex);
   }
 
   @Bean
-  JdbcArtifactEvaluationRepository artifactEvaluationRepository(JdbcTemplate jdbc) {
-    return new JdbcArtifactEvaluationRepository(jdbc);
+  JdbcArtifactEvaluationRepository artifactEvaluationRepository(
+      JdbcTemplate jdbc, Environment env) {
+    return new JdbcArtifactEvaluationRepository(
+        jdbc, value(env, "EKB_KNOWLEDGE_BASE_ID", "enterprise"));
   }
 
   @Bean
@@ -233,24 +258,26 @@ public class EnterpriseConfiguration {
   }
 
   @Bean
-  Neo4jGraphStoreAdapter graphStore(JdbcTemplate jdbc, ObjectMapper mapper, Environment env) {
-    String[] auth = required(env, "EKB_NEO4J_AUTH").split("/", 2);
-    if (auth.length != 2 || auth[0].isBlank() || auth[1].isBlank()) {
-      throw new IllegalStateException("EKB_NEO4J_AUTH must use username/password format");
-    }
-    return new Neo4jGraphStoreAdapter(
-        value(env, "EKB_NEO4J_URL", "http://127.0.0.1:17474"),
-        auth[0],
-        auth[1],
-        value(env, "EKB_NEO4J_DATABASE", "neo4j"),
-        mapper,
-        jdbc);
+  PostgresGraphStoreAdapter graphStore(
+      JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper, Environment env) {
+    return new PostgresGraphStoreAdapter(
+        jdbc, tx, mapper, value(env, "EKB_KNOWLEDGE_BASE_ID", "enterprise"));
   }
 
   @Bean
   KnowledgeModel knowledgeModel(
-      JdbcModelConfigurationStore store, ObjectMapper mapper, Environment env) {
-    KnowledgeModel remote = new SpringAiAlibabaKnowledgeModel(store, mapper);
+      JdbcModelConfigurationStore store,
+      ObjectMapper mapper,
+      Environment env,
+      JdbcTemplate jdbc,
+      TransactionTemplate tx,
+      AuditPort audit) {
+    KnowledgeModel remote =
+        new SpringAiAlibabaKnowledgeModel(
+            store,
+            mapper,
+            new cn.lgs.knowledgebase.infrastructure.persistence.JdbcCompilationModelAudit(
+                jdbc, tx, audit));
     String stagingRoot = value(env, "EKB_STAGING_ROOT", "/var/lib/enterprise-kb/staging");
     Path fallbackMarker = Path.of(stagingRoot).resolve(".assistant-evidence-fallback");
     return new AssistantEvidenceFallbackKnowledgeModel(
@@ -260,8 +287,7 @@ public class EnterpriseConfiguration {
   @Bean
   JdbcKnowledgeGenerationRecommendationRepository knowledgeGenerationRecommendationRepository(
       JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper, Environment env) {
-    return new JdbcKnowledgeGenerationRecommendationRepository(
-        jdbc, tx, mapper, integer(env, "EKB_GENERATION_EFFECTIVE_HIT_THRESHOLD", 3));
+    return new JdbcKnowledgeGenerationRecommendationRepository(jdbc, tx, mapper);
   }
 
   @Bean
@@ -277,8 +303,49 @@ public class EnterpriseConfiguration {
 
   @Bean
   ObjectStoreSourcePackageService sourcePackages(
-      EnterpriseOperations.Repository operations, ObjectStore objects, ObjectMapper mapper) {
-    return new ObjectStoreSourcePackageService(operations, objects, mapper, Duration.ofMinutes(10));
+      EnterpriseOperations.Repository operations,
+      ObjectStore objects,
+      ObjectMapper mapper,
+      cn.lgs.knowledgebase.application.access.KnowledgeAccessService access,
+      JdbcTemplate jdbc,
+      org.springframework.transaction.support.TransactionTemplate transactions,
+      JdbcQuerySessionRepository sessions) {
+    return new ObjectStoreSourcePackageService(
+        operations,
+        objects,
+        mapper,
+        Duration.ofMinutes(10),
+        access,
+        new cn.lgs.knowledgebase.infrastructure.persistence.JdbcPackageAuthorizationRepository(
+            jdbc, mapper),
+        new cn.lgs.knowledgebase.application.usage.SourcePackageUsageService(
+            sessions, access, new JdbcDownloadUsageRepository(jdbc, transactions)));
+  }
+
+  @Bean
+  EvidenceResolver authoritativeEvidence(JdbcKnowledgeRepository knowledge) {
+    return new EvidenceResolver() {
+      public List<cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence> resolve(
+          List<String> ids) {
+        return knowledge.resolveEvidence(ids);
+      }
+
+      public List<cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence> resolve(
+          List<String> ids,
+          cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.SearchFilters filters) {
+        return knowledge.resolveEvidence(ids, filters);
+      }
+    };
+  }
+
+  @Bean
+  cn.lgs.knowledgebase.application.access.KnowledgeAccessService knowledgeAccess(
+      JdbcIdentityRepository users,
+      EvidenceResolver evidence,
+      JdbcQuerySessionRepository sessions,
+      JdbcTemplate jdbc) {
+    return new cn.lgs.knowledgebase.application.access.KnowledgeAccessService(
+        users, evidence, sessions, new JdbcProjectionAuthority(jdbc));
   }
 
   @Bean
@@ -288,33 +355,45 @@ public class EnterpriseConfiguration {
 
   @Bean
   RetrievalApplicationService retrievalApplicationService(
-      OpenSearchRawIndexAdapter rawIndex,
-      OpenSearchDerivedIndexAdapter derivedIndex,
+      RawSearchIndex rawIndex,
+      DerivedSearchIndex derivedIndex,
       OpenAiCompatibleModelServingAdapter models,
       CachedQueryEmbeddingPort queryEmbedding,
-      Neo4jGraphStoreAdapter graph,
+      PostgresGraphStoreAdapter graph,
       JdbcKnowledgeRepository knowledge,
+      JdbcTemplate jdbc,
       Environment env) {
-    List<RetrievalLane> lanes =
-        List.of(
-            new HybridRetrievalLanes.Raw(rawIndex, queryEmbedding),
-            new HybridRetrievalLanes.Summary(derivedIndex, queryEmbedding),
-            new HybridRetrievalLanes.Wiki(derivedIndex, queryEmbedding),
-            new GraphRetrievalLane(graph));
     return new RetrievalApplicationService(
-        lanes,
+        List.of(
+            new MilvusHybridRetrievalLane((MilvusKnowledgeIndexAdapter) rawIndex, queryEmbedding)),
         models,
-        knowledge::resolveEvidence,
-        Quotas.defaults(),
-        integer(env, "EKB_RERANK_MAX_CANDIDATES", 20),
-        integer(env, "EKB_RERANK_MAX_CHARS", 400));
+        new EvidenceResolver() {
+          public List<cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence> resolve(
+              List<String> ids) {
+            return knowledge.resolveEvidence(ids);
+          }
+
+          public List<cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence> resolve(
+              List<String> ids,
+              cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.SearchFilters filters) {
+            return knowledge.resolveEvidence(ids, filters);
+          }
+        },
+        new Quotas(50, 0, 0, 10),
+        20,
+        24000,
+        graph,
+        new JdbcProjectionAuthority(jdbc));
   }
 
   @Bean
   AskApplicationService askApplicationService(
-      RetrievalApplicationService retrieval, KnowledgeModel model, Environment env) {
+      RetrievalApplicationService retrieval,
+      KnowledgeModel model,
+      Environment env,
+      cn.lgs.knowledgebase.infrastructure.raw.FrozenRawEncodingConfiguration encoding) {
     return new AskApplicationService(
-        retrieval, model, integer(env, "EKB_QUERY_CONTEXT_CHARS", 24000));
+        retrieval, model, integer(env, "EKB_QUERY_CONTEXT_CHARS", 24000), encoding.tokens());
   }
 
   @Bean
@@ -325,8 +404,10 @@ public class EnterpriseConfiguration {
 
   @Bean
   QueryHistoryApplicationService queryHistoryApplicationService(
-      JdbcQuerySessionRepository sessions, ObjectStoreSourcePackageService packages) {
-    return new QueryHistoryApplicationService(sessions, sessions, packages);
+      JdbcQuerySessionRepository sessions,
+      ObjectStoreSourcePackageService packages,
+      cn.lgs.knowledgebase.application.access.KnowledgeAccessService access) {
+    return new QueryHistoryApplicationService(sessions, sessions, packages, access);
   }
 
   @Bean
@@ -336,28 +417,128 @@ public class EnterpriseConfiguration {
       KnowledgeModel model,
       JdbcQuerySessionRepository sessions,
       JdbcKnowledgeRepository knowledge,
+      EvidenceResolver evidence,
+      cn.lgs.knowledgebase.application.access.KnowledgeAccessService access,
       Environment env) {
     return new KnowledgeQueryOrchestrator(
         retrieval,
         ask,
         model,
         sessions,
-        knowledge::resolveEvidence,
-        integer(env, "EKB_QUERY_MAX_RETRIEVAL_ROUNDS", 3),
+        evidence,
+        integer(env, "EKB_QUERY_MAX_RETRIEVAL_ROUNDS", 8),
         integer(env, "EKB_QUERY_MAX_TOTAL_QUERIES", 8),
         integer(env, "EKB_QUERY_MAX_QUERIES_PER_ROUND", 3),
-        integer(env, "EKB_QUERY_EVIDENCE_CONTEXT_CHARS", 12000));
+        integer(env, "EKB_QUERY_EVIDENCE_CONTEXT_CHARS", 12000),
+        access);
   }
 
-  @Bean(destroyMethod = "shutdown")
-  ExecutorService knowledgeQueryExecutor(Environment env) {
-    return Executors.newFixedThreadPool(integer(env, "EKB_QUERY_WORKER_THREADS", 2));
+  @Bean
+  JdbcMultipartUploadRepository multipartUploadRepository(
+      JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper, Environment env) {
+    return new JdbcMultipartUploadRepository(
+        jdbc,
+        tx,
+        mapper,
+        Path.of(value(env, "EKB_STAGING_ROOT", "/var/lib/enterprise-kb/staging")));
+  }
+
+  @Bean(destroyMethod = "close")
+  MinioMultipartUploadAdapter multipartUploadStore(Environment env) {
+    String endpoint = value(env, "EKB_MINIO_ENDPOINT", "http://127.0.0.1:19000");
+    String publicEndpoint = value(env, "EKB_MINIO_PUBLIC_ENDPOINT", endpoint);
+    return new MinioMultipartUploadAdapter(
+        endpoint.contains("://") ? endpoint : "http://" + endpoint,
+        publicEndpoint.contains("://") ? publicEndpoint : "http://" + publicEndpoint,
+        required(env, "EKB_MINIO_ACCESS_KEY"),
+        required(env, "EKB_MINIO_SECRET_KEY"),
+        value(env, "EKB_MINIO_BUCKET", "enterprise-kb"),
+        value(env, "EKB_MINIO_REGION", "us-east-1"));
+  }
+
+  @Bean
+  MultipartUploadApplicationService multipartUploads(
+      JdbcMultipartUploadRepository sessions,
+      MinioMultipartUploadAdapter store,
+      ManagedIngestionApplicationService permissions,
+      Environment env) {
+    long effectiveLimit =
+        Math.min(
+            env.getProperty("EKB_MAX_UPLOAD_BYTES", Long.class, 536870912L),
+            env.getProperty("EKB_MINERU_MAX_FILE_BYTES", Long.class, 268435456L));
+    return new MultipartUploadApplicationService(
+        sessions,
+        store,
+        permissions,
+        value(env, "EKB_KNOWLEDGE_BASE_ID", "enterprise"),
+        effectiveLimit,
+        env.getProperty("EKB_MULTIPART_RESERVED_BYTES", Long.class, 1073741824L));
+  }
+
+  @Bean
+  MultipartUploadRecovery multipartUploadRecovery(MultipartUploadApplicationService uploads) {
+    return new MultipartUploadRecovery(uploads);
+  }
+
+  @Bean(defaultCandidate = false)
+  org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor knowledgeQueryExecutor(
+      Environment env) {
+    int workers = env.getProperty("EKB_QUERY_WORKER_THREADS", Integer.class, 2);
+    int queueCapacity = env.getProperty("EKB_QUERY_QUEUE_CAPACITY", Integer.class, 32);
+    if (workers < 1 || queueCapacity < 0)
+      throw new IllegalArgumentException(
+          "query worker count must be positive and queue capacity nonnegative");
+    var executor = new org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(workers);
+    executor.setMaxPoolSize(workers);
+    executor.setQueueCapacity(queueCapacity);
+    executor.setThreadNamePrefix("knowledge-query-");
+    executor.setRejectedExecutionHandler(new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+    executor.setAwaitTerminationSeconds(5);
+    // Spring owns initialization and shutdown; a saturated pool never runs inference on HTTP
+    // threads.
+    return executor;
   }
 
   @Bean
   AsyncKnowledgeQueryService asyncKnowledgeQueryService(
-      KnowledgeQueryOrchestrator orchestrator, ExecutorService knowledgeQueryExecutor) {
+      KnowledgeQueryOrchestrator orchestrator,
+      @org.springframework.beans.factory.annotation.Qualifier("knowledgeQueryExecutor")
+          org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor knowledgeQueryExecutor) {
     return new AsyncKnowledgeQueryService(orchestrator, knowledgeQueryExecutor);
+  }
+
+  @Bean
+  cn.lgs.knowledgebase.infrastructure.query.ExpiredQueryRecovery expiredQueryRecovery(
+      QueryExecutionRecoveryRepository repository, Environment env) {
+    return new cn.lgs.knowledgebase.infrastructure.query.ExpiredQueryRecovery(
+        repository,
+        java.time.Clock.systemUTC(),
+        java.time.Duration.ofSeconds(
+            env.getProperty("EKB_QUERY_MAX_LIFETIME_SECONDS", Long.class, 7200L)));
+  }
+
+  @Bean
+  cn.lgs.knowledgebase.infrastructure.raw.FrozenRawEncodingConfiguration rawEncodingConfiguration(
+      JdbcModelConfigurationStore store, ObjectMapper mapper, Environment env) {
+    return new cn.lgs.knowledgebase.infrastructure.raw.FrozenRawEncodingConfiguration(
+        value(env, "EKB_EMBED_TOKENIZER_MANIFEST", ""),
+        mapper,
+        store,
+        "whole-input-no-truncation-v1:openai-embeddings-dimensions:server-qwen-document-template-v1");
+  }
+
+  @Bean
+  cn.lgs.knowledgebase.application.raw.RawVectorEncoder rawVectorEncoder(
+      OpenAiCompatibleModelServingAdapter models,
+      cn.lgs.knowledgebase.infrastructure.raw.FrozenRawEncodingConfiguration encoding,
+      JdbcTemplate jdbc,
+      ObjectMapper mapper) {
+    return new cn.lgs.knowledgebase.application.raw.RawVectorEncoder(
+        models.rawEmbeddingPort(),
+        encoding.profiles(),
+        new cn.lgs.knowledgebase.infrastructure.raw.JdbcRawVectorCache(jdbc, mapper),
+        true);
   }
 
   @Bean
@@ -367,25 +548,88 @@ public class EnterpriseConfiguration {
       JdbcKnowledgeRepository knowledge,
       RoutingParserAdapter parser,
       JacksonParsedArtifactEncoder encoder,
-      OpenSearchRawIndexAdapter rawIndex,
+      RawSearchIndex rawIndex,
       OpenAiCompatibleModelServingAdapter models,
-      OpenSearchDerivedIndexAdapter derived) {
+      DerivedSearchIndex derived,
+      cn.lgs.knowledgebase.infrastructure.raw.FrozenRawEncodingConfiguration encoding,
+      cn.lgs.knowledgebase.application.raw.RawVectorEncoder vectors) {
     return new RawIngestionApplicationService(
-        files, objects, knowledge, parser, encoder, rawIndex, models, derived);
+        files,
+        objects,
+        knowledge,
+        parser,
+        encoder,
+        rawIndex,
+        models,
+        derived,
+        encoding.tokens(),
+        cn.lgs.knowledgebase.application.raw.RawChunkProfile.DEFAULT,
+        vectors);
   }
 
   @Bean
   JdbcIngestionRepository ingestionRepository(
-      JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper) {
-    return new JdbcIngestionRepository(jdbc, tx, mapper);
+      JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper, Environment env) {
+    return new JdbcIngestionRepository(
+        jdbc,
+        tx,
+        mapper,
+        Path.of(
+            value(
+                env,
+                "EKB_STAGING_ROOT",
+                System.getProperty("java.io.tmpdir") + "/enterprise-kb/staging")));
   }
 
   @Bean
   ManagedIngestionApplicationService managedIngestion(
       JdbcIngestionRepository uploads,
       JdbcIdentityRepository identity,
-      LocalFileSourceAdapter files) {
-    return new ManagedIngestionApplicationService(uploads, identity, files);
+      LocalFileSourceAdapter files,
+      JdbcGenerationTaskRepository generationTasks) {
+    return new ManagedIngestionApplicationService(
+        uploads,
+        identity,
+        files,
+        versionId ->
+            generationTasks.queue(
+                versionId,
+                cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTaskType
+                    .SOURCE_ASSOCIATION,
+                "",
+                java.time.Instant.now()));
+  }
+
+  @Bean(destroyMethod = "shutdown")
+  org.redisson.api.RedissonClient rawRecoveryLocks(Environment env) {
+    var config = new org.redisson.config.Config();
+    config.setThreads(2).setNettyThreads(2);
+    config
+        .useSingleServer()
+        .setAddress(
+            "redis://"
+                + value(env, "EKB_REDIS_HOST", "127.0.0.1")
+                + ":"
+                + integer(env, "EKB_REDIS_PORT", 16385))
+        .setDatabase(integer(env, "EKB_REDIS_DATABASE", 0))
+        .setConnectionMinimumIdleSize(1)
+        .setConnectionPoolSize(4);
+    return org.redisson.Redisson.create(config);
+  }
+
+  @Bean
+  RedisRawDeliveryQueue rawDeliveryQueue(
+      StringRedisTemplate redis,
+      JdbcIngestionRepository uploads,
+      org.redisson.api.RedissonClient rawRecoveryLocks,
+      Environment env) {
+    return new RedisRawDeliveryQueue(
+        redis,
+        uploads,
+        value(env, "EKB_RAW_STREAM", "evokb:target:raw:v1"),
+        value(env, "EKB_RAW_STREAM_GROUP", "raw-ingestion"),
+        java.util.UUID.randomUUID().toString(),
+        rawRecoveryLocks);
   }
 
   @Bean
@@ -394,6 +638,8 @@ public class EnterpriseConfiguration {
       RawIngestionApplicationService raw,
       LocalFileSourceAdapter files,
       JdbcGenerationTaskRepository generationTasks,
+      RedisRawDeliveryQueue deliveries,
+      ObjectStore originalObjects,
       Environment env) {
     return new DurableIngestionWorker(
         uploads,
@@ -402,7 +648,9 @@ public class EnterpriseConfiguration {
         generationTasks,
         Duration.ofMillis(integer(env, "EKB_INGEST_POLL_MS", 1000)),
         integer(env, "EKB_INGEST_CLAIM_LIMIT", 1),
-        integer(env, "EKB_INGEST_WORKERS", 3));
+        integer(env, "EKB_INGEST_WORKERS", 3),
+        deliveries,
+        originalObjects);
   }
 
   @Bean
@@ -417,14 +665,29 @@ public class EnterpriseConfiguration {
       KnowledgeModel model,
       ObjectStore objects,
       OpenAiCompatibleModelServingAdapter embeddings,
-      OpenSearchDerivedIndexAdapter derived) {
+      DerivedSearchIndex derived) {
     return new SummaryCompilationService(repo, model, objects, embeddings, derived);
   }
 
   @Bean
   ConceptCompilationService conceptCompilation(
-      CompilationContracts.CompilationRepository repo, KnowledgeModel model) {
-    return new ConceptCompilationService(repo, model);
+      CompilationContracts.CompilationRepository repo,
+      KnowledgeModel model,
+      OpenAiCompatibleModelServingAdapter embeddings,
+      DerivedSearchIndex derived,
+      KnowledgeEntryCatalogue entries) {
+    return new ConceptCompilationService(repo, model, embeddings, derived, entries);
+  }
+
+  @Bean
+  KnowledgeEntryCatalogue knowledgeEntries(
+      JdbcTemplate jdbc,
+      TransactionTemplate tx,
+      ObjectMapper mapper,
+      Environment env,
+      CompilationContracts.CompilationRepository compilation) {
+    return new JdbcKnowledgeEntryCatalogue(
+        jdbc, tx, mapper, value(env, "EKB_KNOWLEDGE_BASE_ID", "enterprise"), compilation);
   }
 
   @Bean
@@ -451,13 +714,15 @@ public class EnterpriseConfiguration {
       KnowledgeModel model,
       ObjectStore objects,
       OpenAiCompatibleModelServingAdapter embeddings,
-      OpenSearchDerivedIndexAdapter derived) {
+      DerivedSearchIndex derived) {
     return new WikiCompilationService(repo, model, objects, embeddings, derived);
   }
 
   @Bean
-  JdbcGenerationTaskRepository generationTaskRepository(JdbcTemplate jdbc, TransactionTemplate tx) {
-    return new JdbcGenerationTaskRepository(jdbc, tx);
+  JdbcGenerationTaskRepository generationTaskRepository(
+      JdbcTemplate jdbc, TransactionTemplate tx, Environment env) {
+    return new JdbcGenerationTaskRepository(
+        jdbc, tx, value(env, "EKB_KNOWLEDGE_BASE_ID", "enterprise"));
   }
 
   @Bean
@@ -474,17 +739,70 @@ public class EnterpriseConfiguration {
   @Bean
   RawEmbeddingRebuildService rawEmbeddingRebuildService(
       CompilationContracts.CompilationRepository compilation,
-      OpenSearchRawIndexAdapter rawIndex,
+      RawSearchIndex rawIndex,
       OpenAiCompatibleModelServingAdapter models,
-      EmbeddingRebuildCheckpointRepository checkpoints) {
-    return new RawEmbeddingRebuildService(compilation, rawIndex, models, checkpoints);
+      EmbeddingRebuildCheckpointRepository checkpoints,
+      cn.lgs.knowledgebase.infrastructure.raw.FrozenRawEncodingConfiguration encoding,
+      cn.lgs.knowledgebase.application.raw.RawVectorEncoder vectors) {
+    return new RawEmbeddingRebuildService(
+        compilation,
+        rawIndex,
+        models,
+        checkpoints,
+        encoding.tokens(),
+        cn.lgs.knowledgebase.application.raw.RawChunkProfile.DEFAULT,
+        vectors);
+  }
+
+  @Bean
+  SelectiveGenerationScheduler selectiveGenerationScheduler(
+      JdbcTemplate jdbc,
+      TransactionTemplate tx,
+      JdbcGenerationTaskRepository tasks,
+      JdbcKnowledgeEntryCatalogue entries,
+      Environment env) {
+    return new SelectiveGenerationScheduler(
+        jdbc, tx, tasks, value(env, "EKB_KNOWLEDGE_BASE_ID", "enterprise"), entries);
+  }
+
+  @Bean
+  JdbcRawPublicationWriter rawPublicationWriter(JdbcTemplate jdbc) {
+    return new JdbcRawPublicationWriter(jdbc);
   }
 
   @Bean
   DurableEmbeddingRebuildWorker embeddingRebuildWorker(
-      JdbcGenerationTaskRepository tasks, RawEmbeddingRebuildService rebuild, Environment env) {
+      JdbcGenerationTaskRepository tasks,
+      RawEmbeddingRebuildService rebuild,
+      JdbcRawPublicationWriter writer,
+      Environment env) {
     return new DurableEmbeddingRebuildWorker(
-        tasks, rebuild, Duration.ofMillis(integer(env, "EKB_EMBEDDING_REBUILD_POLL_MS", 1000)));
+        tasks,
+        rebuild,
+        Duration.ofMillis(integer(env, "EKB_EMBEDDING_REBUILD_POLL_MS", 1000)),
+        writer);
+  }
+
+  @Bean
+  EntryAssociationService entryAssociationService(
+      CompilationContracts.CompilationRepository compilation,
+      KnowledgeEntryCatalogue entries,
+      KnowledgeModel model,
+      JdbcGenerationTaskRepository tasks) {
+    return new EntryAssociationService(compilation, entries, model, tasks);
+  }
+
+  @Bean
+  JdbcCompilationCommandRepository compilationCommands(
+      JdbcTemplate jdbc,
+      TransactionTemplate tx,
+      ObjectMapper mapper,
+      JdbcGenerationTaskRepository tasks,
+      JdbcIdentityRepository users,
+      cn.lgs.knowledgebase.application.access.KnowledgeAccessService access,
+      Environment env) {
+    return new JdbcCompilationCommandRepository(
+        jdbc, tx, mapper, tasks, users, access, value(env, "EKB_KNOWLEDGE_BASE_ID", "enterprise"));
   }
 
   @Bean
@@ -496,17 +814,25 @@ public class EnterpriseConfiguration {
       GraphCompilationService graph,
       WikiCompilationService wiki,
       WikiKeywordProjectionService projection,
+      KnowledgeEntryCatalogue entries,
+      EntryAssociationService association,
+      JdbcCompilationCommandRepository commands,
+      AsyncKnowledgeQueryService foregroundQueries,
       Environment env) {
     return new DurableCompilationWorker(
-        tasks,
-        compilation,
-        summaries,
-        concepts,
-        graph,
-        wiki,
-        projection,
-        Duration.ofMillis(integer(env, "EKB_COMPILATION_POLL_MS", 1000)),
-        integer(env, "EKB_COMPILATION_CLAIM_LIMIT", 1));
+            tasks,
+            compilation,
+            summaries,
+            concepts,
+            graph,
+            wiki,
+            projection,
+            Duration.ofMillis(integer(env, "EKB_COMPILATION_POLL_MS", 1000)),
+            integer(env, "EKB_COMPILATION_CLAIM_LIMIT", 1),
+            entries,
+            association,
+            commands)
+        .withForegroundActivity(foregroundQueries::hasPendingWork);
   }
 
   @Bean
@@ -523,8 +849,10 @@ public class EnterpriseConfiguration {
   }
 
   @Bean
-  EnterpriseSessionInterceptor sessionInterceptor(IdentityApplicationService identity) {
-    return new EnterpriseSessionInterceptor(identity);
+  EnterpriseSessionInterceptor sessionInterceptor(
+      IdentityApplicationService identity, Environment env) {
+    return new EnterpriseSessionInterceptor(
+        identity, value(env, "EKB_SESSION_COOKIE_NAME", "ekb_session"));
   }
 
   @Bean
@@ -569,8 +897,42 @@ public class EnterpriseConfiguration {
   EnterpriseMcpTools enterpriseMcpTools(
       RetrievalApplicationService retrieval,
       KnowledgeGenerationRecommendationService recommendations,
-      SourcePackageService packages) {
-    return new EnterpriseMcpTools(retrieval, recommendations, packages);
+      SourcePackageService packages,
+      cn.lgs.knowledgebase.application.access.KnowledgeAccessService access) {
+    return new EnterpriseMcpTools(retrieval, recommendations, packages, access);
+  }
+
+  @Bean
+  io.modelcontextprotocol.server.transport.WebMvcStreamableServerTransportProvider
+      authenticatedMcpTransport(
+          @org.springframework.beans.factory.annotation.Qualifier("mcpServerObjectMapper")
+              ObjectMapper mapper,
+          org.springframework.ai.mcp.server.common.autoconfigure.properties
+                  .McpServerStreamableHttpProperties
+              properties) {
+    return io.modelcontextprotocol.server.transport.WebMvcStreamableServerTransportProvider
+        .builder()
+        .jsonMapper(new io.modelcontextprotocol.json.jackson.JacksonMcpJsonMapper(mapper))
+        .mcpEndpoint(properties.getMcpEndpoint())
+        .disallowDelete(properties.isDisallowDelete())
+        .keepAliveInterval(properties.getKeepAliveInterval())
+        .contextExtractor(cn.lgs.knowledgebase.interfaces.mcp.McpIdentityContext::extract)
+        .build();
+  }
+
+  @Bean
+  cn.lgs.knowledgebase.interfaces.http.EnterpriseMcpAuthenticationFilter mcpAuthenticationFilter(
+      IdentityApplicationService identity,
+      JdbcTemplate jdbc,
+      Environment env,
+      org.springframework.ai.mcp.server.common.autoconfigure.properties
+              .McpServerStreamableHttpProperties
+          properties) {
+    return new cn.lgs.knowledgebase.interfaces.http.EnterpriseMcpAuthenticationFilter(
+        identity,
+        new JdbcMcpSessionRepository(jdbc),
+        value(env, "EKB_SESSION_COOKIE_NAME", EnterpriseSessionInterceptor.SESSION_COOKIE),
+        properties.getMcpEndpoint());
   }
 
   @Bean

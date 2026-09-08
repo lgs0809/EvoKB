@@ -1,12 +1,18 @@
 package cn.lgs.knowledgebase.infrastructure.model;
 
+import cn.lgs.knowledgebase.application.compilation.ModelOutputRejectedException;
 import cn.lgs.knowledgebase.application.model.ModelConfigurationApplicationService.EffectiveConfiguration;
 import cn.lgs.knowledgebase.application.model.ModelConfigurationApplicationService.Store;
+import cn.lgs.knowledgebase.application.port.ExternalCallBudget;
+import cn.lgs.knowledgebase.application.port.Ports.AuditPort;
 import cn.lgs.knowledgebase.application.port.Ports.KnowledgeModel;
 import cn.lgs.knowledgebase.application.port.Ports.ModelRole;
 import cn.lgs.knowledgebase.application.port.Ports.ModelTask;
+import cn.lgs.knowledgebase.application.port.Ports.TransientDependencyFailure;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.exc.InvalidDefinitionException;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.IOException;
@@ -22,8 +28,16 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.SSLHandshakeException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.converter.BeanOutputConverter;
+import org.springframework.retry.backoff.BackOffInterruptedException;
+import org.springframework.retry.backoff.ExponentialBackOffPolicy;
+import org.springframework.retry.policy.SimpleRetryPolicy;
+import org.springframework.retry.support.RetryTemplate;
 
 /**
  * OpenAI-compatible knowledge-model boundary. The model endpoint, credentials and role mappings are
@@ -33,15 +47,24 @@ import org.springframework.ai.converter.BeanOutputConverter;
 public final class SpringAiAlibabaKnowledgeModel implements KnowledgeModel {
   // The configured provider occasionally terminates the TLS handshake for the first few
   // connections in a burst.  Keep retries bounded, but leave enough room for the provider to
-  // recover without ever retrying non-transient/business or structured-decoding failures.
+  // recover without repeating non-transient/business or structured-decoding failures here.
+  // Rejected structured proposals use the separate durable task attempt budget.
   private static final int TRANSIENT_RETRY_ATTEMPTS = 5;
   private static final long TRANSIENT_RETRY_BACKOFF_MILLIS = 5_000L;
   private final Store configurationStore;
   private final ObjectMapper mapper;
+  private final CompilationModelAudit outputAudit;
+  private final RecentlyHealthyModelRoutes healthyRoutes = new RecentlyHealthyModelRoutes();
 
   public SpringAiAlibabaKnowledgeModel(Store configurationStore, ObjectMapper mapper) {
+    this(configurationStore, mapper, event -> {});
+  }
+
+  public SpringAiAlibabaKnowledgeModel(
+      Store configurationStore, ObjectMapper mapper, AuditPort audit) {
     this.configurationStore = Objects.requireNonNull(configurationStore, "configuration store");
     this.mapper = Objects.requireNonNull(mapper, "object mapper");
+    this.outputAudit = new CompilationModelAudit(audit);
   }
 
   @Override
@@ -66,15 +89,35 @@ public final class SpringAiAlibabaKnowledgeModel implements KnowledgeModel {
         text(systemPrompt)
             + "\n\nReturn only a JSON value that follows this schema and formatting contract:\n"
             + converter.getFormat();
-    String content = call(role, task, structuredSystem, userPrompt);
+    String content;
+    EffectiveConfiguration configuration = configurationStore.current();
+    String identity = model(configuration, role);
+    try {
+      content = call(role, task, structuredSystem, userPrompt, configuration);
+    } catch (RuntimeException failure) {
+      try {
+        outputAudit.failed(role, task, identity, outputType, failure);
+      } catch (RuntimeException auditFailure) {
+        failure.addSuppressed(auditFailure);
+      }
+      throw failure;
+    }
+    outputAudit.received(role, task, identity, outputType, content);
     try {
       JsonNode parsed = mapper.readTree(extractJson(content));
       T output = mapper.treeToValue(normalizeStructuredKeys(parsed), outputType);
       if (output == null)
-        throw new IllegalStateException("model returned empty structured output for " + task);
+        throw new ModelOutputRejectedException(
+            "model returned empty structured output for " + task);
       return output;
-    } catch (IOException | RuntimeException failure) {
+    } catch (InvalidDefinitionException failure) {
+      // A local serialization definition is a programming/configuration defect, not a bad proposal.
       throw new IllegalStateException("cannot decode structured model output for " + task, failure);
+    } catch (JsonProcessingException failure) {
+      // The HTTP request already succeeded. Let durable task policy retry this proposal, without
+      // treating it as a transport failure or repeating the HTTP request inside this adapter.
+      throw new ModelOutputRejectedException(
+          "cannot decode structured model output for " + task, failure);
     }
   }
 
@@ -99,10 +142,11 @@ public final class SpringAiAlibabaKnowledgeModel implements KnowledgeModel {
       start = arrayStart;
       endChar = ']';
     }
-    if (start < 0) throw new IllegalStateException("structured model output does not contain JSON");
+    if (start < 0)
+      throw new ModelOutputRejectedException("structured model output does not contain JSON");
     int end = value.lastIndexOf(endChar);
     if (end < start)
-      throw new IllegalStateException("structured model output contains incomplete JSON");
+      throw new ModelOutputRejectedException("structured model output contains incomplete JSON");
     return value.substring(start, end + 1);
   }
 
@@ -141,7 +185,15 @@ public final class SpringAiAlibabaKnowledgeModel implements KnowledgeModel {
   }
 
   private String call(ModelRole role, ModelTask task, String systemPrompt, String userPrompt) {
-    EffectiveConfiguration config = configurationStore.current();
+    return call(role, task, systemPrompt, userPrompt, configurationStore.current());
+  }
+
+  private String call(
+      ModelRole role,
+      ModelTask task,
+      String systemPrompt,
+      String userPrompt,
+      EffectiveConfiguration config) {
     String model = model(config, role);
     String endpoint = chatCompletionEndpoint(config.chatBaseUrl());
     byte[] payload;
@@ -151,7 +203,7 @@ public final class SpringAiAlibabaKnowledgeModel implements KnowledgeModel {
               Map.of(
                   "model",
                   model,
-                  // The configured GPT-5.6-compatible gateway applies its own structured-output
+                  // The configured OpenAI-compatible gateway applies its own structured-output
                   // budget. Do not send legacy temperature/max_tokens overrides: with these
                   // fields present it can route the request to a compatibility path that leaves
                   // the connection open. The complete RawBlock input is still sent verbatim;
@@ -177,91 +229,132 @@ public final class SpringAiAlibabaKnowledgeModel implements KnowledgeModel {
       request.header("Authorization", "Bearer " + config.chatApiKey());
     }
 
-    HttpResponse<byte[]> response = sendWithTransientRetry(request.build(), task);
+    String route = RecentlyHealthyModelRoutes.identity(endpoint, model, config.chatApiKey());
+    HttpResponse<byte[]> response = sendWithTransientRetry(request.build(), task, route);
     try {
       JsonNode root = mapper.readTree(response.body());
       String businessError = providerBusinessError(root);
       if (!businessError.isBlank()) {
         throw new IllegalStateException("chat request failed for " + task + ": " + businessError);
       }
+      // A requested model name is not evidence of the model that actually answered. Reject
+      // missing/substituted identities and incomplete completions before exposing content or
+      // marking this exact route healthy. Never relabel a gateway response as the chosen model.
+      if (!root.path("model").isTextual() || !model.equals(root.path("model").asText())) {
+        throw new TransientDependencyFailure(
+            "chat response model identity mismatch for " + task, null);
+      }
+      if (!"stop".equals(root.path("choices").path(0).path("finish_reason").asText())) {
+        throw new TransientDependencyFailure("chat response incomplete for " + task, null);
+      }
       JsonNode content = root.path("choices").path(0).path("message").path("content");
       if (!content.isTextual() || content.asText().isBlank()) {
-        throw new IllegalStateException("chat response missing content for " + task);
+        throw new TransientDependencyFailure("chat response missing content for " + task, null);
       }
+      LoggerFactory.getLogger(SpringAiAlibabaKnowledgeModel.class)
+          .info(
+              "Model response verified task={} requestedModel={} responseModel={} finishReason=stop",
+              task,
+              model,
+              root.path("model").asText());
+      healthyRoutes.succeeded(route);
       return content.asText();
     } catch (IOException e) {
-      throw new IllegalStateException("cannot decode chat response for " + task, e);
+      throw new TransientDependencyFailure("cannot decode chat response for " + task, e);
     }
   }
 
-  private HttpResponse<byte[]> sendWithTransientRetry(HttpRequest request, ModelTask task) {
-    IOException lastIoFailure = null;
-    boolean proxyConfigured = proxyConfigured();
-    boolean directFallbackAllowed = proxyConfigured && directFallbackAllowed();
-    for (int attempt = 1; attempt <= TRANSIENT_RETRY_ATTEMPTS; attempt++) {
-      try {
-        HttpResponse<byte[]> response =
-            newHttpClient(attempt).send(request, HttpResponse.BodyHandlers.ofByteArray());
-        int status = response.statusCode();
-        if (status / 100 == 2) return response;
-        if (!transientStatus(status)
-            || nonRetryableTransientResponse(status, response.body())
-            || attempt == TRANSIENT_RETRY_ATTEMPTS) {
-          throw new IllegalStateException(
-              "chat request failed for "
-                  + task
-                  + ": HTTP "
-                  + status
-                  + providerMessage(response.body()));
-        }
-      } catch (IOException failure) {
-        lastIoFailure = failure;
-        // A local proxy may be reachable from the host but not from the Docker gateway address.
-        // If the connection failed before an HTTP response (connect/TLS handshake), make one
-        // direct attempt before consuming the retry slot. This keeps the configured proxy as the
-        // primary path while allowing the provider's direct route when the proxy binding is
-        // loopback-only; HTTP status/business/structured failures remain fail-closed.
-        if (directFallbackAllowed && proxyConnectionFailure(failure)) {
-          try {
-            HttpResponse<byte[]> directResponse =
-                newHttpClient(attempt, false)
-                    .send(request, HttpResponse.BodyHandlers.ofByteArray());
-            int directStatus = directResponse.statusCode();
-            if (directStatus / 100 == 2) return directResponse;
-            if (!transientStatus(directStatus)
-                || nonRetryableTransientResponse(directStatus, directResponse.body())
-                || attempt == TRANSIENT_RETRY_ATTEMPTS) {
-              throw new IllegalStateException(
-                  "chat request failed for "
-                      + task
-                      + ": HTTP "
-                      + directStatus
-                      + providerMessage(directResponse.body()));
+  private HttpResponse<byte[]> sendWithTransientRetry(
+      HttpRequest request, ModelTask task, String route) {
+    var retries = new RetryTemplate();
+    retries.setRetryPolicy(
+        new SimpleRetryPolicy(TRANSIENT_RETRY_ATTEMPTS, Map.of(RetryableChatFailure.class, true)));
+    var backoff = new ExponentialBackOffPolicy();
+    backoff.setInitialInterval(TRANSIENT_RETRY_BACKOFF_MILLIS);
+    backoff.setMultiplier(2);
+    backoff.setMaxInterval(30_000L);
+    backoff.setSleeper(
+        millis -> {
+          Duration delay = ExternalCallBudget.limit(Duration.ofMillis(millis));
+          Thread.sleep(delay.toMillis(), delay.toNanosPart() % 1_000_000);
+        });
+    retries.setBackOffPolicy(backoff);
+    boolean fallbackAllowed = proxyConfigured() && directFallbackAllowed();
+    var directNext = new AtomicBoolean(false);
+    try {
+      return retries.execute(
+          context -> {
+            ExternalCallBudget.check();
+            int attempt = context.getRetryCount() + 1;
+            boolean direct = directNext.getAndSet(false);
+            long started = System.nanoTime();
+            try {
+              // Every network send, including the optional existing direct route, consumes a slot.
+              HttpResponse<byte[]> response =
+                  BudgetedHttpRetry.observe(newHttpClient(!direct), request);
+              int status = response.statusCode();
+              transportObservation(task, attempt, direct, "HTTP_" + status, started);
+              if (status / 100 == 2) return response;
+              RuntimeException failure = httpFailure(task, status, response.body(), route);
+              if (failure instanceof TransientDependencyFailure)
+                throw new RetryableChatFailure(failure);
+              throw failure;
+            } catch (IOException failure) {
+              transportObservation(
+                  task, attempt, direct, failure.getClass().getSimpleName(), started);
+              if (!direct && fallbackAllowed && proxyConnectionFailure(failure))
+                directNext.set(true);
+              throw new RetryableChatFailure(
+                  new TransientDependencyFailure(
+                      "chat request failed for " + task + ": " + failure.getClass().getSimpleName(),
+                      failure));
+            } catch (InterruptedException interrupted) {
+              Thread.currentThread().interrupt();
+              throw new IllegalStateException("chat request interrupted for " + task, interrupted);
             }
-          } catch (IOException directFailure) {
-            lastIoFailure = directFailure;
-          } catch (InterruptedException directFailure) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("chat request interrupted for " + task, directFailure);
-          }
-        }
-        if (retryBudgetExhausted(failure, attempt)) {
-          throw new IllegalStateException(
-              "chat request failed for "
-                  + task
-                  + ": "
-                  + failure.getClass().getSimpleName()
-                  + ": "
-                  + failure.getMessage(),
-              failure);
-        }
-      } catch (InterruptedException failure) {
-        Thread.currentThread().interrupt();
-        throw new IllegalStateException("chat request interrupted for " + task, failure);
-      }
-      sleepBeforeRetry(task, attempt);
+          });
+    } catch (RetryableChatFailure exhausted) {
+      throw exhausted.failure;
+    } catch (BackOffInterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("chat retry interrupted for " + task, interrupted);
     }
-    throw new IllegalStateException("chat request failed for " + task, lastIoFailure);
+  }
+
+  private static final Logger TRANSPORT_LOG =
+      LoggerFactory.getLogger(SpringAiAlibabaKnowledgeModel.class);
+
+  private static void transportObservation(
+      ModelTask task, int attempt, boolean direct, String outcome, long started) {
+    // Operational evidence only: no endpoint, credential, request body or model answer.
+    TRANSPORT_LOG.info(
+        "Model HTTP task={} attempt={}/{} route={} outcome={} elapsedMs={}",
+        task,
+        attempt,
+        TRANSIENT_RETRY_ATTEMPTS,
+        direct ? "DIRECT_FALLBACK" : "CONFIGURED",
+        outcome,
+        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+  }
+
+  private static final class RetryableChatFailure extends RuntimeException {
+    private final RuntimeException failure;
+
+    private RetryableChatFailure(RuntimeException failure) {
+      super(failure);
+      this.failure = failure;
+    }
+  }
+
+  private RuntimeException httpFailure(ModelTask task, int status, byte[] body, String route) {
+    String message = "chat request failed for " + task + ": HTTP " + status + providerMessage(body);
+    // A route/model/credential that just returned usable content is configured correctly.
+    // Some compatible gateways intermittently return 404 while rotating an upstream route.
+    // Cold/mistyped routes and authorization errors still fail immediately. The original
+    // five-attempt/backoff/stage-budget contract is unchanged and no success is manufactured.
+    return (transientStatus(status) || status == 404 && healthyRoutes.recentlySucceeded(route))
+        ? new TransientDependencyFailure(message, null)
+        : new IllegalStateException(message);
   }
 
   private static boolean transientStatus(int status) {
@@ -271,24 +364,7 @@ public final class SpringAiAlibabaKnowledgeModel implements KnowledgeModel {
     return status == 429 || status == 502 || status == 503 || status == 504 || status == 524;
   }
 
-  /**
-   * A gateway can use HTTP 503 for a deterministic account/provider capacity response. Retrying
-   * that exact request only burns the same provider quota and delays the durable checkpoint, so
-   * fail fast while retaining retries for ordinary transient 503 responses.
-   */
-  private boolean nonRetryableTransientResponse(int status, byte[] payload) {
-    if (status != 503 || payload == null || payload.length == 0) return false;
-    String message = providerMessage(payload).toLowerCase(java.util.Locale.ROOT);
-    return message.contains("no available token")
-        || message.contains("no available tokens")
-        || message.contains("token unavailable");
-  }
-
-  private static HttpClient newHttpClient(int attempt) {
-    return newHttpClient(attempt, true);
-  }
-
-  private static HttpClient newHttpClient(int attempt, boolean allowProxy) {
+  private static HttpClient newHttpClient(boolean allowProxy) {
     // Use the JVM's normal certificate-validated TLS negotiation. The provider's current
     // gateway accepts the default TLS profile; forcing a hand-built TLS 1.2 context made the
     // Linux-container -> local proxy handshake fail intermittently even when the same request
@@ -340,24 +416,6 @@ public final class SpringAiAlibabaKnowledgeModel implements KnowledgeModel {
           || current instanceof SSLHandshakeException) return true;
     }
     return false;
-  }
-
-  private static boolean retryBudgetExhausted(IOException failure, int attempt) {
-    // A stalled TLS handshake or request timeout does not improve by repeating the same long
-    // request five times. Keep one recovery attempt, then return to the durable compilation
-    // checkpoint so an operator can switch route/provider without burning an hour per unit.
-    boolean slowTransport =
-        proxyConnectionFailure(failure) || failure instanceof java.net.http.HttpTimeoutException;
-    return attempt >= (slowTransport ? 2 : TRANSIENT_RETRY_ATTEMPTS);
-  }
-
-  private static void sleepBeforeRetry(ModelTask task, int attempt) {
-    try {
-      Thread.sleep(attempt * TRANSIENT_RETRY_BACKOFF_MILLIS);
-    } catch (InterruptedException failure) {
-      Thread.currentThread().interrupt();
-      throw new IllegalStateException("chat request interrupted for " + task, failure);
-    }
   }
 
   private String providerMessage(byte[] payload) {

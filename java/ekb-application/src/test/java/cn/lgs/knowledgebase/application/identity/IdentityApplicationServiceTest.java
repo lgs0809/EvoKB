@@ -75,20 +75,95 @@ class IdentityApplicationServiceTest {
     assertEquals("admin", fixture.service.login("admin", chars("abcdefghij")).user().username());
   }
 
+  @Test
+  void clearanceChangesAffectExistingSessionAndSurviveLoginAndProfileChanges() {
+    Fixture f = new Fixture();
+    User admin =
+        f.service.setupAdmin(
+            new IdentityApplicationService.CreateUser(
+                "admin", "Admin", chars("0123456789"), Role.ADMIN));
+    var login = f.service.login("admin", chars("0123456789"));
+    f.service.updateUser(
+        admin.id(), new IdentityApplicationService.UpdateUser("Renamed", null, null, 30));
+    assertEquals(30, f.service.authenticate(login.token()).securityClearance());
+    assertEquals(30, f.service.login("admin", chars("0123456789")).user().securityClearance());
+    f.service.updateUser(
+        admin.id(), new IdentityApplicationService.UpdateUser(null, null, null, 10));
+    assertEquals(10, f.service.authenticate(login.token()).securityClearance());
+  }
+
   private static char[] chars(String value) {
     return value.toCharArray();
   }
 
+  @Test
+  void loginPreservesProfileChangedBeforeSessionTransaction() {
+    Fixture fixture = new Fixture();
+    User user =
+        fixture.service.setupAdmin(
+            new IdentityApplicationService.CreateUser(
+                "admin", "Admin", chars("0123456789"), Role.ADMIN));
+    fixture.tx.beforeWork =
+        () ->
+            fixture.store.update(
+                user.withRoleAndStatus(Role.USER, UserStatus.ACTIVE, Instant.now())
+                    .withDisplayName("Updated profile", Instant.now()));
+    var login = fixture.service.login("admin", chars("0123456789"));
+    assertEquals(Role.USER, login.user().role());
+    assertEquals("Updated profile", login.user().displayName());
+    assertEquals(Role.USER, fixture.service.authenticate(login.token()).role());
+  }
+
+  @Test
+  void loginCannotReactivateAccountDisabledBeforeSessionTransaction() {
+    Fixture fixture = new Fixture();
+    User user =
+        fixture.service.setupAdmin(
+            new IdentityApplicationService.CreateUser(
+                "admin", "Admin", chars("0123456789"), Role.ADMIN));
+    fixture.tx.beforeWork =
+        () ->
+            fixture.store.update(
+                user.withRoleAndStatus(Role.ADMIN, UserStatus.DISABLED, Instant.now()));
+    assertThrows(
+        IdentityApplicationService.InvalidCredentials.class,
+        () -> fixture.service.login("admin", chars("0123456789")));
+    assertFalse(fixture.store.findById(user.id()).orElseThrow().active());
+    assertTrue(fixture.store.sessions.isEmpty());
+  }
+
+  @Test
+  void loginCannotUsePasswordReplacedBeforeSessionTransaction() {
+    Fixture fixture = new Fixture();
+    User user =
+        fixture.service.setupAdmin(
+            new IdentityApplicationService.CreateUser(
+                "admin", "Admin", chars("0123456789"), Role.ADMIN));
+    fixture.tx.beforeWork = () -> fixture.store.updatePasswordHash(user.id(), "hash:abcdefghij");
+    assertThrows(
+        IdentityApplicationService.InvalidCredentials.class,
+        () -> fixture.service.login("admin", chars("0123456789")));
+    assertTrue(fixture.store.sessions.isEmpty());
+  }
+
   private static final class Fixture {
     private final FakeStore store = new FakeStore();
+    private final DirectTx tx = new DirectTx();
     private final IdentityApplicationService service =
         new IdentityApplicationService(
-            store, store, new FakePasswordHasher(), new DirectTx(), Duration.ofHours(12));
+            store, store, new FakePasswordHasher(), tx, Duration.ofHours(12));
   }
 
   private static final class DirectTx implements TransactionPort {
+    private Runnable beforeWork;
+
     @Override
     public <T> T required(java.util.function.Supplier<T> work) {
+      if (beforeWork != null) {
+        Runnable action = beforeWork;
+        beforeWork = null;
+        action.run();
+      }
       return work.get();
     }
   }

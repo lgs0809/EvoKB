@@ -9,28 +9,31 @@ import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.DocumentVersion;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Metadata;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.RawBlock;
+import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.SearchFilters;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.VersionLifecycle;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 
 public final class JdbcKnowledgeRepository implements KnowledgeRepository {
   private final JdbcTemplate jdbc;
+  private final NamedParameterJdbcTemplate named;
   private final TransactionTemplate transactions;
   private final ObjectMapper mapper;
 
   public JdbcKnowledgeRepository(
       JdbcTemplate jdbc, TransactionTemplate transactions, ObjectMapper mapper) {
     this.jdbc = jdbc;
+    this.named = new NamedParameterJdbcTemplate(jdbc);
     this.transactions = transactions;
     this.mapper = mapper;
   }
@@ -50,6 +53,60 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
   public Optional<DocumentVersion> findVersionBySha(String documentId, String sha256) {
     return findVersion(
         "WHERE document_id=? AND sha256=? ORDER BY version_no DESC LIMIT 1", documentId, sha256);
+  }
+
+  @Override
+  public Optional<DocumentVersion> findVersionBySourceAndPipeline(
+      String documentId, String sha256, String pipelineSha256) {
+    return findVersion(
+        "WHERE document_id=? AND sha256=? AND parser_pipeline_sha256=? ORDER BY version_no DESC LIMIT 1",
+        documentId,
+        sha256,
+        pipelineSha256);
+  }
+
+  @Override
+  public Optional<cn.lgs.knowledgebase.application.raw.RawParseCheckpoint> parseCheckpoint(
+      String versionId) {
+    return jdbc
+        .query(
+            "SELECT parse_checkpoint_json FROM document_version WHERE version_id=? AND parse_checkpoint_json IS NOT NULL",
+            (rs, n) -> {
+              try {
+                return mapper.readValue(
+                    rs.getString(1), cn.lgs.knowledgebase.application.raw.RawParseCheckpoint.class);
+              } catch (java.io.IOException invalid) {
+                if (invalid
+                    instanceof com.fasterxml.jackson.databind.exc.InvalidDefinitionException)
+                  throw new IllegalStateException(
+                      "Cannot decode typed parser checkpoint definition", invalid);
+                // Unreadable is unproved. Preserve the original row; bounded unpublished retries
+                // may
+                // parse again, while ACTIVE reuse is rejected by the shared complete-checkpoint
+                // gate.
+                return null;
+              }
+            },
+            versionId)
+        .stream()
+        .filter(java.util.Objects::nonNull)
+        .findFirst();
+  }
+
+  @Override
+  public void bindParserPipeline(String versionId, String pipelineSha256) {
+    if (pipelineSha256 == null || !pipelineSha256.matches("[0-9a-f]{64}"))
+      throw new IllegalArgumentException("Actual parser pipeline SHA required");
+    int rows =
+        jdbc.update(
+            "UPDATE document_version SET parser_pipeline_sha256=? WHERE version_id=? AND lifecycle IN ('PENDING','FAILED') AND (parser_pipeline_sha256=? OR (parser_pipeline_sha256 IS NULL AND parsed_at IS NULL AND NOT EXISTS(SELECT 1 FROM raw_block WHERE version_id=?)))",
+            pipelineSha256,
+            versionId,
+            pipelineSha256,
+            versionId);
+    if (rows != 1)
+      throw new IllegalStateException(
+          "PARSER_IDENTITY_CHANGED: reserved source belongs to another/unknown parsed pipeline");
   }
 
   @Override
@@ -78,17 +135,51 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
 
   @Override
   public void createPendingVersion(Document document, DocumentVersion version, Metadata metadata) {
+    createPendingVersion(document, version, metadata, null);
+  }
+
+  @Override
+  public void createPendingVersion(
+      Document document, DocumentVersion version, Metadata metadata, Integer securityLevel) {
+    createPendingVersionInternal(document, version, metadata, securityLevel, null);
+  }
+
+  @Override
+  public void createPendingVersion(
+      Document document,
+      DocumentVersion version,
+      Metadata metadata,
+      Integer securityLevel,
+      String actualPipelineSha256) {
+    if (actualPipelineSha256 == null || !actualPipelineSha256.matches("[0-9a-f]{64}"))
+      throw new IllegalArgumentException("Actual parser pipeline SHA required");
+    createPendingVersionInternal(document, version, metadata, securityLevel, actualPipelineSha256);
+  }
+
+  private void createPendingVersionInternal(
+      Document document,
+      DocumentVersion version,
+      Metadata metadata,
+      Integer securityLevel,
+      String pipeline) {
+    cn.lgs.knowledgebase.application.operations.DocumentClassificationPolicy.requireValid(
+        securityLevel);
     transactions.executeWithoutResult(
         status -> {
+          int inherited =
+              jdbc.queryForObject(
+                  "SELECT COALESCE(max(m.security_level),10) FROM document_metadata m JOIN document_version v USING(version_id) WHERE v.document_id=?",
+                  Integer.class,
+                  document.id());
+          int classification = securityLevel == null ? inherited : securityLevel;
           jdbc.update(
-              "INSERT INTO document(document_id,logical_name,source_path,status) VALUES(?,?,?,'ACTIVE') "
-                  + "ON DUPLICATE KEY UPDATE logical_name=VALUES(logical_name),source_path=VALUES(source_path),status='ACTIVE'",
+              "INSERT INTO document(document_id,logical_name,source_path,status) VALUES(?,?,?,'ACTIVE') ON CONFLICT (document_id) DO UPDATE SET logical_name=EXCLUDED.logical_name,source_path=EXCLUDED.source_path,status='ACTIVE'",
               document.id(),
               document.logicalName(),
               nullable(document.sourcePath()));
           jdbc.update(
-              "INSERT INTO document_version(version_id,document_id,version_no,lifecycle,original_filename,media_type,size_bytes,sha256,original_object_key) "
-                  + "VALUES(?,?,?,'PENDING',?,?,?,?,?)",
+              "INSERT INTO document_version(version_id,document_id,version_no,lifecycle,original_filename,media_type,size_bytes,sha256,original_object_key,parser_pipeline_sha256) "
+                  + "VALUES(?,?,?,'PENDING',?,?,?,?,?,?)",
               version.id(),
               version.documentId(),
               version.versionNo(),
@@ -96,42 +187,64 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
               nullable(version.mediaType()),
               version.sizeBytes(),
               version.sha256(),
-              version.originalObjectKey());
+              version.originalObjectKey(),
+              pipeline);
           jdbc.update(
-              "INSERT INTO document_metadata(version_id,source_department,material_category,manual_tags,company,document_date,auto_document_type) "
-                  + "VALUES(?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE source_department=VALUES(source_department),material_category=VALUES(material_category),"
-                  + "manual_tags=VALUES(manual_tags),company=VALUES(company),document_date=VALUES(document_date),auto_document_type=VALUES(auto_document_type)",
+              "INSERT INTO document_metadata(version_id,source_department,material_category,manual_tags,company,document_date,auto_document_type,security_level) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT (version_id) DO UPDATE SET source_department=EXCLUDED.source_department,material_category=EXCLUDED.material_category,manual_tags=EXCLUDED.manual_tags,company=EXCLUDED.company,document_date=EXCLUDED.document_date,auto_document_type=EXCLUDED.auto_document_type",
               version.id(),
               nullable(metadata.sourceDepartment()),
               nullable(metadata.materialCategory()),
               json(metadata.manualTags()),
               nullable(metadata.company()),
               metadata.documentDate(),
-              nullable(metadata.documentType()));
+              nullable(metadata.documentType()),
+              classification);
         });
   }
 
   @Override
   public void resetFailedVersion(String versionId, Metadata metadata, boolean preserveParsed) {
+    resetFailedVersion(versionId, metadata, preserveParsed, null);
+  }
+
+  @Override
+  public Optional<Integer> sourceSecurityLevel(String versionId) {
+    return jdbc
+        .query(
+            "SELECT security_level FROM document_metadata WHERE version_id=?",
+            (rs, n) -> rs.getInt(1),
+            versionId)
+        .stream()
+        .findFirst();
+  }
+
+  @Override
+  public void resetFailedVersion(
+      String versionId, Metadata metadata, boolean preserveParsed, Integer securityLevel) {
+    cn.lgs.knowledgebase.application.operations.DocumentClassificationPolicy.requireValid(
+        securityLevel);
     transactions.executeWithoutResult(
         status -> {
           String sql =
               preserveParsed
                   ? "UPDATE document_version SET lifecycle='PENDING',failure_code=NULL,failure_message=NULL,activated_at=NULL WHERE version_id=? AND lifecycle IN ('FAILED','PENDING')"
                   : "UPDATE document_version SET lifecycle='PENDING',failure_code=NULL,failure_message=NULL,"
-                      + "markdown_object_key=NULL,structured_object_key=NULL,parser_name=NULL,parser_version=NULL,parsed_at=NULL,activated_at=NULL "
+                      + "markdown_object_key=NULL,structured_object_key=NULL,parser_name=NULL,parser_version=NULL,parsed_at=NULL,parse_checkpoint_json=NULL,activated_at=NULL "
                       + "WHERE version_id=? AND lifecycle IN ('FAILED','PENDING')";
           int rows = jdbc.update(sql, versionId);
           if (rows != 1) throw new IllegalStateException("version is not FAILED: " + versionId);
           jdbc.update("UPDATE evidence SET active=FALSE WHERE version_id=?", versionId);
           jdbc.update(
-              "UPDATE document_metadata SET source_department=?,material_category=?,manual_tags=?,company=?,document_date=?,auto_document_type=? WHERE version_id=?",
+              "UPDATE document_metadata SET source_department=?,material_category=?,manual_tags=?,company=?,document_date=?,auto_document_type=?,security_level=COALESCE(?::smallint,security_level),acl_version=acl_version+CASE WHEN ?::smallint IS NOT NULL AND ?::smallint<>security_level THEN 1 ELSE 0 END WHERE version_id=?",
               nullable(metadata.sourceDepartment()),
               nullable(metadata.materialCategory()),
               json(metadata.manualTags()),
               nullable(metadata.company()),
               metadata.documentDate(),
               nullable(metadata.documentType()),
+              securityLevel,
+              securityLevel,
+              securityLevel,
               versionId);
         });
   }
@@ -213,31 +326,73 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
   }
 
   @Override
+  public void saveParsed(
+      String versionId,
+      String markdownKey,
+      String structuredKey,
+      String parserName,
+      String parserVersion,
+      List<RawBlock> blocks,
+      List<Evidence> evidence,
+      cn.lgs.knowledgebase.application.raw.RawParseCheckpoint checkpoint) {
+    if (blocks.isEmpty()
+        || blocks.stream().anyMatch(block -> !versionId.equals(block.versionId()))
+        || !checkpoint
+            .rawBlocksSha256()
+            .equals(cn.lgs.knowledgebase.application.raw.RawParseCheckpoint.blocksSha256(blocks)))
+      throw new IllegalStateException(
+          "PARSER_CHECKPOINT_INVALID: complete parsed block proof differs from the reserved version");
+    transactions.executeWithoutResult(
+        status -> {
+          saveParsed(
+              versionId, markdownKey, structuredKey, parserName, parserVersion, blocks, evidence);
+          int rows =
+              jdbc.update(
+                  "UPDATE document_version SET parse_checkpoint_json=?::jsonb WHERE version_id=? AND parser_pipeline_sha256=? AND sha256=? AND size_bytes=? AND lifecycle='PENDING'",
+                  json(checkpoint),
+                  versionId,
+                  checkpoint.pipeline().sha256(),
+                  checkpoint.sourceSha256(),
+                  checkpoint.sourceSizeBytes());
+          if (rows != 1)
+            throw new IllegalStateException(
+                "PARSER_IDENTITY_CHANGED: parsed checkpoint differs from reserved source pipeline");
+        });
+  }
+
+  @Override
   public void activateVersion(String documentId, String versionId) {
     transactions.executeWithoutResult(
         status -> {
           jdbc.update(
-              "UPDATE summary s JOIN document_version v ON v.version_id=s.version_id SET s.lifecycle='STALE' "
-                  + "WHERE v.document_id=? AND v.version_id<>? AND v.lifecycle='ACTIVE' AND s.lifecycle='ACTIVE'",
+              "UPDATE summary s SET lifecycle='STALE' FROM document_version v "
+                  + "WHERE v.version_id=s.version_id AND v.document_id=? AND v.version_id<>? AND v.lifecycle='ACTIVE' AND s.lifecycle='ACTIVE'",
               documentId,
               versionId);
           jdbc.update(
-              "UPDATE relation_evidence_support rs JOIN evidence e ON e.evidence_id=rs.evidence_id JOIN document_version v ON v.version_id=e.version_id "
-                  + "SET rs.active=FALSE WHERE v.document_id=? AND v.version_id<>? AND v.lifecycle='ACTIVE' AND rs.active=TRUE",
+              "UPDATE relation_evidence_support rs SET active=FALSE FROM evidence e JOIN document_version v ON v.version_id=e.version_id "
+                  + "WHERE e.evidence_id=rs.evidence_id AND v.document_id=? AND v.version_id<>? AND v.lifecycle='ACTIVE' AND rs.active=TRUE",
               documentId,
               versionId);
           jdbc.update(
-              "UPDATE wiki w JOIN wiki_claim c ON c.wiki_id=w.wiki_id AND c.wiki_version=w.wiki_version "
+              "UPDATE wiki w SET lifecycle='STALE' FROM wiki_claim c "
                   + "JOIN wiki_evidence we ON we.claim_id=c.claim_id JOIN evidence e ON e.evidence_id=we.evidence_id "
-                  + "JOIN document_version v ON v.version_id=e.version_id SET w.lifecycle='STALE' "
-                  + "WHERE v.document_id=? AND v.version_id<>? AND v.lifecycle='ACTIVE' AND w.lifecycle='ACTIVE'",
+                  + "JOIN document_version v ON v.version_id=e.version_id "
+                  + "WHERE c.wiki_id=w.wiki_id AND c.wiki_version=w.wiki_version AND v.document_id=? AND v.version_id<>? AND v.lifecycle='ACTIVE' AND w.lifecycle='ACTIVE'",
+              documentId,
+              versionId);
+          jdbc.update(
+              "UPDATE wiki w SET lifecycle='STALE' WHERE w.lifecycle='ACTIVE' AND EXISTS("
+                  + "SELECT 1 FROM kb_asset_build_dependency dep JOIN document_version v ON v.version_id=dep.source_version_id "
+                  + "WHERE dep.asset_type='WIKI' AND dep.asset_id=w.wiki_id AND dep.build_revision=w.wiki_version::text "
+                  + "AND v.document_id=? AND v.version_id<>? AND v.lifecycle='ACTIVE')",
               documentId,
               versionId);
           // Version lifecycle invalidates evidence support only. Relation valid_from/valid_to is
           // business-time truth and is intentionally untouched.
           jdbc.update(
-              "UPDATE evidence e JOIN document_version v ON v.version_id=e.version_id SET e.active=FALSE "
-                  + "WHERE v.document_id=? AND v.version_id<>? AND v.lifecycle='ACTIVE'",
+              "UPDATE evidence e SET active=FALSE FROM document_version v "
+                  + "WHERE v.version_id=e.version_id AND v.document_id=? AND v.version_id<>? AND v.lifecycle='ACTIVE'",
               documentId,
               versionId);
           jdbc.update(
@@ -267,16 +422,27 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
 
   @Override
   public List<Evidence> resolveEvidence(List<String> evidenceIds) {
+    return resolveEvidence(evidenceIds, new SearchFilters(null, null, null, List.of()));
+  }
+
+  public List<Evidence> resolveEvidence(List<String> evidenceIds, SearchFilters filters) {
     if (evidenceIds == null || evidenceIds.isEmpty()) return List.of();
-    String placeholders = String.join(",", Collections.nCopies(evidenceIds.size(), "?"));
+    var scope = SourceAccessSql.retrievalScope(filters);
+    var parameters = new LinkedHashMap<>(scope.parameters());
+    parameters.put("evidenceIds", evidenceIds);
+    parameters.put("clearance", filters == null ? 10 : filters.securityClearance());
     String sql =
         "SELECT e.evidence_id,e.document_id,e.version_id,e.block_id,e.object_key,e.raw_location,e.content_hash,b.raw_content,b.heading_path "
-            + "FROM evidence e JOIN raw_block b ON b.block_id=e.block_id WHERE e.active=TRUE AND e.evidence_id IN ("
-            + placeholders
-            + ")";
+            + "FROM evidence e JOIN raw_block b ON b.block_id=e.block_id "
+            + "JOIN document_version v ON v.version_id=e.version_id JOIN document d ON d.document_id=e.document_id "
+            + "JOIN kb_source_authority m ON m.version_id=e.version_id "
+            + "WHERE e.active=TRUE AND v.lifecycle='ACTIVE' AND d.status='ACTIVE' AND m.security_level<=:clearance"
+            + " AND e.evidence_id IN (:evidenceIds) AND "
+            + scope.matches("e.version_id");
     Map<String, Evidence> byId = new LinkedHashMap<>();
-    jdbc.query(
+    named.query(
         sql,
+        parameters,
         rs -> {
           String content = contextualEvidenceContent(strings(rs.getString(9)), rs.getString(8));
           Evidence item =
@@ -290,8 +456,7 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
                   content,
                   sha256(content));
           byId.put(item.id(), item);
-        },
-        evidenceIds.toArray());
+        });
     List<Evidence> ordered = new ArrayList<>();
     for (String id : evidenceIds) if (byId.containsKey(id)) ordered.add(byId.get(id));
     return List.copyOf(ordered);
@@ -324,6 +489,7 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
   }
 
   private Map<String, Object> map(String json) {
+    if (json == null || json.isBlank() || "null".equals(json)) return Map.of();
     try {
       return mapper.readValue(json, new TypeReference<Map<String, Object>>() {});
     } catch (JsonProcessingException e) {
@@ -332,6 +498,7 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
   }
 
   private List<String> strings(String json) {
+    if (json == null || json.isBlank() || "null".equals(json)) return List.of();
     try {
       return mapper.readValue(json, new TypeReference<List<String>>() {});
     } catch (JsonProcessingException e) {
@@ -340,6 +507,7 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
   }
 
   private List<Double> doubles(String json) {
+    if (json == null || json.isBlank() || "null".equals(json)) return List.of();
     try {
       return mapper.readValue(json, new TypeReference<List<Double>>() {});
     } catch (JsonProcessingException e) {

@@ -33,7 +33,6 @@ public final class JdbcModelConfigurationStore implements Store {
     this.jdbc = Objects.requireNonNull(jdbc, "jdbc");
     this.tx = Objects.requireNonNull(tx, "transaction template");
     this.defaults = Objects.requireNonNull(defaults, "model configuration defaults");
-    ensureSchema();
     migrateLegacyConfiguration();
     repairBootstrapProfile();
   }
@@ -44,7 +43,7 @@ public final class JdbcModelConfigurationStore implements Store {
         jdbc.query(
             "SELECT "
                 + PROFILE_COLUMNS
-                + " FROM model_configuration_profile WHERE active=1 LIMIT 1",
+                + " FROM model_configuration_profile WHERE active=TRUE LIMIT 1",
             (rs, rowNum) -> scanProfile(rs));
     return rows.isEmpty() ? defaults : rows.get(0).effective();
   }
@@ -139,10 +138,10 @@ public final class JdbcModelConfigurationStore implements Store {
           ProfileConfiguration next = profile(profileId);
           validateActivatable(next);
           Instant now = Instant.now();
-          jdbc.update("UPDATE model_configuration_profile SET active=0 WHERE active=1");
+          jdbc.update("UPDATE model_configuration_profile SET active=FALSE WHERE active=TRUE");
           int rows =
               jdbc.update(
-                  "UPDATE model_configuration_profile SET active=1,updated_at=? WHERE profile_id=?",
+                  "UPDATE model_configuration_profile SET active=TRUE,updated_at=? WHERE profile_id=?",
                   Timestamp.from(now),
                   profileId);
           if (rows != 1) throw new IllegalStateException("model configuration profile not found");
@@ -298,26 +297,6 @@ public final class JdbcModelConfigurationStore implements Store {
             current.rerankTimeoutSeconds(),
             "rerank timeout seconds"),
         updatedAt);
-  }
-
-  private void ensureSchema() {
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS model_configuration ("
-            + "configuration_id TINYINT UNSIGNED PRIMARY KEY,"
-            + "chat_base_url VARCHAR(2048) NOT NULL,chat_api_key TEXT NULL,small_model VARCHAR(255) NOT NULL,large_model VARCHAR(255) NOT NULL,chat_timeout_seconds INT UNSIGNED NOT NULL,"
-            + "embedding_base_url VARCHAR(2048) NOT NULL,embedding_api_key TEXT NULL,embedding_model VARCHAR(255) NOT NULL,"
-            + "embedding_dimensions INT UNSIGNED NOT NULL,embedding_batch_size INT UNSIGNED NOT NULL,embedding_timeout_seconds INT UNSIGNED NOT NULL,"
-            + "rerank_base_url VARCHAR(2048) NOT NULL,rerank_api_key TEXT NULL,rerank_model VARCHAR(255) NOT NULL,rerank_timeout_seconds INT UNSIGNED NOT NULL,"
-            + "updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)) ENGINE=InnoDB");
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS model_configuration_profile ("
-            + "profile_id VARCHAR(36) PRIMARY KEY,name VARCHAR(128) NOT NULL,active BOOLEAN NOT NULL DEFAULT FALSE,"
-            + "chat_base_url VARCHAR(2048) NOT NULL,chat_api_key TEXT NULL,small_model VARCHAR(255) NOT NULL,large_model VARCHAR(255) NOT NULL,chat_timeout_seconds INT UNSIGNED NOT NULL,"
-            + "embedding_base_url VARCHAR(2048) NOT NULL,embedding_api_key TEXT NULL,embedding_model VARCHAR(255) NOT NULL,"
-            + "embedding_dimensions INT UNSIGNED NOT NULL,embedding_batch_size INT UNSIGNED NOT NULL,embedding_timeout_seconds INT UNSIGNED NOT NULL,"
-            + "rerank_base_url VARCHAR(2048) NOT NULL,rerank_api_key TEXT NULL,rerank_model VARCHAR(255) NOT NULL,rerank_timeout_seconds INT UNSIGNED NOT NULL,"
-            + "created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),"
-            + "INDEX idx_model_configuration_profile_active(active)) ENGINE=InnoDB");
   }
 
   private void migrateLegacyConfiguration() {

@@ -4,56 +4,59 @@ import static cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.sha256;
 
 import cn.lgs.knowledgebase.application.port.Ports.ParsedBlock;
 import cn.lgs.knowledgebase.application.port.Ports.RawIndexDocument;
+import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Metadata;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.RawBlock;
+import java.text.BreakIterator;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.Locale;
+import java.util.NavigableSet;
+import java.util.Set;
+import java.util.TreeSet;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Element;
+import org.jsoup.nodes.Entities;
 
+/**
+ * Structure-first chunking. The final encoder text, rather than parser estimates, owns the budget.
+ */
 final class RawKnowledgeBuilder {
-  static final int DEFAULT_TARGET_TOKENS = 512;
-  static final int DEFAULT_OVERLAP_TOKENS = 64;
-  static final int DEFAULT_BOUNDARY_WINDOW = 96;
-  // HTML tables contain many tags/attributes that are much more expensive for the embedding
-  // tokenizer than the parser's token estimate suggests. Keep the ordinary-table fast path, but
-  // force long HTML payloads through the bounded row splitter as well.
-  private static final int MAX_TABLE_FRAGMENT_CHARS = 1200;
-
-  private static final java.util.Set<String> AUXILIARY_BLOCK_TYPES =
-      java.util.Set.of("header", "footer", "page_number");
-  private static final Pattern TABLE_ROW_PATTERN = Pattern.compile("(?is)<tr\\b[^>]*>.*?</tr\\s*>");
-  private static final Pattern TABLE_CELL_PATTERN = Pattern.compile("(?is)<t[dh]\\b");
+  private static final Set<String> AUXILIARY = Set.of("header", "footer", "page_number");
 
   private RawKnowledgeBuilder() {}
 
-  static List<RawBlock> rawBlocks(String versionId, List<ParsedBlock> parsed) {
-    List<RawBlock> blocks = new ArrayList<>();
+  static List<RawBlock> rawBlocks(String version, List<ParsedBlock> parsed) {
+    // A legacy caller may preserve original evidence before an encoder is configured. Zero means
+    // uncounted; smartChunks never trusts this metadata to enforce the encoder budget.
+    return rawBlocks(version, parsed, null);
+  }
+
+  static List<RawBlock> rawBlocks(
+      String version, List<ParsedBlock> parsed, RawTokenCounter tokens) {
+    List<RawBlock> result = new ArrayList<>();
     List<String> headings = new ArrayList<>();
-    List<ParsedBlock> source = parsed == null ? List.of() : parsed;
-    for (int i = 0; i < source.size(); i++) {
-      ParsedBlock item = source.get(i);
-      if (isAuxiliary(item.type())) continue;
+    List<ParsedBlock> input = parsed == null ? List.of() : parsed;
+    for (int i = 0; i < input.size(); i++) {
+      ParsedBlock item = input.get(i);
+      if (AUXILIARY.contains(safe(item.type()))) continue;
       String text = blockText(item);
       if (text.isBlank()) continue;
-      if ("text".equals(item.type())
-          && item.textLevel() > 0
-          && item.text() != null
-          && !item.text().isBlank()) {
-        int level = Math.max(1, item.textLevel());
-        if (level > headings.size() + 1) level = headings.size() + 1;
-        if (level <= headings.size()) headings = new ArrayList<>(headings.subList(0, level - 1));
+      if ("text".equals(item.type()) && item.textLevel() > 0) {
+        int level = Math.min(item.textLevel(), headings.size() + 1);
+        headings = new ArrayList<>(headings.subList(0, Math.min(headings.size(), level - 1)));
         headings.add(normalize(item.text()));
       }
       String normalized = normalize(text);
-      String idSeed = versionId + ":" + i + ":" + safe(item.type()) + ":" + normalized;
-      String id = "rb_" + sha256(idSeed).substring(0, 40);
+      String id =
+          "rb_" + sha256(version + ":" + i + ":" + item.type() + ":" + normalized).substring(0, 40);
       Integer page = item.page() == null || item.page() < 0 ? null : item.page() + 1;
-      blocks.add(
+      result.add(
           new RawBlock(
               id,
-              versionId,
+              version,
               i,
               safe(item.type()),
               text,
@@ -64,172 +67,580 @@ final class RawKnowledgeBuilder {
               safeList(item.bbox()),
               safeList(item.pageSize()),
               List.of(id),
-              sha256(text),
-              estimateTokens(text)));
+              sha256(normalized),
+              tokens == null ? 0 : tokens.count(text)));
     }
-    return List.copyOf(blocks);
+    return List.copyOf(result);
   }
 
-  static List<Evidence> evidence(
-      String documentId, String originalObjectKey, List<RawBlock> blocks) {
+  static List<Evidence> evidence(String document, String object, List<RawBlock> blocks) {
     return blocks.stream()
-        .filter(RawKnowledgeBuilder::isEvidenceBlock)
-        .map(block -> Evidence.fromBlock(documentId, originalObjectKey, block))
+        .filter(RawKnowledgeBuilder::evidenceBlock)
+        .map(block -> Evidence.fromBlock(document, object, block))
         .toList();
   }
 
   static List<ChunkDraft> smartChunks(
-      String documentId, String versionId, Metadata metadata, List<RawBlock> blocks) {
+      String document, String version, Metadata metadata, List<RawBlock> blocks) {
     return smartChunks(
-        documentId,
-        versionId,
+        document,
+        version,
         metadata,
         blocks,
-        DEFAULT_TARGET_TOKENS,
-        DEFAULT_OVERLAP_TOKENS,
-        DEFAULT_BOUNDARY_WINDOW);
+        RawChunkProfile.DEFAULT,
+        RawTokenCounter.unconfigured());
   }
 
   static List<ChunkDraft> smartChunks(
-      String documentId,
-      String versionId,
+      String document,
+      String version,
       Metadata metadata,
       List<RawBlock> blocks,
       int target,
       int overlap,
       int boundary) {
-    if (target <= 0) target = DEFAULT_TARGET_TOKENS;
-    if (overlap < 0) overlap = 0;
-    if (boundary < 0) boundary = 0;
+    return smartChunks(
+        document,
+        version,
+        metadata,
+        blocks,
+        new RawChunkProfile(target, target, overlap, Math.min(150, target)),
+        RawTokenCounter.unconfigured());
+  }
+
+  static List<ChunkDraft> smartChunks(
+      String document,
+      String version,
+      Metadata metadata,
+      List<RawBlock> blocks,
+      RawChunkProfile profile,
+      RawTokenCounter tokens) {
     List<ChunkDraft> out = new ArrayList<>();
-    List<RawBlock> current = new ArrayList<>();
-    int currentTokens = 0;
-    boolean currentHasEvidence = false;
+    List<Part> pending = new ArrayList<>();
     for (RawBlock block : blocks) {
-      if (block.content() == null || block.content().isBlank() || isAuxiliary(block.blockType()))
-        continue;
-      boolean heading = isHeading(block);
-      boolean semanticBoundary = heading || startsStructuralBoundary(block);
-
-      // Structural boundaries outrank token boundaries. Do not carry overlap across a new chapter,
-      // section, article, or other clearly numbered unit: the previous section should not dilute
-      // the
-      // next unit's retrieval meaning.
-      if (semanticBoundary && currentHasEvidence && !current.isEmpty()) {
-        FlushResult flushed = flush(documentId, versionId, metadata, out, current, 0);
-        current = flushed.carry();
-        currentTokens = flushed.tokens();
-        currentHasEvidence = hasEvidenceBlock(current);
-      }
-
-      // A parser block can itself contain an entire long paragraph/section. Block-level packing
-      // alone
-      // would therefore leave a multi-thousand-token chunk intact. Preserve the structural heading
-      // context, but fall back to bounded text splitting inside that one semantic unit. Ordinary
-      // tables stay atomic; oversized tables are handled below by complete-row partitioning.
-      if (!heading
-          && !"table".equals(block.blockType())
-          && block.tokenCount() > target + boundary) {
-        List<RawBlock> headingContext =
-            currentHasEvidence
-                ? List.of()
-                : current.stream().filter(RawKnowledgeBuilder::isHeading).toList();
-        if (currentHasEvidence) flush(documentId, versionId, metadata, out, current, 0);
-        out.addAll(
-            splitOversizedBlock(
-                documentId, versionId, metadata, headingContext, block, target, overlap, boundary));
-        current = new ArrayList<>();
-        currentTokens = 0;
-        currentHasEvidence = false;
-        continue;
-      }
-
-      // Keep ordinary tables atomic, but never send an unbounded HTML table to the embedding
-      // model. Annual reports can contain a single project/guarantee table with tens of thousands
-      // of tokens. Such a table is split only between complete <tr> rows (with its header rows
-      // repeated), so every emitted chunk remains a self-contained table fragment and still
-      // points back to the same raw evidence block.
-      if ("table".equals(block.blockType())
-          && (block.tokenCount() > target + boundary
-              || safe(block.content()).length() > MAX_TABLE_FRAGMENT_CHARS)) {
-        List<RawBlock> headingContext =
-            currentHasEvidence
-                ? List.of()
-                : current.stream().filter(RawKnowledgeBuilder::isHeading).toList();
-        if (currentHasEvidence) flush(documentId, versionId, metadata, out, current, 0);
-        out.addAll(
-            splitOversizedTableBlock(
-                documentId, versionId, metadata, headingContext, block, target, boundary));
-        current = new ArrayList<>();
-        currentTokens = 0;
-        currentHasEvidence = false;
-        continue;
-      }
-
-      if ("table".equals(block.blockType())
-          && !current.isEmpty()
-          && currentTokens + block.tokenCount() > target) {
-        FlushResult flushed = flush(documentId, versionId, metadata, out, current, overlap);
-        current = flushed.carry();
-        currentTokens = flushed.tokens();
-        currentHasEvidence = hasEvidenceBlock(current);
-      }
-      if (!heading
-          && !"table".equals(block.blockType())
-          && !current.isEmpty()
-          && currentTokens + block.tokenCount() > target + boundary) {
-        FlushResult flushed = flush(documentId, versionId, metadata, out, current, overlap);
-        current = flushed.carry();
-        currentTokens = flushed.tokens();
-        currentHasEvidence = hasEvidenceBlock(current);
-      }
-      current.add(block);
-      currentTokens += block.tokenCount();
-      currentHasEvidence |= isEvidenceBlock(block);
-      if ("table".equals(block.blockType()) && currentTokens >= target) {
-        FlushResult flushed = flush(documentId, versionId, metadata, out, current, overlap);
-        current = flushed.carry();
-        currentTokens = flushed.tokens();
-        currentHasEvidence = hasEvidenceBlock(current);
+      if (!evidenceBlock(block)) continue;
+      Part part =
+          new Part(
+              block.content(),
+              block.headingPath(),
+              List.of(block.id()),
+              block.pageStart(),
+              block.pageEnd(),
+              block.blockType());
+      boolean separate = "table".equals(block.blockType()) || structuralBoundary(block.content());
+      if (!pending.isEmpty()
+          && (separate
+              || !pending.get(0).headings.equals(part.headings)
+              || !pending.get(0).type.equals(part.type)))
+        flush(document, version, metadata, pending, out, tokens, profile);
+      String contextual = render(part.headings, part.body);
+      if (tokens.count(contextual) > profile.hardLimitTokens()) {
+        flush(document, version, metadata, pending, out, tokens, profile);
+        List<String> pieces =
+            "table".equals(part.type)
+                ? tablePieces(part, profile, tokens)
+                : textPieces(part.body, part.headings, profile, tokens, true);
+        for (String body : pieces)
+          out.add(
+              chunk(document, version, metadata, List.of(part.withBody(body)), tokens, profile));
+      } else if (separate) {
+        out.add(chunk(document, version, metadata, List.of(part), tokens, profile));
+      } else {
+        List<Part> candidate = new ArrayList<>(pending);
+        candidate.add(part);
+        if (!pending.isEmpty() && tokens.count(renderParts(candidate)) > profile.targetTokens())
+          flush(document, version, metadata, pending, out, tokens, profile);
+        pending.add(part);
       }
     }
-    if (!current.isEmpty()) flush(documentId, versionId, metadata, out, current, overlap);
+    flush(document, version, metadata, pending, out, tokens, profile);
     return List.copyOf(out);
+  }
+
+  private static void flush(
+      String document,
+      String version,
+      Metadata metadata,
+      List<Part> pending,
+      List<ChunkDraft> out,
+      RawTokenCounter tokens,
+      RawChunkProfile profile) {
+    if (pending.isEmpty()) return;
+    ChunkDraft next = chunk(document, version, metadata, List.copyOf(pending), tokens, profile);
+    if (!out.isEmpty()
+        && !"table".equals(pending.get(0).type)
+        && tokens.count(String.join("\n\n", pending.stream().map(part -> part.body).toList()))
+            < profile.tailTokens()) {
+      ChunkDraft previous = out.get(out.size() - 1);
+      if (previous.structureType.equals(pending.get(0).type)
+          && previous.headingPath.equals(next.headingPath)
+          && !structuralBoundary(pending.get(0).body)) {
+        String prefix = render(previous.headingPath, "");
+        String priorBody =
+            prefix.isEmpty()
+                ? previous.content
+                : previous.content.substring(prefix.length()).stripLeading();
+        List<Part> merged = new ArrayList<>();
+        merged.add(
+            new Part(
+                priorBody,
+                previous.headingPath,
+                previous.sourceBlockIds,
+                previous.pageStart,
+                previous.pageEnd,
+                pending.get(0).type));
+        merged.addAll(pending);
+        if (tokens.count(renderParts(merged)) <= profile.hardLimitTokens()) {
+          out.set(out.size() - 1, chunk(document, version, metadata, merged, tokens, profile));
+          pending.clear();
+          return;
+        }
+      }
+    }
+    out.add(next);
+    pending.clear();
+  }
+
+  private static List<String> textPieces(
+      String body,
+      List<String> headings,
+      RawChunkProfile profile,
+      RawTokenCounter tokens,
+      boolean overlap) {
+    List<String> pieces = new ArrayList<>();
+    NavigableSet<Integer> sentences = sentenceEnds(body);
+    int start = 0;
+    while (start < body.length()) {
+      int end = fittingEnd(body, start, headings, profile.targetTokens(), tokens);
+      if (end == start) end = fittingEnd(body, start, headings, profile.hardLimitTokens(), tokens);
+      if (end == start)
+        throw new IllegalStateException(
+            "Title or an indivisible token exceeds the raw token budget");
+      if (end < body.length()) {
+        Integer sentence = sentences.floor(end);
+        if (sentence != null && sentence > start) end = sentence;
+        else {
+          // The target is a preference: keep one complete sentence when it fits the hard budget.
+          // A truly oversized sentence still has bounded token slices and the same source identity.
+          int hardEnd = fittingEnd(body, start, headings, profile.hardLimitTokens(), tokens);
+          Integer complete = sentences.floor(hardEnd);
+          end = complete != null && complete > start ? complete : hardEnd;
+        }
+      }
+      // A complete 600–900-token paragraph, or a small final tail, remains a semantic unit.
+      if (tokens.count(render(headings, body.substring(start))) <= profile.hardLimitTokens()
+          && (tokens.count(render(headings, body.substring(start))) <= profile.targetTokens()
+              || tokens.count(body.substring(end)) < profile.tailTokens())) end = body.length();
+      pieces.add(body.substring(start, end));
+      if (end == body.length()) break;
+      int next = end;
+      if (overlap && profile.overlapTokens() > 0 && sentences.contains(end)) {
+        Integer boundary = sentences.lower(end);
+        if (boundary != null
+            && boundary > start
+            && tokens.count(body.substring(boundary, end)) <= profile.overlapTokens())
+          next = boundary;
+      }
+      if (next <= start) next = end;
+      start = next;
+    }
+    return List.copyOf(pieces);
+  }
+
+  private static int fittingEnd(
+      String body, int start, List<String> headings, int limit, RawTokenCounter tokens) {
+    int low = start + 1, high = body.length(), best = start;
+    while (low <= high) {
+      int mid = safeBoundary(body, low + (high - low) / 2);
+      if (mid <= start) mid = start + Character.charCount(body.codePointAt(start));
+      if (tokens.count(render(headings, body.substring(start, mid))) <= limit) {
+        best = mid;
+        low = mid + 1;
+      } else high = mid - 1;
+    }
+    // Recount every emitted slice. BPE merges are not assumed perfectly monotone at boundaries.
+    while (best > start && tokens.count(render(headings, body.substring(start, best))) > limit)
+      best = body.offsetByCodePoints(best, -1);
+    return best;
+  }
+
+  private static NavigableSet<Integer> sentenceEnds(String body) {
+    // JDK sentence rules preserve decimal points and semicolon-linked conditions.
+    BreakIterator iterator = BreakIterator.getSentenceInstance(Locale.ROOT);
+    iterator.setText(body);
+    NavigableSet<Integer> boundaries = new TreeSet<>();
+    for (int end = iterator.first(); end != BreakIterator.DONE; end = iterator.next())
+      boundaries.add(end);
+    return boundaries;
+  }
+
+  private static int safeBoundary(String body, int index) {
+    if (index > 0
+        && index < body.length()
+        && Character.isLowSurrogate(body.charAt(index))
+        && Character.isHighSurrogate(body.charAt(index - 1))) return index - 1;
+    return index;
+  }
+
+  private static List<String> tablePieces(
+      Part part, RawChunkProfile profile, RawTokenCounter tokens) {
+    Element table = Jsoup.parse(part.body).selectFirst("table");
+    if (table == null || table.select("tr").isEmpty())
+      throw new IllegalStateException(
+          "Oversized table has no recoverable row/cell structure; original retained for review");
+    List<Element> rows =
+        table.select("tr").stream().filter(row -> row.closest("table") == table).toList();
+    List<List<Cell>> grid = expandGrid(rows);
+    int headerCount = 0;
+    while (headerCount < rows.size()
+        && (rows.get(headerCount).closest("thead") != null
+            || !rows.get(headerCount).select("th").isEmpty())) headerCount++;
+    if (headerCount == 0) headerCount = 1;
+    // Native Office HTML may use td for a multi-row header. Complete every span
+    // rooted in the header before treating following rows as business data.
+    for (int row = 0; row < headerCount; row++) {
+      for (Element cell : rows.get(row).children()) {
+        if (Set.of("td", "th").contains(cell.normalName()))
+          headerCount = Math.max(headerCount, Math.min(rows.size(), row + span(cell, "rowspan")));
+      }
+    }
+    List<List<Cell>> headers = grid.subList(0, headerCount);
+    String outside = tableContext(part.body, table);
+    List<String> pieces = new ArrayList<>();
+    List<Integer> group = new ArrayList<>();
+    for (int row = headerCount; row < grid.size(); row++) {
+      List<Integer> candidate = new ArrayList<>(group);
+      candidate.add(row);
+      String assembled = tableFragment(outside, headers, grid, candidate, null);
+      if (!group.isEmpty()
+          && tokens.count(render(part.headings, assembled)) > profile.targetTokens()) {
+        pieces.add(tableFragment(outside, headers, grid, group, null));
+        group.clear();
+      }
+      String single = tableFragment(outside, headers, grid, List.of(row), null);
+      if (tokens.count(render(part.headings, single)) > profile.hardLimitTokens()) {
+        if (!group.isEmpty()) {
+          pieces.add(tableFragment(outside, headers, grid, group, null));
+          group.clear();
+        }
+        pieces.addAll(longRowPieces(outside, headers, grid, row, part.headings, profile, tokens));
+      } else group.add(row);
+    }
+    if (!group.isEmpty()) pieces.add(tableFragment(outside, headers, grid, group, null));
+    if (pieces.isEmpty()) pieces.add(tableFragment(outside, headers, grid, List.of(), null));
+    return List.copyOf(pieces);
+  }
+
+  private static List<List<Cell>> expandGrid(List<Element> rows) {
+    List<List<Cell>> grid = new ArrayList<>();
+    java.util.Map<Integer, Span> spans = new java.util.HashMap<>();
+    for (int rowNo = 0; rowNo < rows.size(); rowNo++) {
+      java.util.Map<Integer, Cell> row = new java.util.TreeMap<>();
+      java.util.Map<Integer, Span> next = new java.util.HashMap<>();
+      for (var entry : spans.entrySet()) {
+        row.put(entry.getKey(), entry.getValue().cell);
+        if (entry.getValue().remaining > 1)
+          next.put(entry.getKey(), new Span(entry.getValue().cell, entry.getValue().remaining - 1));
+      }
+      int column = 0;
+      for (Element element : rows.get(rowNo).children()) {
+        if (!Set.of("td", "th").contains(element.tagName())) continue;
+        while (row.containsKey(column)) column++;
+        int colspan = span(element, "colspan"), rowspan = span(element, "rowspan");
+        String text = element.wholeText();
+        for (int offset = 0; offset < colspan; offset++) {
+          if (row.containsKey(column + offset))
+            throw new IllegalStateException("Overlapping table spans require review");
+          Cell cell = new Cell(text, rowNo, column, offset == 0);
+          row.put(column + offset, cell);
+          if (rowspan > 1) next.put(column + offset, new Span(cell, rowspan - 1));
+        }
+        column += colspan;
+      }
+      int width =
+          row.isEmpty() ? 0 : row.keySet().stream().mapToInt(Integer::intValue).max().orElse(0) + 1;
+      List<Cell> cells = new ArrayList<>();
+      for (int col = 0; col < width; col++)
+        cells.add(row.getOrDefault(col, new Cell("", rowNo, col, true)));
+      grid.add(List.copyOf(cells));
+      spans = next;
+    }
+    if (!spans.isEmpty())
+      throw new IllegalStateException(
+          "Table rowspan exceeds available rows; original retained for review");
+    return grid;
+  }
+
+  private static int span(Element element, String name) {
+    String raw = element.attr(name);
+    if (raw.isBlank()) return 1;
+    try {
+      int value = Integer.parseInt(raw);
+      if (value <= 0 || value > 1000) throw new NumberFormatException();
+      return value;
+    } catch (NumberFormatException ex) {
+      throw new IllegalStateException("Invalid table " + name, ex);
+    }
+  }
+
+  private static String tableContext(String body, Element table) {
+    Element doc = Jsoup.parse(body).body();
+    Element selected = doc.selectFirst("table");
+    if (selected != null) selected.remove();
+    return doc.wholeText().trim();
+  }
+
+  private static String tableFragment(
+      String outside,
+      List<List<Cell>> headers,
+      List<List<Cell>> grid,
+      List<Integer> rows,
+      List<Integer> columns) {
+    StringBuilder out = new StringBuilder();
+    if (!outside.isBlank()) out.append(outside).append('\n');
+    out.append("<table><thead>");
+    for (List<Cell> header : headers) out.append(rowHtml(header, -1, columns, null));
+    out.append("</thead><tbody>");
+    for (int row : rows) out.append(rowHtml(grid.get(row), row, columns, null));
+    return out.append("</tbody></table>").toString();
+  }
+
+  private static String rowHtml(
+      List<Cell> cells,
+      int row,
+      List<Integer> selected,
+      java.util.Map<Integer, String> replacements) {
+    StringBuilder out = new StringBuilder("<tr");
+    if (row >= 0) out.append(" data-source-row=\"").append(row).append("\"");
+    out.append('>');
+    Set<String> displayedOrigins = new java.util.HashSet<>();
+    for (int col = 0; col < cells.size(); col++) {
+      if (selected != null && !selected.contains(col)) continue;
+      Cell cell = cells.get(col);
+      String value =
+          replacements != null && replacements.containsKey(col) ? replacements.get(col) : cell.text;
+      out.append("<td data-origin=\"")
+          .append(cell.originRow)
+          .append(':')
+          .append(cell.originCol)
+          .append("\">");
+      // Column-spanned text appears once within this row, but its originating identity is retained.
+      if (displayedOrigins.add(cell.originRow + ":" + cell.originCol))
+        out.append(Entities.escape(value));
+      out.append("</td>");
+    }
+    return out.append("</tr>").toString();
+  }
+
+  private static List<String> longRowPieces(
+      String outside,
+      List<List<Cell>> headers,
+      List<List<Cell>> grid,
+      int row,
+      List<String> headings,
+      RawChunkProfile profile,
+      RawTokenCounter tokens) {
+    List<String> pieces = new ArrayList<>();
+    List<Cell> cells = grid.get(row);
+    for (int col = 1; col < cells.size(); col++) {
+      Cell cell = cells.get(col);
+      if (!cell.first) continue;
+      List<Integer> selected = List.of(0, col);
+      String shell = tableFragment(outside, headers, grid, List.of(row), selected);
+      if (tokens.count(render(headings, shell)) <= profile.hardLimitTokens()) {
+        pieces.add(shell);
+        continue;
+      }
+      String emptyShell =
+          outside
+              + "\n<table><thead>"
+              + headers.stream().map(h -> rowHtml(h, -1, selected, null)).reduce("", String::concat)
+              + "</thead><tbody>"
+              + rowHtml(cells, row, selected, java.util.Map.of(col, ""))
+              + "</tbody></table>";
+      int remaining = profile.hardLimitTokens() - tokens.count(render(headings, emptyShell));
+      if (remaining < 1)
+        throw new IllegalStateException(
+            "Table row key/header exceeds raw token limit; original retained for review");
+      RawTokenCounter withShell =
+          new RawTokenCounter() {
+            public int count(String value) {
+              String body =
+                  outside
+                      + "\n<table><thead>"
+                      + headers.stream()
+                          .map(h -> rowHtml(h, -1, selected, null))
+                          .reduce("", String::concat)
+                      + "</thead><tbody>"
+                      + rowHtml(cells, row, selected, java.util.Map.of(selected.get(1), value))
+                      + "</tbody></table>";
+              return tokens.count(render(headings, body));
+            }
+
+            public String identity() {
+              return tokens.identity();
+            }
+          };
+      for (String value : textPieces(cell.text, List.of(), profile, withShell, false)) {
+        pieces.add(
+            outside
+                + "\n<table><thead>"
+                + headers.stream()
+                    .map(h -> rowHtml(h, -1, selected, null))
+                    .reduce("", String::concat)
+                + "</thead><tbody>"
+                + rowHtml(cells, row, selected, java.util.Map.of(col, value))
+                + "</tbody></table>");
+      }
+    }
+    if (pieces.isEmpty())
+      throw new IllegalStateException(
+          "Oversized table row cannot be split without losing its row identity");
+    return pieces;
+  }
+
+  private static ChunkDraft chunk(
+      String document,
+      String version,
+      Metadata metadata,
+      List<Part> parts,
+      RawTokenCounter tokens,
+      RawChunkProfile profile) {
+    String content = renderParts(parts);
+    int count = tokens.count(content);
+    if (count > profile.hardLimitTokens())
+      throw new IllegalStateException("Raw chunk exceeds hard token limit: " + count);
+    List<String> sourceIds =
+        parts.stream().flatMap(part -> part.sourceIds.stream()).distinct().toList();
+    String hash =
+        sha256(normalize(String.join("\n\n", parts.stream().map(part -> part.body).toList())));
+    String id =
+        "ch_"
+            + sha256(version + ":" + String.join(",", sourceIds) + ":" + sha256(content))
+                .substring(0, 40);
+    Integer start =
+        parts.stream()
+            .map(part -> part.pageStart)
+            .filter(java.util.Objects::nonNull)
+            .min(Integer::compareTo)
+            .orElse(null);
+    Integer end =
+        parts.stream()
+            .map(part -> part.pageEnd)
+            .filter(java.util.Objects::nonNull)
+            .max(Integer::compareTo)
+            .orElse(null);
+    return new ChunkDraft(
+        id,
+        document,
+        version,
+        content,
+        normalize(content),
+        parts.get(0).headings,
+        sourceIds,
+        start,
+        end,
+        hash,
+        count,
+        metadata,
+        parts.get(0).type);
   }
 
   static List<RawIndexDocument> toIndexDocuments(
       List<ChunkDraft> chunks, List<Evidence> evidence, List<List<Float>> vectors) {
     if (chunks.size() != vectors.size())
       throw new IllegalArgumentException("embedding count mismatch");
-    java.util.Map<String, String> evidenceByBlock = new java.util.HashMap<>();
-    evidence.forEach(item -> evidenceByBlock.put(item.blockId(), item.id()));
-    List<RawIndexDocument> docs = new ArrayList<>(chunks.size());
+    java.util.Map<String, String> byBlock = new java.util.HashMap<>();
+    evidence.forEach(item -> byBlock.put(item.blockId(), item.id()));
+    List<RawIndexDocument> docs = new ArrayList<>();
     for (int i = 0; i < chunks.size(); i++) {
       ChunkDraft chunk = chunks.get(i);
-      java.util.LinkedHashSet<String> ids = new java.util.LinkedHashSet<>();
-      chunk
-          .sourceBlockIds()
-          .forEach(
-              blockId -> {
-                String id = evidenceByBlock.get(blockId);
-                if (id != null && !id.isBlank()) ids.add(id);
-              });
+      LinkedHashSet<String> ids = new LinkedHashSet<>();
+      chunk.sourceBlockIds.forEach(
+          id -> {
+            if (byBlock.containsKey(id)) ids.add(byBlock.get(id));
+          });
       docs.add(
           new RawIndexDocument(
-              chunk.id(),
-              chunk.content(),
-              chunk.normalized(),
-              chunk.headingPath(),
-              chunk.sourceBlockIds(),
-              chunk.pageStart(),
-              chunk.pageEnd(),
-              chunk.contentHash(),
+              chunk.id,
+              chunk.content,
+              chunk.normalized,
+              chunk.headingPath,
+              chunk.sourceBlockIds,
+              chunk.pageStart,
+              chunk.pageEnd,
+              chunk.contentHash,
               vectors.get(i),
               List.copyOf(ids),
-              chunk.metadata()));
+              chunk.metadata));
     }
     return List.copyOf(docs);
   }
+
+  private static String renderParts(List<Part> parts) {
+    return render(
+        parts.get(0).headings, String.join("\n\n", parts.stream().map(part -> part.body).toList()));
+  }
+
+  private static String render(List<String> headings, String body) {
+    return KnowledgeDomain.contextualEvidenceContent(headings, body);
+  }
+
+  private static boolean evidenceBlock(RawBlock block) {
+    return RawEvidencePolicy.hasSemanticBody(block);
+  }
+
+  private static boolean structuralBoundary(String text) {
+    return text.matches("^(第[一二三四五六七八九十百千〇零两0-9]+[章节条款]|[一二三四五六七八九十百]+、|[0-9]{1,3}[.．、])\\s*.*");
+  }
+
+  private static String blockText(ParsedBlock block) {
+    if ("table".equals(block.type())) {
+      String html =
+          !safe(block.tableBody()).isBlank() ? block.tableBody() : safe(block.tableHtml());
+      List<String> context = new ArrayList<>();
+      for (String key : List.of("table_caption", "table_footnote")) {
+        Object value = block.raw() == null ? null : block.raw().get(key);
+        if (value instanceof List<?> values)
+          values.forEach(
+              item -> {
+                if (item instanceof String text && !text.isBlank()) context.add(text);
+              });
+      }
+      return (String.join("\n", context) + (context.isEmpty() ? "" : "\n") + html).trim();
+    }
+    if ("image".equals(block.type()) && safe(block.text()).isBlank())
+      return safe(block.imagePath()).isBlank() ? "" : "[image] " + block.imagePath();
+    return safe(block.text()).trim();
+  }
+
+  static String normalize(String value) {
+    return safe(value).replace("\r\n", "\n").replace('\r', '\n').trim();
+  }
+
+  private static String safe(String value) {
+    return value == null ? "" : value;
+  }
+
+  private static <T> List<T> safeList(List<T> values) {
+    return values == null ? List.of() : List.copyOf(values);
+  }
+
+  private record Part(
+      String body,
+      List<String> headings,
+      List<String> sourceIds,
+      Integer pageStart,
+      Integer pageEnd,
+      String type) {
+    Part withBody(String value) {
+      return new Part(value, headings, sourceIds, pageStart, pageEnd, type);
+    }
+  }
+
+  private record Cell(String text, int originRow, int originCol, boolean first) {}
+
+  private record Span(Cell cell, int remaining) {}
 
   record ChunkDraft(
       String id,
@@ -243,464 +654,35 @@ final class RawKnowledgeBuilder {
       Integer pageEnd,
       String contentHash,
       int tokenCount,
-      Metadata metadata) {}
-
-  private static FlushResult flush(
-      String documentId,
-      String versionId,
       Metadata metadata,
-      List<ChunkDraft> out,
-      List<RawBlock> current,
-      int overlap) {
-    if (current.isEmpty()) return new FlushResult(List.of(), 0);
-    if (!hasEvidenceBlock(current))
-      return new FlushResult(new ArrayList<>(current), tokenCount(current));
-    out.add(makeChunk(documentId, versionId, metadata, current));
-    if (overlap == 0) return new FlushResult(new ArrayList<>(), 0);
-    List<RawBlock> carryReverse = new ArrayList<>();
-    int tokens = 0;
-    for (int i = current.size() - 1; i >= 0; i--) {
-      RawBlock block = current.get(i);
-      if ("table".equals(block.blockType()) && !carryReverse.isEmpty()) break;
-      if (tokens + block.tokenCount() > overlap && !carryReverse.isEmpty()) break;
-      carryReverse.add(block);
-      tokens += block.tokenCount();
+      String structureType) {
+    ChunkDraft(
+        String id,
+        String documentId,
+        String versionId,
+        String content,
+        String normalized,
+        List<String> headingPath,
+        List<String> sourceBlockIds,
+        Integer pageStart,
+        Integer pageEnd,
+        String contentHash,
+        int tokenCount,
+        Metadata metadata) {
+      this(
+          id,
+          documentId,
+          versionId,
+          content,
+          normalized,
+          headingPath,
+          sourceBlockIds,
+          pageStart,
+          pageEnd,
+          contentHash,
+          tokenCount,
+          metadata,
+          "UNKNOWN");
     }
-    java.util.Collections.reverse(carryReverse);
-    return new FlushResult(new ArrayList<>(carryReverse), tokens);
-  }
-
-  private static ChunkDraft makeChunk(
-      String documentId, String versionId, Metadata metadata, List<RawBlock> parts) {
-    List<String> contents = new ArrayList<>();
-    List<String> sourceIds = new ArrayList<>();
-    List<String> heading = List.of();
-    Integer pageStart = null, pageEnd = null;
-    for (RawBlock block : parts) {
-      sourceIds.add(block.id());
-      if (!block.headingPath().isEmpty()) heading = block.headingPath();
-      if (isEvidenceBlock(block)) contents.add(block.content());
-      if (block.pageStart() != null && (pageStart == null || block.pageStart() < pageStart))
-        pageStart = block.pageStart();
-      if (block.pageEnd() != null && (pageEnd == null || block.pageEnd() > pageEnd))
-        pageEnd = block.pageEnd();
-    }
-    String body = String.join("\n\n", contents);
-    String content =
-        cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.contextualEvidenceContent(
-            heading, body);
-    int tokens = estimateTokens(content);
-    String hash = sha256(content);
-    String seed = versionId + ":" + String.join(",", sourceIds) + ":" + hash;
-    return new ChunkDraft(
-        "ch_" + sha256(seed).substring(0, 40),
-        documentId,
-        versionId,
-        content,
-        normalize(content),
-        List.copyOf(heading),
-        List.copyOf(sourceIds),
-        pageStart,
-        pageEnd,
-        hash,
-        tokens,
-        metadata);
-  }
-
-  private static List<ChunkDraft> splitOversizedBlock(
-      String documentId,
-      String versionId,
-      Metadata metadata,
-      List<RawBlock> headingContext,
-      RawBlock block,
-      int target,
-      int overlap,
-      int boundary) {
-    List<String> sourceIds = new ArrayList<>();
-    Integer pageStart = block.pageStart();
-    Integer pageEnd = block.pageEnd();
-    for (RawBlock context : headingContext) {
-      sourceIds.add(context.id());
-      if (context.pageStart() != null && (pageStart == null || context.pageStart() < pageStart))
-        pageStart = context.pageStart();
-      if (context.pageEnd() != null && (pageEnd == null || context.pageEnd() > pageEnd))
-        pageEnd = context.pageEnd();
-    }
-    sourceIds.add(block.id());
-
-    String headingOnly =
-        cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.contextualEvidenceContent(
-            block.headingPath(), "");
-    int headingTokens = estimateTokens(headingOnly);
-    int bodyTarget = Math.max(1, target - headingTokens);
-    int bodyBoundary = Math.min(boundary, Math.max(0, bodyTarget - 1));
-    int bodyOverlap = Math.min(overlap, Math.max(0, bodyTarget - 1));
-    List<String> pieces = splitText(block.content(), bodyTarget, bodyOverlap, bodyBoundary);
-    List<ChunkDraft> chunks = new ArrayList<>(pieces.size());
-    for (int i = 0; i < pieces.size(); i++) {
-      String content =
-          cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.contextualEvidenceContent(
-              block.headingPath(), pieces.get(i));
-      String hash = sha256(content);
-      String seed = versionId + ":" + String.join(",", sourceIds) + ":part:" + i + ":" + hash;
-      chunks.add(
-          new ChunkDraft(
-              "ch_" + sha256(seed).substring(0, 40),
-              documentId,
-              versionId,
-              content,
-              normalize(content),
-              List.copyOf(block.headingPath()),
-              List.copyOf(sourceIds),
-              pageStart,
-              pageEnd,
-              hash,
-              estimateTokens(content),
-              metadata));
-    }
-    return List.copyOf(chunks);
-  }
-
-  private static List<ChunkDraft> splitOversizedTableBlock(
-      String documentId,
-      String versionId,
-      Metadata metadata,
-      List<RawBlock> headingContext,
-      RawBlock block,
-      int target,
-      int boundary) {
-    String table = trim(block.content());
-    Matcher matcher = TABLE_ROW_PATTERN.matcher(table);
-    List<String> rows = new ArrayList<>();
-    while (matcher.find()) rows.add(matcher.group());
-
-    // MinerU normally emits HTML rows. If a provider returns a malformed table, retain the same
-    // deterministic bounded-splitting fallback used for oversized text rather than allowing one
-    // pathological payload to block the whole raw-ingestion task.
-    if (rows.isEmpty()) {
-      return splitOversizedTableFragments(
-          documentId, versionId, metadata, headingContext, block, table, target, boundary);
-    }
-
-    List<String> heading = block.headingPath();
-    if (heading == null || heading.isEmpty()) {
-      heading =
-          headingContext == null || headingContext.isEmpty()
-              ? List.of()
-              : headingContext.get(headingContext.size() - 1).headingPath();
-    }
-    String headingOnly =
-        cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.contextualEvidenceContent(
-            heading, "");
-    int bodyTarget = Math.max(1, target - estimateTokens(headingOnly));
-    int headerCount = tableHeaderRowCount(rows);
-    List<String> headers = rows.subList(0, headerCount);
-    List<List<String>> groups = new ArrayList<>();
-    List<String> current = new ArrayList<>();
-    for (int i = headerCount; i < rows.size(); i++) {
-      String row = rows.get(i);
-      List<String> candidate = new ArrayList<>(current);
-      candidate.add(row);
-      String candidateTable = tableFragment(headers, candidate);
-      int candidateTokens =
-          estimateTokens(
-              cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.contextualEvidenceContent(
-                  heading, candidateTable));
-      if (!current.isEmpty()
-          && (candidateTokens > bodyTarget || candidateTable.length() > MAX_TABLE_FRAGMENT_CHARS)) {
-        groups.add(List.copyOf(current));
-        current = new ArrayList<>();
-      }
-      current.add(row);
-    }
-    if (!current.isEmpty()) groups.add(List.copyOf(current));
-    if (groups.isEmpty()) groups.add(List.of());
-
-    List<String> sourceIds = new ArrayList<>();
-    if (headingContext != null) headingContext.forEach(context -> sourceIds.add(context.id()));
-    sourceIds.add(block.id());
-    List<ChunkDraft> chunks = new ArrayList<>(groups.size());
-    for (int i = 0; i < groups.size(); i++) {
-      String content = tableFragment(headers, groups.get(i));
-      String contextual =
-          cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.contextualEvidenceContent(
-              heading, content);
-      String hash = sha256(contextual);
-      String seed = versionId + ":" + String.join(",", sourceIds) + ":table-part:" + i + ":" + hash;
-      chunks.add(
-          new ChunkDraft(
-              "ch_" + sha256(seed).substring(0, 40),
-              documentId,
-              versionId,
-              contextual,
-              normalize(contextual),
-              List.copyOf(heading),
-              List.copyOf(sourceIds),
-              block.pageStart(),
-              block.pageEnd(),
-              hash,
-              estimateTokens(contextual),
-              metadata));
-    }
-    return List.copyOf(chunks);
-  }
-
-  private static List<ChunkDraft> splitOversizedTableFragments(
-      String documentId,
-      String versionId,
-      Metadata metadata,
-      List<RawBlock> headingContext,
-      RawBlock block,
-      String table,
-      int target,
-      int boundary) {
-    List<String> heading = block.headingPath();
-    if (heading == null || heading.isEmpty()) {
-      heading =
-          headingContext == null || headingContext.isEmpty()
-              ? List.of()
-              : headingContext.get(headingContext.size() - 1).headingPath();
-    }
-    String headingOnly =
-        cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.contextualEvidenceContent(
-            heading, "");
-    int bodyTarget = Math.max(1, target - estimateTokens(headingOnly));
-    int bodyBoundary = Math.min(boundary, Math.max(0, bodyTarget - 1));
-    List<String> pieces = splitText(table, bodyTarget, 0, bodyBoundary);
-    List<String> sourceIds = new ArrayList<>();
-    if (headingContext != null) headingContext.forEach(context -> sourceIds.add(context.id()));
-    sourceIds.add(block.id());
-    List<ChunkDraft> chunks = new ArrayList<>(pieces.size());
-    for (int i = 0; i < pieces.size(); i++) {
-      String contextual =
-          cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.contextualEvidenceContent(
-              heading, pieces.get(i));
-      String hash = sha256(contextual);
-      String seed =
-          versionId + ":" + String.join(",", sourceIds) + ":table-fragment:" + i + ":" + hash;
-      chunks.add(
-          new ChunkDraft(
-              "ch_" + sha256(seed).substring(0, 40),
-              documentId,
-              versionId,
-              contextual,
-              normalize(contextual),
-              List.copyOf(heading),
-              List.copyOf(sourceIds),
-              block.pageStart(),
-              block.pageEnd(),
-              hash,
-              estimateTokens(contextual),
-              metadata));
-    }
-    return List.copyOf(chunks);
-  }
-
-  private static int tableHeaderRowCount(List<String> rows) {
-    if (rows.size() < 2) return Math.min(1, rows.size());
-    int first = countTableCells(rows.get(0));
-    int second = countTableCells(rows.get(1));
-    return first > 0 && first <= 2 && second > first ? 2 : 1;
-  }
-
-  private static int countTableCells(String row) {
-    int count = 0;
-    Matcher matcher = TABLE_CELL_PATTERN.matcher(row);
-    while (matcher.find()) count++;
-    return count;
-  }
-
-  private static String tableFragment(List<String> headers, List<String> rows) {
-    List<String> all = new ArrayList<>(headers.size() + rows.size());
-    all.addAll(headers);
-    all.addAll(rows);
-    return "<table>" + String.join("", all) + "</table>";
-  }
-
-  private static List<String> splitText(
-      String value, int targetTokens, int overlapTokens, int boundaryTokens) {
-    String text = trim(value);
-    if (text.isEmpty()) return List.of();
-    if (estimateTokens(text) <= targetTokens) return List.of(text);
-
-    List<String> pieces = new ArrayList<>();
-    int start = 0;
-    while (start < text.length()) {
-      int hardEnd = maxEndForTokens(text, start, targetTokens);
-      if (hardEnd <= start) hardEnd = nextCodePointOffset(text, start);
-      int end = hardEnd;
-      if (hardEnd < text.length() && boundaryTokens > 0) {
-        int preferredFloor =
-            maxEndForTokens(text, start, Math.max(1, targetTokens - boundaryTokens));
-        int boundaryEnd = findBoundaryEnd(text, Math.max(start + 1, preferredFloor), hardEnd);
-        if (boundaryEnd > start) end = boundaryEnd;
-      }
-
-      String piece = text.substring(start, end).trim();
-      if (!piece.isEmpty()) pieces.add(piece);
-      if (end >= text.length()) break;
-
-      int nextStart = end;
-      if (overlapTokens > 0) {
-        nextStart = suffixStartForTokens(text, start, end, overlapTokens);
-        nextStart = moveForwardToBoundary(text, nextStart, end);
-      }
-      if (nextStart <= start) nextStart = end;
-      start = nextStart;
-    }
-    return List.copyOf(pieces);
-  }
-
-  private static int maxEndForTokens(String text, int start, int tokenLimit) {
-    int low = start + 1;
-    int high = text.length();
-    int best = start;
-    while (low <= high) {
-      int mid = safeCharBoundary(text, low + (high - low) / 2);
-      if (mid <= start) mid = nextCodePointOffset(text, start);
-      int tokens = estimateTokens(text.substring(start, mid));
-      if (tokens <= tokenLimit) {
-        best = mid;
-        low = mid + 1;
-      } else {
-        high = mid - 1;
-      }
-    }
-    return best;
-  }
-
-  private static int suffixStartForTokens(String text, int floor, int end, int tokenLimit) {
-    int low = floor;
-    int high = end;
-    int best = end;
-    while (low <= high) {
-      int mid = safeCharBoundary(text, low + (high - low) / 2);
-      int tokens = estimateTokens(text.substring(mid, end));
-      if (tokens <= tokenLimit) {
-        best = mid;
-        high = mid - 1;
-      } else {
-        low = mid + 1;
-      }
-    }
-    return best;
-  }
-
-  private static int findBoundaryEnd(String text, int floor, int ceiling) {
-    for (int i = Math.min(ceiling, text.length()) - 1; i >= floor; i--) {
-      char ch = text.charAt(i);
-      if (ch == '\n'
-          || ch == '。'
-          || ch == '！'
-          || ch == '？'
-          || ch == '；'
-          || ch == '.'
-          || ch == '!'
-          || ch == '?'
-          || ch == ';') return i + 1;
-    }
-    return ceiling;
-  }
-
-  private static int moveForwardToBoundary(String text, int start, int end) {
-    for (int i = start; i < end; i++) {
-      char ch = text.charAt(i);
-      if (Character.isWhitespace(ch)) return i + 1;
-      if (ch == '。' || ch == '！' || ch == '？' || ch == '；') return i + 1;
-    }
-    return start;
-  }
-
-  private static int safeCharBoundary(String text, int offset) {
-    int bounded = Math.max(0, Math.min(offset, text.length()));
-    if (bounded > 0
-        && bounded < text.length()
-        && Character.isLowSurrogate(text.charAt(bounded))
-        && Character.isHighSurrogate(text.charAt(bounded - 1))) return bounded - 1;
-    return bounded;
-  }
-
-  private static int nextCodePointOffset(String text, int start) {
-    if (start >= text.length()) return text.length();
-    return start + Character.charCount(text.codePointAt(start));
-  }
-
-  private record FlushResult(List<RawBlock> carry, int tokens) {}
-
-  private static String blockText(ParsedBlock item) {
-    String type = safe(item.type());
-    return switch (type) {
-      case "text", "equation", "interline_equation" -> trim(item.text());
-      case "table" ->
-          !trim(item.tableBody()).isEmpty() ? trim(item.tableBody()) : trim(item.tableHtml());
-      case "image" ->
-          !trim(item.text()).isEmpty()
-              ? trim(item.text())
-              : (!trim(item.imagePath()).isEmpty() ? "[image] " + trim(item.imagePath()) : "");
-      default -> trim(item.text());
-    };
-  }
-
-  private static boolean isAuxiliary(String blockType) {
-    return AUXILIARY_BLOCK_TYPES.contains(
-        safe(blockType).trim().toLowerCase(java.util.Locale.ROOT));
-  }
-
-  private static boolean isHeading(RawBlock block) {
-    return "text".equals(block.blockType())
-        && !block.headingPath().isEmpty()
-        && block.normalized().equals(block.headingPath().get(block.headingPath().size() - 1));
-  }
-
-  private static boolean isEvidenceBlock(RawBlock block) {
-    return !isAuxiliary(block.blockType()) && !isHeading(block);
-  }
-
-  private static boolean startsStructuralBoundary(RawBlock block) {
-    if (!"text".equals(block.blockType())) return false;
-    String text = normalize(block.content());
-    if (text.isEmpty()) return false;
-    return text.matches("^(第[一二三四五六七八九十百千〇零两0-9]+[章节条款]|[一二三四五六七八九十百]+、|[0-9]{1,3}[.．、])\\s*.*");
-  }
-
-  private static boolean hasEvidenceBlock(List<RawBlock> blocks) {
-    return blocks.stream().anyMatch(RawKnowledgeBuilder::isEvidenceBlock);
-  }
-
-  private static int tokenCount(List<RawBlock> blocks) {
-    return blocks.stream().mapToInt(RawBlock::tokenCount).sum();
-  }
-
-  private static int estimateTokens(String text) {
-    int cjk = 0, latin = 0, other = 0;
-    for (int offset = 0; offset < text.length(); ) {
-      int cp = text.codePointAt(offset);
-      offset += Character.charCount(cp);
-      Character.UnicodeScript script = Character.UnicodeScript.of(cp);
-      if (script == Character.UnicodeScript.HAN
-          || script == Character.UnicodeScript.HANGUL
-          || script == Character.UnicodeScript.HIRAGANA
-          || script == Character.UnicodeScript.KATAKANA) cjk++;
-      else if (cp <= 127 && Character.isLetterOrDigit(cp)) latin++;
-      else if (!Character.isWhitespace(cp)) other++;
-    }
-    int tokens = cjk + (latin + 3) / 4 + (other + 2) / 3;
-    return tokens == 0 && !text.isEmpty() ? 1 : tokens;
-  }
-
-  private static String normalize(String value) {
-    return trim(value).replaceAll("\\s+", " ");
-  }
-
-  private static String trim(String value) {
-    return value == null ? "" : value.trim();
-  }
-
-  private static String safe(String value) {
-    return value == null ? "" : value;
-  }
-
-  private static <T> List<T> safeList(List<T> value) {
-    return value == null ? List.of() : List.copyOf(value);
   }
 }

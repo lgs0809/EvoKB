@@ -62,17 +62,38 @@ public final class GraphCompilationService {
   }
 
   public CompileResult compileSummary(String summaryId) {
+    return compileSummary(summaryId, repository.newPublication());
+  }
+
+  public CompileResult compileSummary(
+      String summaryId, java.util.function.Consumer<Runnable> publication) {
+    return compileSummary(summaryId, CompilationPublication.direct(publication));
+  }
+
+  public CompileResult compileSummary(String summaryId, CompilationPublication publication) {
+    return compileSummary(summaryId, publication, List.of());
+  }
+
+  /** Entry metadata inherits all frozen inputs even when a single source supplies the citation. */
+  public CompileResult compileSummary(
+      String summaryId, CompilationPublication publication, List<String> inputVersionIds) {
     SummaryRecord source =
         repository
-            .findSummary(trim(summaryId))
+            .findSummaryForAudit(trim(summaryId))
             .orElseThrow(() -> new IllegalStateException("summary not found: " + summaryId));
     if (!source.activeAndGrounded()) {
       throw new IllegalStateException(
           "summary is not ACTIVE with grounding+coverage PASS: " + summaryId);
     }
+    GroundingConstraintAudit.requireCurrentSummary(source, repository);
+    var inputs = new java.util.TreeSet<>(inputVersionIds);
+    inputs.addAll(repository.derivedContextForSummaries(List.of(source.id())).versionIds());
+    var completeInputs = List.copyOf(inputs);
+    publication.captureInputs(completeInputs);
     Map<String, SummaryFact> facts = groundedFacts(source.facts());
     if (facts.isEmpty())
       throw new IllegalStateException("graph compiler: no grounded summary facts");
+    var references = new GroundedFactReferences(facts);
 
     Extraction extraction =
         model.generateStructured(
@@ -85,17 +106,30 @@ public final class GraphCompilationService {
                 + "Set entities to an empty array; relation endpoints are carried by source_name/source_type and "
                 + "target_name/target_type. Copy every fact id exactly as shown between <fact id=...> tags; never invent, "
                 + "truncate, normalize, or substitute an id. fact_decisions must contain each input fact id exactly once, "
-                + "and relations may cite only those exact ids.",
+                + "and relations may cite only those exact ids. These are short request-local keys such as F001; "
+                + "never output UUIDs or invent a reference.",
             "Entity types:\n- "
                 + String.join("\n- ", ENTITY_TYPES.stream().sorted().toList())
                 + "\nRelation types:\n- "
                 + String.join("\n- ", RELATION_RULES.keySet().stream().sorted().toList())
-                + "\nFacts:\n"
-                + renderFacts(facts.values()),
+                + "\nFor each relation, businessScope is a list of typed anchors (type, value, supportingFactIds). "
+                + "Anchor type is the business object kind, exactly one of COMPANY, ORGANIZATION, PERSON, "
+                + "CONTRACT, PROJECT, LEGAL_CASE, LICENSE; do not invent field kinds such as contract_number or buyer. "
+                + "Each anchor must have a non-empty literal value and non-empty supportingFactIds containing "
+                + "the exact input fact IDs that state that value. Empty citations are invalid. "
+                + "Copy anchor values verbatim from grounded facts, use the same complete anchor set for the same business scope, "
+                + "and cite the exact facts stating them. Contracts/projects must include their number/name and a named party "
+                + "to distinguish identical numbers used by different parties. If no identity qualification is stated, "
+                + "use an empty list: the mention remains local to this document, never a globally merged name. "
+                + "Do not invent registration numbers, parties or scope. Endpoint names must also occur in their cited facts. "
+                + "scopeText is an optional exact clause/section phrase from the cited facts; do not paraphrase it. "
+                + "Document nodes and DOCUMENTS edges are created by the program, not the model.\nFacts:\n"
+                + references.renderFacts(),
             Extraction.class);
 
-    Validation validation = validateExtraction(facts, extraction);
-    repository.replaceGraphRejections(source.id(), validation.rejectedRelations());
+    Validation validation = validateExtraction(facts, references, extraction);
+    publication.publish(
+        () -> repository.replaceGraphRejections(source.id(), validation.rejectedRelations()));
     if (!validation.coverage().pass()) {
       throw new IllegalStateException(
           "graph coverage failed: uncovered eligible facts: "
@@ -112,11 +146,15 @@ public final class GraphCompilationService {
       String targetType = normalizeType(proposed.targetType());
       String sourceSurface = trim(proposed.sourceName());
       String targetSurface = trim(proposed.targetName());
-      Entity sourceEntity = resolve(sourceSurface, sourceType, cache, entities);
-      Entity targetEntity = resolve(targetSurface, targetType, cache, entities);
+      var scope = GraphScopeIdentity.scope(source.documentId(), proposed.businessScope(), facts);
+      String relationScope =
+          stableId("relation_scope", scope.key(), canonicalKey(proposed.scopeText()));
+      Entity sourceEntity = resolve(sourceSurface, sourceType, scope, cache, entities);
+      Entity targetEntity = resolve(targetSurface, targetType, scope, cache, entities);
       Instant validFrom = parseOptionalTime(proposed.validFrom());
       Instant validTo = parseOptionalTime(proposed.validTo());
       LinkedHashSet<String> evidenceIds = new LinkedHashSet<>();
+      evidenceIds.addAll(scope.evidenceIds());
       for (String factId : proposed.supportingFactIds())
         evidenceIds.addAll(facts.get(factId).evidenceIds());
       for (String evidenceId : evidenceIds) {
@@ -144,6 +182,7 @@ public final class GraphCompilationService {
               sourceEntity.canonicalId(),
               proposed.relationType(),
               targetEntity.canonicalId(),
+              relationScope,
               validFrom);
       relations.add(
           new Relation(
@@ -163,7 +202,48 @@ public final class GraphCompilationService {
                   "supporting_fact_ids",
                   proposed.supportingFactIds(),
                   "origin",
-                  "llm_triple")));
+                  "llm_triple",
+                  "scope_key",
+                  relationScope,
+                  "scope_json",
+                  Map.of("business", scope.attributes(), "clause", proposed.scopeText()))));
+    }
+
+    if (!relations.isEmpty()) {
+      Entity document = GraphScopeIdentity.document(source.documentId());
+      var business = List.copyOf(entities);
+      entities.add(document);
+      for (Entity entity : business) {
+        var support =
+            relations.stream()
+                .filter(
+                    r ->
+                        r.subjectEntityId().equals(entity.canonicalId())
+                            || r.objectEntityId().equals(entity.canonicalId()))
+                .flatMap(r -> r.evidenceIds().stream())
+                .distinct()
+                .sorted()
+                .toList();
+        relations.add(
+            new Relation(
+                stableId("documents", source.documentId(), entity.canonicalId()),
+                document.canonicalId(),
+                "DOCUMENTS",
+                entity.canonicalId(),
+                null,
+                null,
+                ConflictStatus.NONE,
+                RelationLifecycle.ACTIVE,
+                support,
+                1,
+                Map.of(
+                    "scope_key",
+                    entity.attributes().get("scope_key"),
+                    "scope_json",
+                    Map.of("document_id", source.documentId()),
+                    "origin",
+                    "source_identity")));
+      }
     }
 
     entities.sort(Comparator.comparing(Entity::canonicalId));
@@ -172,9 +252,11 @@ public final class GraphCompilationService {
         resolutions.values().stream()
             .sorted(Comparator.comparing(EntityResolution::sourceEntityId))
             .toList();
-    repository.saveGraph(source.id(), entities, relations, resolutionList);
-    graph.upsertEntities(entities);
-    graph.upsertRelations(relations);
+    publication.publish(
+        () -> {
+          graph.publish(entities, relations, completeInputs);
+          repository.saveGraph(source.id(), entities, relations, resolutionList);
+        });
     return new CompileResult(
         source.id(),
         List.copyOf(entities),
@@ -194,7 +276,8 @@ public final class GraphCompilationService {
       double confidence,
       String decidedBy) {
     String sourceEntityId =
-        stableId("source_entity", versionId, surfaceForm, entityType, evidenceId);
+        stableId(
+            "source_entity", versionId, surfaceForm, entityType, evidenceId, canonicalEntityId);
     EntityResolution next =
         new EntityResolution(
             sourceEntityId,
@@ -218,24 +301,28 @@ public final class GraphCompilationService {
   }
 
   private Entity resolve(
-      String name, String type, Map<String, Entity> cache, List<Entity> entities) {
+      String name,
+      String type,
+      GraphScopeIdentity.Scope scope,
+      Map<String, Entity> cache,
+      List<Entity> entities) {
     String normalizedType = normalizeType(type);
-    String key = normalizedType + "\u0000" + canonicalKey(name);
+    String key = normalizedType + "\u0000" + scope.key() + "\u0000" + canonicalKey(name);
     Entity cached = cache.get(key);
     if (cached != null) return cached;
-    Entity resolved = repository.resolveEntity(trim(name), normalizedType);
+    Entity resolved = GraphScopeIdentity.entity(trim(name), normalizedType, scope);
     cache.put(key, resolved);
     entities.add(resolved);
     return resolved;
   }
 
   private static Validation validateExtraction(
-      Map<String, SummaryFact> facts, Extraction extraction) {
+      Map<String, SummaryFact> facts, GroundedFactReferences references, Extraction extraction) {
     if (extraction == null)
       throw new IllegalStateException("graph extraction returned empty output");
     Map<String, FactDecision> decisions = new LinkedHashMap<>();
     for (FactDecision raw : safe(extraction.factDecisions())) {
-      String factId = trim(raw.factId());
+      String factId = references.canonicalId(raw.factId());
       if (!facts.containsKey(factId))
         throw new IllegalStateException(
             "graph coverage: decision references unknown fact " + factId);
@@ -260,7 +347,7 @@ public final class GraphCompilationService {
       candidateIndex++;
       ProposedRelation relation;
       try {
-        relation = normalize(raw);
+        relation = normalize(raw, references);
       } catch (RuntimeException invalid) {
         rejected.add(rejected(candidateIndex, raw, invalid.getMessage()));
         continue;
@@ -324,6 +411,46 @@ public final class GraphCompilationService {
             + id
             + " without raw evidence";
     }
+    String citedText =
+        relation.supportingFactIds().stream()
+            .map(id -> facts.get(id).factText())
+            .collect(java.util.stream.Collectors.joining("\n"));
+    if (!canonicalKey(citedText).contains(canonicalKey(relation.sourceName()))
+        || !canonicalKey(citedText).contains(canonicalKey(relation.targetName())))
+      return "graph endpoints are not stated in the cited facts";
+    if (!relation.scopeText().isBlank()
+        && relation.supportingFactIds().stream()
+            .noneMatch(
+                id ->
+                    canonicalKey(facts.get(id).factText())
+                            .contains(canonicalKey(relation.scopeText()))
+                        || canonicalKey(facts.get(id).section())
+                            .equals(canonicalKey(relation.scopeText()))))
+      return "graph clause scope is not stated in the cited facts";
+    try {
+      GraphScopeIdentity.scope("validation-only", relation.businessScope(), facts);
+    } catch (IllegalArgumentException invalid) {
+      return invalid.getMessage();
+    }
+    for (String type : List.of(relation.sourceType(), relation.targetType())) {
+      if (Set.of("CONTRACT", "PROJECT").contains(type)) {
+        var anchors =
+            relation.businessScope() == null
+                ? List.<GraphScopeIdentity.Anchor>of()
+                : relation.businessScope();
+        boolean object =
+            anchors.stream().anyMatch(a -> a.type() != null && type.equals(a.type().name()));
+        boolean party =
+            anchors.stream()
+                .anyMatch(
+                    a ->
+                        a.type() != null
+                            && Set.of("COMPANY", "ORGANIZATION", "PERSON")
+                                .contains(a.type().name()));
+        if (!object || !party)
+          return "contract/project identity requires an evidence-backed object and party scope";
+      }
+    }
     return null;
   }
 
@@ -375,7 +502,9 @@ public final class GraphCompilationService {
               + " is not allowed");
     if (relation.supportingFactIds().isEmpty())
       throw new IllegalStateException("graph relation requires at least one supporting fact");
-    if (relation.confidence() < 0 || relation.confidence() > 1)
+    if (!Double.isFinite(relation.confidence())
+        || relation.confidence() < 0
+        || relation.confidence() > 1)
       throw new IllegalStateException("graph relation confidence must be within [0,1]");
     Instant from = parseOptionalTime(relation.validFrom());
     Instant to = parseOptionalTime(relation.validTo());
@@ -383,13 +512,14 @@ public final class GraphCompilationService {
       throw new IllegalStateException("graph relation valid_to cannot be before valid_from");
   }
 
-  private static ProposedRelation normalize(ProposedRelation relation) {
+  private static ProposedRelation normalize(
+      ProposedRelation relation, GroundedFactReferences references) {
     if (relation == null) throw new IllegalStateException("graph relation is null");
     List<String> facts =
         relation.supportingFactIds() == null
             ? List.of()
             : relation.supportingFactIds().stream()
-                .map(GraphCompilationService::trim)
+                .map(references::canonicalId)
                 .filter(v -> !v.isEmpty())
                 .distinct()
                 .toList();
@@ -402,7 +532,20 @@ public final class GraphCompilationService {
         facts,
         trim(relation.validFrom()),
         trim(relation.validTo()),
-        relation.confidence());
+        relation.confidence(),
+        relation.businessScope() == null
+            ? List.of()
+            : relation.businessScope().stream()
+                .map(
+                    anchor ->
+                        anchor == null
+                            ? null
+                            : new GraphScopeIdentity.Anchor(
+                                anchor.type(),
+                                anchor.value(),
+                                references.canonicalIds(anchor.supportingFactIds())))
+                .toList(),
+        trim(relation.scopeText()));
   }
 
   private static Map<String, SummaryFact> groundedFacts(List<SummaryFact> input) {
@@ -438,9 +581,9 @@ public final class GraphCompilationService {
   }
 
   private static String relationId(
-      String sourceId, String relationType, String targetId, Instant validFrom) {
+      String sourceId, String relationType, String targetId, String scope, Instant validFrom) {
     String valid = validFrom == null ? "" : validFrom.toString();
-    return stableId("relation", sourceId, relationType, targetId, valid);
+    return stableId("relation", sourceId, relationType, targetId, scope, valid);
   }
 
   public static String stableId(String... parts) {
@@ -461,19 +604,6 @@ public final class GraphCompilationService {
     } catch (Exception e) {
       throw new IllegalStateException(e);
     }
-  }
-
-  private static String renderFacts(java.util.Collection<SummaryFact> facts) {
-    StringBuilder out = new StringBuilder();
-    for (SummaryFact fact : facts)
-      out.append("<fact id=\"")
-          .append(fact.id())
-          .append("\" section=\"")
-          .append(fact.section())
-          .append("\">\n")
-          .append(fact.factText())
-          .append("\n</fact>\n");
-    return out.toString();
   }
 
   public static boolean relationAllowed(String sourceType, String relationType, String targetType) {
@@ -554,7 +684,33 @@ public final class GraphCompilationService {
       List<String> supportingFactIds,
       String validFrom,
       String validTo,
-      double confidence) {}
+      double confidence,
+      List<GraphScopeIdentity.Anchor> businessScope,
+      String scopeText) {
+    public ProposedRelation(
+        String sourceName,
+        String sourceType,
+        String relationType,
+        String targetName,
+        String targetType,
+        List<String> supportingFactIds,
+        String validFrom,
+        String validTo,
+        double confidence) {
+      this(
+          sourceName,
+          sourceType,
+          relationType,
+          targetName,
+          targetType,
+          supportingFactIds,
+          validFrom,
+          validTo,
+          confidence,
+          List.of(),
+          "");
+    }
+  }
 
   public record FactDecision(String factId, boolean graphEligible, String skipReason) {}
 

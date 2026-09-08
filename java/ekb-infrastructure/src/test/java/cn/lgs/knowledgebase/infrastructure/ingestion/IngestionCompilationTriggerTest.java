@@ -13,20 +13,24 @@ class IngestionCompilationTriggerTest {
   private static final Instant NOW = Instant.parse("2026-08-24T00:00:00Z");
 
   @Test
-  void queuesSummaryAfterRawCommitWithIdempotentRepositoryContract() {
+  void queuesOnlyAssociationAfterRawCommitWithIdempotentRepositoryContract() {
     Tasks tasks = new Tasks(false);
 
-    new IngestionCompilationTrigger(tasks).queueSummary("v1", NOW);
+    new IngestionCompilationTrigger(tasks).queueAssociation("v1", NOW);
 
     assertEquals(1, tasks.queued);
     assertEquals("v1", tasks.versionId);
+    assertEquals(
+        cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTaskType
+            .SOURCE_ASSOCIATION,
+        tasks.taskType);
   }
 
   @Test
   void derivedTriggerFailureDoesNotEscapeIntoRawWorker() {
     Tasks tasks = new Tasks(true);
 
-    assertDoesNotThrow(() -> new IngestionCompilationTrigger(tasks).queueSummary("v1", NOW));
+    assertDoesNotThrow(() -> new IngestionCompilationTrigger(tasks).queueAssociation("v1", NOW));
     assertEquals(0, tasks.queued);
   }
 
@@ -34,6 +38,7 @@ class IngestionCompilationTriggerTest {
     private final boolean fail;
     private int queued;
     private String versionId;
+    private cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTaskType taskType;
 
     private Tasks(boolean fail) {
       this.fail = fail;
@@ -47,6 +52,7 @@ class IngestionCompilationTriggerTest {
         Instant now) {
       if (fail) throw new IllegalStateException("temporary queue outage");
       this.versionId = versionId;
+      this.taskType = taskType;
       queued++;
       return null;
     }
@@ -64,12 +70,23 @@ class IngestionCompilationTriggerTest {
         GenerationTask task, String outputHash, Instant now) {}
 
     @Override
-    public void fail(String taskId, String errorCode, String errorMessage, Instant now) {}
+    public void fail(GenerationTask task, String errorCode, String errorMessage, Instant now) {}
+
+    @Override
+    public void defer(
+        GenerationTask task,
+        String errorCode,
+        String errorMessage,
+        Instant nextAttemptAt,
+        Instant now) {}
 
     @Override
     public void retry(String taskId, Instant now) {}
 
     @Override
-    public void resetInterrupted(Instant now) {}
+    public void resetInterrupted(
+        List<cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTaskType>
+            taskTypes,
+        Instant now) {}
   }
 }

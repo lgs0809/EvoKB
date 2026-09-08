@@ -14,6 +14,49 @@ import java.util.Optional;
 public final class CompilationContracts {
   private CompilationContracts() {}
 
+  /** Complete model inputs are distinct from the evidence selected for final citations. */
+  public static final String COMPLETE_INPUT_POLICY = "complete-inputs-v1";
+
+  /** Policy changes must not reuse successful work from an obsolete publication contract. */
+  public static String generationPolicy(
+      cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTaskType type) {
+    return switch (type) {
+      case SUMMARY, CONCEPT -> GroundingConstraintAudit.POLICY_VERSION;
+      case GRAPH, WIKI -> GroundingConstraintAudit.POLICY_VERSION + ":" + COMPLETE_INPUT_POLICY;
+      default -> "";
+    };
+  }
+
+  /** Preserve every existing short/native key; long enterprise identities have a bounded digest. */
+  public static String generationTaskKey(
+      String knowledgeBaseId,
+      String versionId,
+      cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTaskType type,
+      String subjectId) {
+    if (knowledgeBaseId == null
+        || knowledgeBaseId.isBlank()
+        || versionId == null
+        || versionId.isBlank()
+        || type == null)
+      throw new IllegalArgumentException("trusted compilation identity required");
+    String policy = generationPolicy(type);
+    String full =
+        "generation:"
+            + type.name().toLowerCase(java.util.Locale.ROOT)
+            + ":"
+            + (policy.isEmpty() ? "" : policy + ":")
+            + versionId.trim()
+            + ":"
+            + (subjectId == null ? "" : subjectId.trim());
+    if (!"enterprise".equals(knowledgeBaseId))
+      return cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.sha256(
+          knowledgeBaseId.length() + ":" + knowledgeBaseId + ":" + full);
+    return full.length() <= 255
+        ? full
+        : "generation-key-sha256:"
+            + cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.sha256(full);
+  }
+
   public record VersionSource(
       String documentId,
       String versionId,
@@ -46,7 +89,29 @@ public final class CompilationContracts {
       List<String> evidenceBlockIds,
       List<String> evidenceIds,
       String groundingStatus,
-      String groundingReason) {
+      String groundingReason,
+      GroundingConstraintAudit.Audit groundingAudit) {
+    public SummaryFact(
+        String id,
+        String summaryId,
+        String section,
+        String factText,
+        List<String> evidenceBlockIds,
+        List<String> evidenceIds,
+        String groundingStatus,
+        String groundingReason) {
+      this(
+          id,
+          summaryId,
+          section,
+          factText,
+          evidenceBlockIds,
+          evidenceIds,
+          groundingStatus,
+          groundingReason,
+          null);
+    }
+
     public SummaryFact {
       evidenceBlockIds = evidenceBlockIds == null ? List.of() : List.copyOf(evidenceBlockIds);
       evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
@@ -129,7 +194,58 @@ public final class CompilationContracts {
       List<String> factIds,
       List<String> evidenceIds,
       String groundingStatus,
-      String temporalStatus) {
+      String temporalStatus,
+      String groundingReason,
+      GroundingConstraintAudit.Audit groundingAudit) {
+    public WikiClaim(
+        String id,
+        String wikiId,
+        long wikiVersion,
+        String section,
+        String claimText,
+        List<String> factIds,
+        List<String> evidenceIds,
+        String groundingStatus,
+        String temporalStatus,
+        String groundingReason) {
+      this(
+          id,
+          wikiId,
+          wikiVersion,
+          section,
+          claimText,
+          factIds,
+          evidenceIds,
+          groundingStatus,
+          temporalStatus,
+          groundingReason,
+          null);
+    }
+
+    public WikiClaim(
+        String id,
+        String wikiId,
+        long wikiVersion,
+        String section,
+        String claimText,
+        List<String> factIds,
+        List<String> evidenceIds,
+        String groundingStatus,
+        String temporalStatus) {
+      this(
+          id,
+          wikiId,
+          wikiVersion,
+          section,
+          claimText,
+          factIds,
+          evidenceIds,
+          groundingStatus,
+          temporalStatus,
+          "",
+          null);
+    }
+
     public WikiClaim {
       factIds = factIds == null ? List.of() : List.copyOf(factIds);
       evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
@@ -158,6 +274,15 @@ public final class CompilationContracts {
   }
 
   public interface CompilationRepository {
+    default CompilationPublication newPublication() {
+      return CompilationPublication.direct(this::withinPublication);
+    }
+
+    /** Execute publication writes together; database adapters supply their native transaction. */
+    default void withinPublication(Runnable publication) {
+      publication.run();
+    }
+
     VersionSource loadVersionSource(String versionId);
 
     void replaceDocumentUnits(String versionId, List<DocumentUnit> units);
@@ -174,6 +299,11 @@ public final class CompilationContracts {
     void saveSummary(SummaryRecord summary);
 
     Optional<SummaryRecord> findSummary(String summaryId);
+
+    /** Audit/source checks need authoritative facts, without remote object reads in a DB fence. */
+    default Optional<SummaryRecord> findSummaryForAudit(String summaryId) {
+      return findSummary(summaryId);
+    }
 
     List<SummaryRecord> loadSummaries(List<String> summaryIds);
 
@@ -200,6 +330,10 @@ public final class CompilationContracts {
     long nextWikiVersion(String wikiId);
 
     void saveWiki(WikiRecord wiki);
+
+    default void saveWiki(WikiRecord wiki, List<String> inputSummaryIds) {
+      saveWiki(wiki);
+    }
 
     DerivedContext derivedContextForSummaries(List<String> summaryIds);
   }

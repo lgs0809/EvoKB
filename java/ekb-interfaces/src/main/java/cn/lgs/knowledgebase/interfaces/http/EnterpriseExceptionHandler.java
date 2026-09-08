@@ -20,6 +20,7 @@ public final class EnterpriseExceptionHandler {
   }
 
   @ExceptionHandler({
+    cn.lgs.knowledgebase.application.access.KnowledgeAccessService.Denied.class,
     EnterpriseRequestContext.Forbidden.class,
     ManagedIngestionApplicationService.Forbidden.class
   })

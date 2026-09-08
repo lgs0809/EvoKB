@@ -1,10 +1,16 @@
 package cn.lgs.knowledgebase.infrastructure.compilation;
 
+import cn.lgs.knowledgebase.application.compilation.CompilationExecutionBudget;
+import cn.lgs.knowledgebase.application.compilation.CompilationPublication;
 import cn.lgs.knowledgebase.application.port.Ports.GenerationTaskRepository;
 import cn.lgs.knowledgebase.application.raw.RawEmbeddingRebuildService;
 import cn.lgs.knowledgebase.application.raw.RawEmbeddingRebuildService.RebuildResult;
+import cn.lgs.knowledgebase.application.raw.RawExecution;
 import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTask;
+import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTaskType;
+import cn.lgs.knowledgebase.domain.ingestion.IngestionDomain.ProgressStage;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain;
+import cn.lgs.knowledgebase.infrastructure.raw.JdbcRawPublicationWriter;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
@@ -23,6 +29,7 @@ public final class DurableEmbeddingRebuildWorker implements SmartLifecycle {
   private final RawEmbeddingRebuildService rebuild;
   private final Duration pollInterval;
   private final Clock clock;
+  private final JdbcRawPublicationWriter publicationWriter;
   private final AtomicBoolean running = new AtomicBoolean(false);
   private ExecutorService executor;
 
@@ -31,11 +38,33 @@ public final class DurableEmbeddingRebuildWorker implements SmartLifecycle {
     this(tasks, rebuild, pollInterval, Clock.systemUTC());
   }
 
+  public DurableEmbeddingRebuildWorker(
+      GenerationTaskRepository tasks,
+      RawEmbeddingRebuildService rebuild,
+      Duration pollInterval,
+      JdbcRawPublicationWriter publicationWriter) {
+    this(
+        tasks,
+        rebuild,
+        pollInterval,
+        Clock.systemUTC(),
+        require(publicationWriter, "raw publication writer"));
+  }
+
   DurableEmbeddingRebuildWorker(
       GenerationTaskRepository tasks,
       RawEmbeddingRebuildService rebuild,
       Duration pollInterval,
       Clock clock) {
+    this(tasks, rebuild, pollInterval, clock, null);
+  }
+
+  private DurableEmbeddingRebuildWorker(
+      GenerationTaskRepository tasks,
+      RawEmbeddingRebuildService rebuild,
+      Duration pollInterval,
+      Clock clock,
+      JdbcRawPublicationWriter publicationWriter) {
     this.tasks = require(tasks, "generation task repository");
     this.rebuild = require(rebuild, "raw embedding rebuild service");
     this.pollInterval =
@@ -43,12 +72,13 @@ public final class DurableEmbeddingRebuildWorker implements SmartLifecycle {
             ? Duration.ofSeconds(1)
             : pollInterval;
     this.clock = require(clock, "clock");
+    this.publicationWriter = publicationWriter;
   }
 
   @Override
   public synchronized void start() {
     if (!running.compareAndSet(false, true)) return;
-    tasks.resetInterrupted(clock.instant());
+    tasks.resetInterrupted(List.of(GenerationTaskType.EMBEDDING_REBUILD), clock.instant());
     executor =
         Executors.newSingleThreadExecutor(
             runnable -> {
@@ -107,18 +137,80 @@ public final class DurableEmbeddingRebuildWorker implements SmartLifecycle {
 
   private void process(GenerationTask task) {
     try {
-      RebuildResult result = rebuild.rebuild(task.versionId());
-      tasks.complete(
-          task,
-          KnowledgeDomain.sha256(result.fingerprint() + "|chunks=" + result.chunkCount()),
-          clock.instant());
+      var gate = tasks.publication(task);
+      try (var budget = CompilationExecutionBudget.open(task.stageDeadline(), gate, clock)) {
+        gate.captureInputs(List.of(task.versionId()));
+        RebuildResult result =
+            publicationWriter == null
+                ? rebuild.rebuild(task.versionId())
+                : rebuild.rebuild(task.versionId(), execution(task, gate));
+        tasks.complete(
+            task,
+            KnowledgeDomain.sha256(result.fingerprint() + "|chunks=" + result.chunkCount()),
+            clock.instant());
+      }
     } catch (RuntimeException failure) {
-      // During a graceful application stop leave the row RUNNING. The repository resets it to
-      // PENDING on the next startup, preserving the resumable task rather than recording a false
-      // terminal failure.
+      // Leave an interrupted stage RUNNING until its database deadline expires.
+      // A different process starting is never evidence that the old executor has stopped.
       if (Thread.currentThread().isInterrupted()) return;
-      tasks.fail(task.taskId(), "EMBEDDING_REBUILD_FAILED", failure.getMessage(), clock.instant());
+      GenerationTaskFailureHandler.persist(
+          tasks, task, "EMBEDDING_REBUILD_FAILED", failure, clock.instant());
     }
+  }
+
+  private RawExecution execution(GenerationTask task, CompilationPublication gate) {
+    return new RawExecution() {
+      private String documentId;
+      private long aclVersion;
+
+      public String projectionScope() {
+        return task.taskId() + ":e" + task.executionEpoch();
+      }
+
+      public void check() {
+        tasks.withinPublication(task, () -> {});
+      }
+
+      public void phase(ProgressStage stage) {
+        check();
+      }
+
+      public void bind(String document, String version) {
+        if (!task.versionId().equals(version))
+          throw new IllegalStateException("rebuild source differs from claimed task");
+        gate.publish(
+            () -> {
+              long current = publicationWriter.sourceAcl(document, version);
+              if (current != task.sourceAclVersion())
+                throw new IllegalStateException("rebuild source permission changed");
+              if (documentId != null && (!documentId.equals(document) || aclVersion != current))
+                throw new IllegalStateException("rebuild input binding cannot change");
+              documentId = document;
+              aclVersion = current;
+            });
+      }
+
+      public void fenced(Runnable mutation) {
+        gate.publish(mutation);
+      }
+
+      public void publish(String document, String version, List<String> ids, Runnable mutation) {
+        if (documentId == null || !documentId.equals(document) || !task.versionId().equals(version))
+          throw new IllegalStateException("rebuild publication source has not been bound");
+        gate.publish(
+            () ->
+                publicationWriter.publish(
+                    projectionScope(),
+                    null,
+                    task.taskId(),
+                    task.executionEpoch(),
+                    document,
+                    version,
+                    aclVersion,
+                    ids,
+                    mutation));
+      }
+    };
   }
 
   private static <T> T require(T value, String name) {

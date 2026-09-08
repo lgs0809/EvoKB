@@ -1,11 +1,13 @@
 package cn.lgs.knowledgebase.interfaces.mcp;
 
 import cn.lgs.knowledgebase.application.KnowledgeGenerationRecommendationService;
+import cn.lgs.knowledgebase.application.access.KnowledgeAccessService;
 import cn.lgs.knowledgebase.application.port.Ports.SourcePackageService;
 import cn.lgs.knowledgebase.application.retrieval.RetrievalApplicationService;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.SearchFilters;
 import java.util.List;
 import java.util.Map;
+import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 
@@ -13,14 +15,17 @@ public final class EnterpriseMcpTools {
   private final RetrievalApplicationService retrieval;
   private final KnowledgeGenerationRecommendationService recommendations;
   private final SourcePackageService packages;
+  private final KnowledgeAccessService access;
 
   public EnterpriseMcpTools(
       RetrievalApplicationService retrieval,
       KnowledgeGenerationRecommendationService recommendations,
-      SourcePackageService packages) {
+      SourcePackageService packages,
+      KnowledgeAccessService access) {
     this.retrieval = retrieval;
     this.recommendations = recommendations;
     this.packages = packages;
+    this.access = access;
   }
 
   @Tool(
@@ -32,12 +37,17 @@ public final class EnterpriseMcpTools {
       @ToolParam(description = "Optional source department") String sourceDepartment,
       @ToolParam(description = "Optional material category") String materialCategory,
       @ToolParam(description = "Optional document type") String documentType,
-      @ToolParam(description = "Maximum final results, normally 1-20") Integer limit) {
+      @ToolParam(description = "Maximum final results, normally 1-20") Integer limit,
+      ToolContext context) {
+    String userId = McpIdentityContext.userId(context);
     SearchFilters filters =
         new SearchFilters(
             blank(sourceDepartment), blank(materialCategory), blank(documentType), List.of());
-    var result = retrieval.search(query, filters, limit == null ? 10 : limit);
-    recommendations.recordDeliveredSearch(query, filters, result);
+    var result =
+        retrieval.searchCurrent(
+            query, () -> access.filters(userId, filters), limit == null ? 10 : limit);
+    access.requireResults(userId, result.results());
+    recommendations.recordDeliveredSearch(query, access.filters(userId, filters), result);
     var items =
         result.results().stream()
             .map(
@@ -48,17 +58,19 @@ public final class EnterpriseMcpTools {
                         "score", r.candidate().score(),
                         "evidence", r.evidence()))
             .toList();
+    access.requireResults(userId, result.results());
     return Map.of("search_id", result.searchId(), "results", items);
   }
 
   @Tool(
       name = "package_sources",
       description =
-          "Package original source files for selected evidence IDs into a ZIP with a manifest and return a temporary download URL.")
+          "Package accessible original source files for selected evidence IDs into a ZIP with a manifest. The returned application download URL requires the same authenticated user.")
   public Object packageSources(
       @ToolParam(description = "Evidence IDs returned by search_knowledge")
-          List<String> evidenceIds) {
-    return packages.packageSources(evidenceIds);
+          List<String> evidenceIds,
+      ToolContext context) {
+    return packages.packageSources(McpIdentityContext.userId(context), evidenceIds);
   }
 
   private static String blank(String value) {

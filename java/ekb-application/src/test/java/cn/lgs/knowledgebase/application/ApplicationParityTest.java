@@ -203,10 +203,7 @@ class ApplicationParityTest {
 
     var response =
         service.answerFromResults(
-            "投资与决策委员会由几名董事组成，其中独立董事几名？",
-            "search",
-            List.of(resultWithEvidence(evidence)),
-            Ports.ModelRole.SMALL);
+            "投资与决策委员会由几名董事组成，其中独立董事几名？", "search", separateChunks(evidence), Ports.ModelRole.SMALL);
 
     assertFalse(response.evidenceOnly());
     assertEquals("target", response.citations().get(0).evidence().id());
@@ -234,11 +231,159 @@ class ApplicationParityTest {
     assertEquals("ev-6", response.citations().get(0).evidence().id());
   }
 
+  @Test
+  void askRejectsCitationForOriginalExcludedByTheRenderedContextBudget() {
+    var model = new CapturingModel("第二份资料证明了结论。[2]");
+    var service = new AskApplicationService(retrievalWithSingleSource(), model, 1400);
+    var response =
+        service.answerFromResults(
+            "xyz",
+            "search",
+            separateChunks(
+                List.of(evidence("first", "A".repeat(1000)), evidence("second", "B".repeat(1000)))),
+            Ports.ModelRole.SMALL);
+
+    assertTrue(response.evidenceOnly());
+    assertFalse(model.userPrompt.contains("[SOURCE 2]"));
+    assertEquals(
+        List.of("first"), response.citations().stream().map(c -> c.evidence().id()).toList());
+  }
+
+  @Test
+  void askNeverAcceptsNinthChunkOutsideTheEightSegmentBudget() {
+    var model = new CapturingModel("结论由第九份资料证明。[9]");
+    var evidence =
+        java.util.stream.IntStream.rangeClosed(1, 12)
+            .mapToObj(i -> evidence("ev-" + i, "完整业务原文 " + i))
+            .toList();
+    var service = new AskApplicationService(retrievalWithSingleSource(), model, 24000);
+    var response =
+        service.answerFromResults("xyz", "search", separateChunks(evidence), Ports.ModelRole.SMALL);
+
+    assertTrue(response.evidenceOnly());
+    assertFalse(model.userPrompt.contains("[SOURCE 9]"));
+    assertEquals(8, response.citations().size());
+  }
+
+  @Test
+  void askKeepsWholeChineseOriginalsWithinTheTokenBudgetAndSkipsAnOversizedSource() {
+    var model = new CapturingModel("两份完整资料支持结论。[1][2]");
+    var counter =
+        new cn.lgs.knowledgebase.application.raw.RawTokenCounter() {
+          public int count(String text) {
+            return text.codePointCount(0, text.length());
+          }
+
+          public String identity() {
+            return "test-codepoint-counter";
+          }
+        };
+    var service = new AskApplicationService(retrievalWithSingleSource(), model, 24000, counter);
+    String first = "甲".repeat(3000);
+    String second = "乙".repeat(3000);
+    var response =
+        service.answerFromResults(
+            "xyz",
+            "search",
+            separateChunks(
+                List.of(
+                    evidence("too-large", "丙".repeat(6001)),
+                    evidence("first", first),
+                    evidence("second", second),
+                    evidence("over-budget", "丁"))),
+            Ports.ModelRole.SMALL);
+
+    assertFalse(response.evidenceOnly());
+    assertEquals(
+        List.of("first", "second"),
+        response.citations().stream().map(c -> c.evidence().id()).toList());
+    assertTrue(model.userPrompt.contains("Raw evidence: " + first + "\n"));
+    assertTrue(model.userPrompt.contains("Raw evidence: " + second + "\n"));
+    assertFalse(model.userPrompt.contains("丙"));
+    assertFalse(model.userPrompt.contains("丁"));
+    assertEquals(
+        service.evidenceContext(
+            "xyz",
+            List.of(
+                resultWithEvidence(
+                    List.of(
+                        evidence("first", first),
+                        evidence("first", first),
+                        evidence("second", second)))),
+            24000),
+        model.userPrompt.substring(model.userPrompt.indexOf("[SOURCE 1]")));
+  }
+
+  @Test
+  void supplementaryFocusCanRecoverAnAlreadyRetrievedSourceWithoutChangingTheQuestionOrBudget() {
+    String question = "compare atlas platform limits and timeout values";
+    var originals = new ArrayList<KnowledgeDomain.Evidence>();
+    for (int i = 0; i < 8; i++)
+      originals.add(evidence("overview-" + i, "atlas platform limits overview " + i));
+    originals.add(evidence("deadline", "timeout maximum is forty five seconds"));
+    var results = separateChunks(originals);
+    var model = new CapturingModel("The deadline is forty five seconds.[1]");
+    var service = new AskApplicationService(retrievalWithSingleSource(), model, 24000);
+
+    assertFalse(service.evidenceContext(question, results, 24000).contains("forty five"));
+    var selection = service.selectEvidence(question, List.of("timeout maximum"), results, 24000);
+    var duplicatedFocus =
+        service.selectEvidence(
+            question, List.of("timeout maximum", "timeout maximum"), results, 24000);
+    assertEquals(selection, duplicatedFocus);
+    assertEquals(8, selection.sources().size());
+    assertEquals("deadline", selection.sources().get(0).evidence().id());
+    assertTrue(selection.bodyTokens() <= 6000);
+
+    var response =
+        service.answerFromSelection(question, "search", selection, Ports.ModelRole.LARGE);
+    assertFalse(response.evidenceOnly());
+    assertEquals("deadline", response.citations().get(0).evidence().id());
+    assertTrue(model.userPrompt.startsWith("Question: " + question + "\n"));
+    assertEquals(
+        selection.rendered(), model.userPrompt.substring(model.userPrompt.indexOf("[SOURCE 1]")));
+  }
+
+  @Test
+  void derivedRetrievalRoutesStillPresentOnlyTheResolvedOriginalAsRawEvidence() {
+    var original = evidence("original", "完整原文：服务响应期限为两小时。");
+    var candidate =
+        new RetrievalDomain.Candidate(
+            "summary-candidate",
+            "doc",
+            "v1",
+            RetrievalDomain.LaneType.SUMMARY,
+            "摘要候选文字不能代替原文",
+            1.0,
+            List.of(original.id()),
+            Map.of());
+    var model = new CapturingModel("响应期限为两小时。[1]");
+    var service = new AskApplicationService(retrievalWithSingleSource(), model, 24000);
+    var response =
+        service.answerFromResults(
+            "响应期限",
+            "search",
+            List.of(new RetrievalDomain.Result(candidate, List.of(original))),
+            Ports.ModelRole.SMALL);
+
+    assertFalse(response.evidenceOnly());
+    assertEquals(original, response.citations().get(0).evidence());
+    assertTrue(
+        model.userPrompt.contains(
+            "Retrieval route: summary\nEvidence kind: RAW_SOURCE\nRaw evidence: "
+                + original.content()));
+    assertFalse(model.userPrompt.contains("Knowledge type: summary"));
+    assertFalse(model.userPrompt.contains("摘要候选文字不能代替原文"));
+  }
+
   private static RetrievalDomain.Result resultWithEvidence(
       List<KnowledgeDomain.Evidence> evidence) {
     var candidate =
         new RetrievalDomain.Candidate(
-            "raw-many",
+            "raw-"
+                + evidence.stream()
+                    .map(KnowledgeDomain.Evidence::id)
+                    .collect(java.util.stream.Collectors.joining("-")),
             "doc",
             "v1",
             RetrievalDomain.LaneType.RAW,
@@ -247,6 +392,13 @@ class ApplicationParityTest {
             evidence.stream().map(KnowledgeDomain.Evidence::id).toList(),
             Map.of());
     return new RetrievalDomain.Result(candidate, evidence);
+  }
+
+  // The passage-count tests require separate retrieved chunks. A chunk may legitimately contain
+  // several parser paragraphs; grouping all paragraphs as one result would test another budget.
+  private static List<RetrievalDomain.Result> separateChunks(
+      List<KnowledgeDomain.Evidence> evidence) {
+    return evidence.stream().map(e -> resultWithEvidence(List.of(e))).toList();
   }
 
   private static RetrievalApplicationService retrievalWithSingleSource() {
@@ -321,6 +473,10 @@ class ApplicationParityTest {
         String systemPrompt,
         String userPrompt,
         Class<T> outputType) {
+      if (task == Ports.ModelTask.ANSWER_VERIFICATION)
+        return outputType.cast(
+            new cn.lgs.knowledgebase.application.ask.AnswerGroundingVerifier.Output(
+                true, true, true, "synthetic supported answer", List.of()));
       throw new UnsupportedOperationException();
     }
   }
@@ -344,6 +500,10 @@ class ApplicationParityTest {
         String systemPrompt,
         String userPrompt,
         Class<T> outputType) {
+      if (task == Ports.ModelTask.ANSWER_VERIFICATION)
+        return outputType.cast(
+            new cn.lgs.knowledgebase.application.ask.AnswerGroundingVerifier.Output(
+                true, true, true, "synthetic supported answer", List.of()));
       throw new UnsupportedOperationException();
     }
   }

@@ -1,6 +1,7 @@
 package cn.lgs.knowledgebase.application.compilation;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -27,6 +28,342 @@ import org.junit.jupiter.api.Test;
 
 class ConceptCompilationServiceTest {
   private static final Instant NOW = Instant.parse("2026-08-20T00:00:00Z");
+
+  @Test
+  void shortModelReferencesPersistCanonicalFactsAndOnlyTheirEvidence() {
+    Fixture f =
+        new Fixture(
+            summary(groundedFact("uuid-b", "第二个对象", "e2"), groundedFact("uuid-a", "第一个对象", "e1")));
+    f.model.output =
+        proposals(proposal("第一个对象", List.of(), "CONTRACT", "资料锚点", List.of("F001", "uuid-a"), 0.9));
+    var calls = new java.util.ArrayList<List<Object>>();
+    var result =
+        new ConceptCompilationService(
+                f.repo,
+                f.model,
+                recordingEmbedding(input -> List.of(List.of(1f))),
+                recordingIndex(calls))
+            .compileSummary("s1");
+    assertEquals(List.of("uuid-a"), result.concepts().get(0).factIds());
+    assertEquals(List.of("e1"), calls.get(0).get(2));
+    assertTrue(f.model.prompt.contains("<fact id=\"F001\""));
+    assertFalse(f.model.prompt.contains("<fact id=\"uuid-a\""));
+  }
+
+  @Test
+  void inventedShortReferenceAndNonFiniteConfidenceFailBeforePublishing() {
+    for (var candidate :
+        List.of(
+            proposal("对象", List.of(), "CONTRACT", "资料", List.of("F999"), 0.9),
+            proposal("对象", List.of(), "CONTRACT", "资料", List.of("F001"), Double.NaN),
+            proposal(
+                "对象", List.of(), "CONTRACT", "资料", List.of("F001"), Double.POSITIVE_INFINITY))) {
+      Fixture f = new Fixture(summary(groundedFact("uuid", "对象", "e1")));
+      f.model.output = proposals(candidate);
+      assertThrows(IllegalStateException.class, () -> f.service.compileSummary("s1"));
+      assertTrue(f.repo.conceptsBySummary.isEmpty());
+    }
+  }
+
+  @Test
+  void groundedConceptPublishesCompactProjectionWithOnlyItsOwnEvidence() {
+    Fixture f =
+        new Fixture(
+            summary(
+                groundedFact("f1", "很长的合同原文不得作为概念向量内容", "e1"),
+                groundedFact("f2", "另外一个不参与本条目的事实", "e2")));
+    f.model.output =
+        proposals(
+            proposal("采购合同", List.of("设备合同"), "CONTRACT", "覆盖设备采购与验收付款资料", List.of("f1"), 0.95));
+    var encoded = new java.util.ArrayList<String>();
+    Ports.EmbeddingPort embedding =
+        recordingEmbedding(
+            input -> {
+              encoded.addAll(input);
+              return List.of(List.of(1f));
+            });
+    var calls = new java.util.ArrayList<List<Object>>();
+    var derived = recordingIndex(calls);
+    var result =
+        new ConceptCompilationService(f.repo, f.model, embedding, derived).compileSummary("s1");
+    assertTrue(encoded.get(0).contains("采购合同"));
+    assertTrue(encoded.get(0).contains("设备合同"));
+    assertFalse(encoded.get(0).contains("很长的合同原文"));
+    assertEquals(1, calls.size());
+    assertEquals(result.concepts().get(0).id(), calls.get(0).get(0));
+    assertEquals(encoded.get(0), calls.get(0).get(1));
+    assertEquals(List.of("e1"), calls.get(0).get(2));
+    assertEquals(List.of(1f), calls.get(0).get(4));
+  }
+
+  @Test
+  void failedConceptEmbeddingDoesNotPublishASuccessfulProjection() {
+    Fixture f = new Fixture(summary(groundedFact("f1", "合同事实", "e1")));
+    f.model.output =
+        proposals(proposal("采购合同", List.of(), "CONTRACT", "采购合同资料", List.of("f1"), 0.95));
+    Ports.EmbeddingPort embedding =
+        recordingEmbedding(
+            input -> {
+              throw new IllegalStateException("unavailable");
+            });
+    var calls = new java.util.ArrayList<List<Object>>();
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            new ConceptCompilationService(f.repo, f.model, embedding, recordingIndex(calls))
+                .compileSummary("s1"));
+    assertTrue(calls.isEmpty());
+    assertTrue(f.repo.conceptsBySummary.isEmpty());
+  }
+
+  @Test
+  void legacyCandidateMetadataFailsBeforeEnteringTheConceptModel() {
+    Fixture f = new Fixture(summary(groundedFact("f1", "当前来源的完整事实", "e1")));
+    var historical = legacySummary();
+    f.repo.summaries.put(historical.id(), historical);
+    var entry = entryWithLegacyMember(historical.id());
+    f.model.output = proposals();
+    var service =
+        new ConceptCompilationService(
+            f.repo,
+            f.model,
+            recordingEmbedding(input -> List.of(List.of(1f))),
+            recordingIndex(new java.util.ArrayList<>()),
+            catalogue(entry));
+    assertThrows(IllegalStateException.class, () -> service.compileSummary("s1"));
+    assertEquals(
+        0, f.model.calls, "Historical PASS metadata is not current audited model evidence");
+    assertTrue(f.repo.conceptsBySummary.isEmpty());
+  }
+
+  @Test
+  void legacyRetainedMemberCannotCreateAFreshStableConceptProjection() {
+    assertEntryRebuildRejectedBeforeEncoding(true);
+  }
+
+  @Test
+  void missingRetainedMemberCannotBeSilentlyDroppedFromFreshProjectionInputs() {
+    assertEntryRebuildRejectedBeforeEncoding(false);
+  }
+
+  @Test
+  void fullyAuditedCandidateMetadataCanEnterTheModel() {
+    Fixture f = new Fixture(summary(groundedFact("f1", "当前来源的完整事实", "e1")));
+    var historical = auditedSecondSummary();
+    f.repo.summaries.put(historical.id(), historical);
+    f.model.output = proposals();
+    var service =
+        new ConceptCompilationService(
+            f.repo,
+            f.model,
+            recordingEmbedding(input -> List.of(List.of(1f))),
+            recordingIndex(new java.util.ArrayList<>()),
+            catalogue(entryWithLegacyMember(historical.id())));
+    assertThrows(IllegalStateException.class, () -> service.compileSummary("s1"));
+    assertEquals(1, f.model.calls);
+    assertTrue(f.model.prompt.contains("来源组合说明"));
+  }
+
+  @Test
+  void fullyAuditedRetainedMembersKeepTheStableProjectionAndAllSourceProofs() {
+    Fixture f = new Fixture(summary(groundedFact("f1", "当前来源的完整事实", "e1")));
+    var historical = auditedSecondSummary();
+    f.repo.summaries.put(historical.id(), historical);
+    f.repo.conceptsBySummary.put(
+        "s1",
+        List.of(
+            new ConceptRecord(
+                "c1",
+                "s1",
+                "v1",
+                "当前条目",
+                List.of(),
+                "CONTRACT",
+                "当前条目说明",
+                List.of("f1"),
+                "ACTIVE",
+                "synthetic-concept",
+                NOW)));
+    var calls = new java.util.ArrayList<List<Object>>();
+    var service =
+        new ConceptCompilationService(
+            f.repo,
+            f.model,
+            recordingEmbedding(input -> List.of(List.of(1f))),
+            recordingIndex(calls),
+            catalogue(entryWithLegacyMember(historical.id())));
+    service.rebuildProjections("s1");
+    assertEquals(1, calls.size());
+    assertEquals("entry-1", calls.get(0).get(0));
+    assertEquals(List.of("e1", "legacy-evidence"), calls.get(0).get(2));
+    assertEquals(0, f.model.calls);
+  }
+
+  private static void assertEntryRebuildRejectedBeforeEncoding(boolean presentLegacy) {
+    Fixture f = new Fixture(summary(groundedFact("f1", "当前来源的完整事实", "e1")));
+    var historical = legacySummary();
+    if (presentLegacy) f.repo.summaries.put(historical.id(), historical);
+    f.repo.conceptsBySummary.put(
+        "s1",
+        List.of(
+            new ConceptRecord(
+                "c1",
+                "s1",
+                "v1",
+                "当前条目",
+                List.of(),
+                "CONTRACT",
+                "当前条目说明",
+                List.of("f1"),
+                "ACTIVE",
+                "synthetic-concept",
+                NOW)));
+    var encoded = new java.util.ArrayList<String>();
+    var calls = new java.util.ArrayList<List<Object>>();
+    var service =
+        new ConceptCompilationService(
+            f.repo,
+            f.model,
+            recordingEmbedding(
+                input -> {
+                  encoded.addAll(input);
+                  return List.of(List.of(1f));
+                }),
+            recordingIndex(calls),
+            catalogue(entryWithLegacyMember(historical.id())));
+    assertThrows(IllegalStateException.class, () -> service.rebuildProjections("s1"));
+    assertTrue(encoded.isEmpty(), "All retained inputs must be certified before actual encoding");
+    assertTrue(calls.isEmpty());
+    if (presentLegacy) assertEquals(historical, f.repo.summaries.get(historical.id()));
+  }
+
+  private static SummaryRecord legacySummary() {
+    var fact =
+        new SummaryFact(
+            "legacy-fact",
+            "s2",
+            "历史事实",
+            "历史来源的完整事实",
+            List.of("legacy-block"),
+            List.of("legacy-evidence"),
+            "PASS",
+            "historical unreviewed PASS");
+    return new SummaryRecord(
+        "s2",
+        "u2",
+        "d2",
+        "v2",
+        "synthetic/history.md",
+        "synthetic-hash",
+        "PASS",
+        "PASS",
+        "ACTIVE",
+        "historical-model",
+        "# Historical",
+        List.of(fact),
+        NOW);
+  }
+
+  private static SummaryRecord auditedSecondSummary() {
+    var old = legacySummary();
+    var f = old.facts().get(0);
+    var audited =
+        new SummaryFact(
+            f.id(),
+            f.summaryId(),
+            f.section(),
+            f.factText(),
+            f.evidenceBlockIds(),
+            f.evidenceIds(),
+            f.groundingStatus(),
+            "independent synthetic current source proof",
+            GroundingConstraintAudit.accepted(
+                f.factText(),
+                GroundingConstraintAudit.exactCopyChecks(f.factText(), List.of(f.factText()))));
+    return new SummaryRecord(
+        old.id(),
+        old.unitId(),
+        old.documentId(),
+        old.versionId(),
+        old.objectKey(),
+        old.contentHash(),
+        old.groundingStatus(),
+        old.coverageStatus(),
+        old.lifecycle(),
+        old.model(),
+        old.markdown(),
+        List.of(audited),
+        old.createdAt());
+  }
+
+  private static KnowledgeEntryCatalogue.Entry entryWithLegacyMember(String summaryId) {
+    return new KnowledgeEntryCatalogue.Entry(
+        "entry-1",
+        1,
+        "synthetic-scope",
+        Map.of("identity_status", "SOURCE_SCOPED"),
+        "CONTRACT",
+        "当前条目",
+        List.of(),
+        "来源组合说明",
+        "CONCEPT",
+        "ACTIVE",
+        List.of(
+            new KnowledgeEntryCatalogue.Source("d1", "v1", "s1", "c1", 1, List.of("f1")),
+            new KnowledgeEntryCatalogue.Source(
+                "d2", "v2", summaryId, "c2", 1, List.of("legacy-fact"))),
+        List.of(
+            new KnowledgeEntryCatalogue.BuildInput("s1", "v1", 1),
+            new KnowledgeEntryCatalogue.BuildInput(summaryId, "v2", 1)));
+  }
+
+  private static KnowledgeEntryCatalogue catalogue(KnowledgeEntryCatalogue.Entry entry) {
+    return (KnowledgeEntryCatalogue)
+        java.lang.reflect.Proxy.newProxyInstance(
+            KnowledgeEntryCatalogue.class.getClassLoader(),
+            new Class<?>[] {KnowledgeEntryCatalogue.class},
+            (proxy, method, args) -> {
+              if (method.getName().equals("candidates"))
+                return List.of(
+                    new KnowledgeEntryCatalogue.Candidate(
+                        entry,
+                        entry.label(),
+                        entry.aliases(),
+                        entry.description(),
+                        entry.buildInputs(),
+                        true));
+              if (method.getName().equals("conceptEntriesForSummary")) return List.of(entry);
+              throw new AssertionError("Unexpected catalogue operation: " + method.getName());
+            });
+  }
+
+  private static Ports.EmbeddingPort recordingEmbedding(
+      java.util.function.Function<List<String>, List<List<Float>>> embed) {
+    return new Ports.EmbeddingPort() {
+      public int dimensions() {
+        return 1024;
+      }
+
+      public List<List<Float>> embed(List<String> values) {
+        return embed.apply(values);
+      }
+    };
+  }
+
+  private static Ports.DerivedSearchIndex recordingIndex(List<List<Object>> calls) {
+    return (Ports.DerivedSearchIndex)
+        java.lang.reflect.Proxy.newProxyInstance(
+            Ports.DerivedSearchIndex.class.getClassLoader(),
+            new Class<?>[] {Ports.DerivedSearchIndex.class},
+            (proxy, method, args) -> {
+              if (method.isDefault() && !method.getName().equals("indexConcept"))
+                return java.lang.reflect.InvocationHandler.invokeDefault(proxy, method, args);
+              if (!method.getName().equals("indexConcept"))
+                throw new AssertionError("unexpected index operation: " + method.getName());
+              calls.add(java.util.Arrays.asList(args));
+              return null;
+            });
+  }
 
   @Test
   void conceptRequiresAtLeastOneSupportingFact() {
@@ -133,7 +470,16 @@ class ConceptCompilationServiceTest {
 
   private static SummaryFact groundedFact(String id, String text, String evidenceId) {
     return new SummaryFact(
-        id, "s1", "事实", text, List.of("block-" + id), List.of(evidenceId), "PASS", "direct");
+        id,
+        "s1",
+        "事实",
+        text,
+        List.of("block-" + id),
+        List.of(evidenceId),
+        "PASS",
+        "synthetic audited fixture",
+        GroundingConstraintAudit.accepted(
+            text, GroundingConstraintAudit.exactCopyChecks(text, List.of(text))));
   }
 
   private static SummaryRecord summary(SummaryFact... facts) {
@@ -183,6 +529,7 @@ class ConceptCompilationServiceTest {
   private static final class FakeModel implements Ports.KnowledgeModel {
     Object output;
     int calls;
+    String prompt;
 
     @Override
     public String identity(Ports.ModelRole role) {
@@ -205,6 +552,7 @@ class ConceptCompilationServiceTest {
       assertEquals(Ports.ModelRole.LARGE, role);
       assertEquals(Ports.ModelTask.CONCEPT_EXTRACT, task);
       calls++;
+      prompt = userPrompt;
       return outputType.cast(output);
     }
   }
@@ -219,7 +567,36 @@ class ConceptCompilationServiceTest {
 
     @Override
     public VersionSource loadVersionSource(String versionId) {
-      throw new UnsupportedOperationException();
+      var evidence =
+          new LinkedHashMap<
+              String, cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence>();
+      for (var summary : summaries.values()) {
+        if (!summary.versionId().equals(versionId)) continue;
+        for (var fact : summary.facts()) {
+          if (fact.evidenceIds().isEmpty() || fact.evidenceBlockIds().isEmpty()) continue;
+          var block = fact.evidenceBlockIds().get(0);
+          evidence.put(
+              block,
+              new cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence(
+                  fact.evidenceIds().get(0),
+                  summary.documentId(),
+                  versionId,
+                  block,
+                  "synthetic-original",
+                  Map.of(),
+                  fact.factText(),
+                  "synthetic-hash"));
+        }
+      }
+      return new VersionSource(
+          "d1",
+          versionId,
+          "Synthetic orchestration source",
+          "",
+          new cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Metadata(
+              "法务", "公告", List.of(), "甲公司", null, "公告"),
+          List.of(),
+          evidence);
     }
 
     @Override
@@ -301,7 +678,8 @@ class ConceptCompilationServiceTest {
 
     @Override
     public Ports.DerivedContext derivedContextForSummaries(List<String> summaryIds) {
-      throw new UnsupportedOperationException();
+      return new Ports.DerivedContext(
+          List.of("d1"), List.of("v1"), List.of(), List.of(), List.of(), List.of(), List.of());
     }
   }
 }

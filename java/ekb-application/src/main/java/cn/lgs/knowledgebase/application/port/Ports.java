@@ -22,6 +22,7 @@ import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryGroup;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryPackage;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.QuerySession;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryTurn;
+import cn.lgs.knowledgebase.domain.query.QueryDomain.RetrievalReservation;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.RetrievalRound;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Candidate;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.LaneType;
@@ -134,6 +135,94 @@ public final class Ports {
     void complete(String fileId, String documentId, String versionId, Instant now);
 
     void fail(String fileId, String errorCode, String errorMessage, Instant now);
+
+    record RawOutbox(String fileId, long deliveryEpoch) {}
+
+    default List<RawOutbox> rawDispatchable(int limit) {
+      throw new UnsupportedOperationException("durable raw outbox");
+    }
+
+    default void rawDispatched(RawOutbox row, String messageId) {
+      throw new UnsupportedOperationException("durable raw outbox");
+    }
+
+    default Optional<cn.lgs.knowledgebase.application.raw.RawTaskClaim> claimRaw(
+        String fileId, String ownerId) {
+      throw new UnsupportedOperationException("durable raw ownership");
+    }
+
+    default cn.lgs.knowledgebase.application.raw.RawExecution rawExecution(
+        cn.lgs.knowledgebase.application.raw.RawTaskClaim claim) {
+      throw new UnsupportedOperationException("durable raw fencing");
+    }
+
+    default boolean rawRecoverable(String fileId) {
+      throw new UnsupportedOperationException("durable raw recovery");
+    }
+
+    default boolean rawAcknowledgeable(String fileId) {
+      throw new UnsupportedOperationException("durable raw acknowledgement");
+    }
+
+    default void rawFailure(
+        cn.lgs.knowledgebase.application.raw.RawTaskClaim claim,
+        String code,
+        String message,
+        boolean retryable) {
+      throw new UnsupportedOperationException("durable raw failure");
+    }
+
+    default void rawComplete(
+        cn.lgs.knowledgebase.application.raw.RawTaskClaim claim,
+        String documentId,
+        String versionId) {
+      throw new UnsupportedOperationException("durable raw completion");
+    }
+
+    default void rawRejectDelivery(String messageId, String fileReference) {
+      throw new UnsupportedOperationException("durable raw poison isolation");
+    }
+
+    /** Commit a missing-body fact and any required redispatch before its PEL tombstone is ACKed. */
+    default void rawMissingDelivery(String messageId) {
+      throw new UnsupportedOperationException("durable raw missing-body recovery");
+    }
+
+    default Optional<String> rawOriginalObject(String fileId) {
+      return Optional.empty();
+    }
+
+    record ReparseSource(
+        String versionId, String originalFilename, String sourceSha256, long sizeBytes) {}
+
+    record ReparseReservation(
+        String batchId, String fileId, String versionId, String pipelineSha256, boolean reused) {}
+
+    /** Fresh owner/admin and source clearance checks precede observing the external parser. */
+    default ReparseSource reparseSource(String actorId, String versionId) {
+      throw new UnsupportedOperationException("Explicit normal reparse is unavailable");
+    }
+
+    /** Atomic idempotent reservation; no original/model/object I/O inside this transaction. */
+    default ReparseReservation reserveReparse(
+        String actorId,
+        ReparseSource source,
+        cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity actualPipeline,
+        Instant now) {
+      throw new UnsupportedOperationException("Explicit normal reparse reservation is unavailable");
+    }
+
+    /** Complete original bytes were streamed and hashed by the worker before any indexing. */
+    default void rawVerifyOriginal(
+        cn.lgs.knowledgebase.application.raw.RawTaskClaim claim, SourceFile source) {}
+
+    default void rawVerifyOriginal(
+        cn.lgs.knowledgebase.application.raw.RawTaskClaim claim,
+        SourceFile source,
+        String actualPipelineSha256) {
+      throw new UnsupportedOperationException(
+          "Current pipeline original verification is unavailable");
+    }
   }
 
   public interface ObjectStore {
@@ -153,6 +242,30 @@ public final class Ports {
   public record ObjectInfo(String key, long size, String contentType, String etag) {}
 
   public interface ParserPort {
+    default Optional<cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity> currentPipeline(
+        String filename) {
+      return Optional.empty();
+    }
+
+    default ParsedDocument parse(
+        String filename,
+        InputStream source,
+        String resumeTaskId,
+        Consumer<String> taskIdSink,
+        cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity expectedPipeline) {
+      return parse(filename, source, resumeTaskId, taskIdSink);
+    }
+
+    default ParsedDocument parse(
+        String filename,
+        InputStream source,
+        String resumeTaskId,
+        Consumer<String> taskIdSink,
+        cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity expectedPipeline,
+        String expectedSourceSha256) {
+      return parse(filename, source, resumeTaskId, taskIdSink, expectedPipeline);
+    }
+
     ParsedDocument parse(String filename, InputStream source);
 
     default ParsedDocument parse(
@@ -186,12 +299,60 @@ public final class Ports {
 
     List<List<Float>> embed(List<String> texts);
 
+    /** A currently resident, actually certified encoder. This must not load a model. */
+    default Optional<EncodingIdentity> currentEncodingIdentity() {
+      return Optional.empty();
+    }
+
+    /** Identity authenticated against every complete input and returned float32 vector. */
+    default EmbeddingBatch embedWithIdentity(List<String> texts) {
+      return new EmbeddingBatch(embed(texts), Optional.empty());
+    }
+
     /**
      * Preferred durable ingestion batch size. Implementations may expose the runtime model
      * configuration; test and lightweight implementations can keep the conservative default.
      */
     default int preferredBatchSize() {
       return 16;
+    }
+  }
+
+  public record EncodingIdentity(
+      String profileSha256, String model, String modelRevision, int dimensions) {
+    public EncodingIdentity {
+      if (profileSha256 == null || !profileSha256.matches("[0-9a-f]{64}"))
+        throw new IllegalArgumentException("encoding profile SHA-256 required");
+      if (model == null || model.isBlank() || modelRevision == null || modelRevision.isBlank())
+        throw new IllegalArgumentException("encoding model and actual revision required");
+      if (dimensions <= 0)
+        throw new IllegalArgumentException("encoding dimensions must be positive");
+    }
+  }
+
+  public record EmbeddingBatch(
+      List<List<Float>> vectors, List<Optional<EncodingIdentity>> identities) {
+    public EmbeddingBatch(List<List<Float>> vectors, Optional<EncodingIdentity> identity) {
+      this(vectors, java.util.Collections.nCopies(vectors.size(), identity));
+    }
+
+    public EmbeddingBatch {
+      if (vectors == null
+          || identities == null
+          || vectors.size() != identities.size()
+          || identities.stream().anyMatch(java.util.Objects::isNull))
+        throw new IllegalArgumentException("embedding vectors and explicit identity required");
+      vectors = List.copyOf(vectors);
+      identities = List.copyOf(identities);
+      if (identities.stream().flatMap(Optional::stream).distinct().count() > 1)
+        throw new IllegalStateException(
+            "ENCODING_PROFILE_MISMATCH: split batches used different runtimes");
+    }
+
+    public Optional<EncodingIdentity> identity() {
+      return identities.isEmpty() || identities.stream().anyMatch(Optional::isEmpty)
+          ? Optional.empty()
+          : identities.get(0);
     }
   }
 
@@ -240,13 +401,55 @@ public final class Ports {
 
     Optional<DocumentVersion> findVersionBySha(String documentId, String sha256);
 
+    default Optional<DocumentVersion> findVersionBySourceAndPipeline(
+        String documentId, String sha256, String pipelineSha256) {
+      throw new UnsupportedOperationException(
+          "Current parser pipeline source lookup is unavailable");
+    }
+
+    default Optional<cn.lgs.knowledgebase.application.raw.RawParseCheckpoint> parseCheckpoint(
+        String versionId) {
+      return Optional.empty();
+    }
+
+    default void bindParserPipeline(String versionId, String pipelineSha256) {
+      throw new UnsupportedOperationException("Actual parser pipeline reservation is unavailable");
+    }
+
     Optional<DocumentVersion> currentActiveVersion(String documentId);
 
     long nextVersionNo(String documentId);
 
     void createPendingVersion(Document document, DocumentVersion version, Metadata metadata);
 
+    default void createPendingVersion(
+        Document document, DocumentVersion version, Metadata metadata, Integer securityLevel) {
+      if (securityLevel != null)
+        throw new UnsupportedOperationException("initial document classification is unavailable");
+      createPendingVersion(document, version, metadata);
+    }
+
+    default void createPendingVersion(
+        Document document,
+        DocumentVersion version,
+        Metadata metadata,
+        Integer securityLevel,
+        String actualPipelineSha256) {
+      throw new UnsupportedOperationException("Current pipeline source creation is unavailable");
+    }
+
     void resetFailedVersion(String versionId, Metadata metadata, boolean preserveParsed);
+
+    default void resetFailedVersion(
+        String versionId, Metadata metadata, boolean preserveParsed, Integer securityLevel) {
+      if (securityLevel != null)
+        throw new UnsupportedOperationException("initial document classification is unavailable");
+      resetFailedVersion(versionId, metadata, preserveParsed);
+    }
+
+    default Optional<Integer> sourceSecurityLevel(String versionId) {
+      return Optional.empty();
+    }
 
     List<RawBlock> rawBlocks(String versionId);
 
@@ -258,6 +461,19 @@ public final class Ports {
         String parserVersion,
         List<RawBlock> blocks,
         List<Evidence> evidence);
+
+    default void saveParsed(
+        String versionId,
+        String markdownKey,
+        String structuredKey,
+        String parserName,
+        String parserVersion,
+        List<RawBlock> blocks,
+        List<Evidence> evidence,
+        cn.lgs.knowledgebase.application.raw.RawParseCheckpoint checkpoint) {
+      throw new UnsupportedOperationException(
+          "Atomic current parser checkpoint persistence is unavailable");
+    }
 
     void activateVersion(String documentId, String versionId);
 
@@ -287,6 +503,19 @@ public final class Ports {
     void ensureIndex(int embeddingDimensions);
 
     void indexRaw(String documentId, String versionId, List<RawIndexDocument> chunks);
+
+    /** Each attempt writes immutable physical IDs; current PG membership decides visibility. */
+    default List<String> stageRaw(
+        String documentId, String versionId, String scope, List<RawIndexDocument> chunks) {
+      if (scope != null && !scope.isBlank())
+        throw new UnsupportedOperationException("immutable raw projections");
+      indexRaw(documentId, versionId, chunks);
+      return chunks.stream().map(RawIndexDocument::id).toList();
+    }
+
+    default void activateRaw(String documentId, String versionId, List<String> physicalIds) {
+      activateVersion(documentId, versionId);
+    }
 
     /**
      * Index rebuilt vectors while retaining the active flag of an existing document. This keeps an
@@ -346,8 +575,16 @@ public final class Ports {
     List<Candidate> search(String query, SearchFilters filters, int limit);
   }
 
+  public interface SourceVersionAuthority {
+    boolean accessible(List<String> versionIds, SearchFilters filters);
+  }
+
   public interface EvidenceResolver {
     List<Evidence> resolve(List<String> evidenceIds);
+
+    default List<Evidence> resolve(List<String> evidenceIds, SearchFilters filters) {
+      return resolve(evidenceIds);
+    }
   }
 
   public interface DerivedArtifactRepository {
@@ -367,9 +604,32 @@ public final class Ports {
 
     void upsertRelations(List<Relation> relations);
 
+    default void publish(List<Entity> entities, List<Relation> relations) {
+      upsertEntities(entities);
+      upsertRelations(relations);
+    }
+
+    /** Publish every frozen model input, including uncited inputs that influenced metadata. */
+    default void publish(
+        List<Entity> entities, List<Relation> relations, List<String> inputVersionIds) {
+      publish(entities, relations);
+    }
+
     List<Candidate> search(String query, SearchFilters filters, int limit);
 
+    default GraphExpansion expand(List<Candidate> retrievedSeeds, SearchFilters filters) {
+      return new GraphExpansion(List.of(), false, 0);
+    }
+
     void deactivateVersion(String versionId);
+  }
+
+  public record GraphExpansion(List<Candidate> candidates, boolean truncated, int hops) {
+    public GraphExpansion {
+      candidates = candidates == null ? List.of() : List.copyOf(candidates);
+      if (hops < 0 || hops > 2)
+        throw new IllegalArgumentException("graph expansion is capped at two hops");
+    }
   }
 
   public interface DerivedSearchIndex {
@@ -378,6 +638,34 @@ public final class Ports {
     void indexSummary(SummaryArtifact summary, DerivedContext context, List<Float> embedding);
 
     void indexWiki(WikiPage page, DerivedContext context, List<Float> embedding);
+
+    /** Prepare external projections before the authoritative publication transaction. */
+    default Runnable prepareSummary(
+        SummaryArtifact summary, DerivedContext context, List<Float> embedding) {
+      return () -> indexSummary(summary, context, embedding);
+    }
+
+    default Runnable prepareWiki(WikiPage page, DerivedContext context, List<Float> embedding) {
+      return () -> indexWiki(page, context, embedding);
+    }
+
+    default Runnable prepareConcept(
+        String id,
+        String text,
+        List<String> evidenceIds,
+        DerivedContext context,
+        List<Float> embedding) {
+      return () -> indexConcept(id, text, evidenceIds, context, embedding);
+    }
+
+    default void indexConcept(
+        String assetId,
+        String projection,
+        List<String> evidenceIds,
+        DerivedContext context,
+        List<Float> embedding) {
+      throw new UnsupportedOperationException("concept projection is unsupported by this adapter");
+    }
 
     List<Candidate> searchSummaryBm25(String query, SearchFilters filters, int limit);
 
@@ -420,10 +708,12 @@ public final class Ports {
     ASK,
     QUERY_UNDERSTANDING,
     EVIDENCE_SUFFICIENCY,
+    ANSWER_VERIFICATION,
     CLASSIFY_UNIT,
     SUMMARY,
     SUMMARY_JUDGE,
     CONCEPT_EXTRACT,
+    SOURCE_ASSOCIATION,
     RELATION_EXTRACT,
     RELATION_REPAIR,
     WIKI_WRITE,
@@ -452,6 +742,14 @@ public final class Ports {
 
     void updateSession(QuerySession session);
 
+    /** Commit the accepted session and its initial message together, without external I/O. */
+    void createSessionWithTurn(QuerySession session, QueryTurn initialTurn);
+
+    /**
+     * Fence the expected state/owner and commit its matching history message in one transaction.
+     */
+    void transitionSessionWithTurn(QuerySession session, QueryTurn turn);
+
     Optional<QuerySession> findSession(String sessionId);
 
     List<QuerySession> listSessions(String userId, int limit);
@@ -460,6 +758,23 @@ public final class Ports {
 
     List<QueryTurn> listTurns(String sessionId);
 
+    /** Atomically reserve and commit before external I/O; unfinished reservations stay consumed. */
+    Optional<RetrievalReservation> reserveRound(
+        String userId,
+        String sessionId,
+        List<String> proposedQueries,
+        int maxRounds,
+        int maxQueries);
+
+    List<RetrievalReservation> listReservations(String sessionId);
+
+    /** Immutable metadata receipt of the exact model context, before external model I/O. */
+    default void recordEvidenceSelection(
+        String userId,
+        RetrievalReservation reservation,
+        cn.lgs.knowledgebase.application.query.QueryEvidenceContext.Snapshot snapshot) {}
+
+    /** Complete only the matching reserved round; a different completion cannot overwrite it. */
     void saveRound(RetrievalRound round);
 
     List<RetrievalRound> listRounds(String sessionId);
@@ -476,6 +791,23 @@ public final class Ports {
         String category,
         String comment,
         Instant createdAt);
+
+    default void addSourceVersions(String sessionId, List<String> versionIds) {}
+
+    default List<String> listSourceVersions(String sessionId) {
+      return List.of();
+    }
+
+    /** Only results whose raw evidence is actually passed to the answer model may be recorded. */
+    default void addAssetExpansions(
+        String sessionId,
+        int roundNo,
+        List<cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Result> results) {}
+  }
+
+  /** Required recovery capability; an alternate adapter must not silently disable expiry. */
+  public interface QueryExecutionRecoveryRepository {
+    int expireRunningSessions(Instant staleBefore, Instant now, String explanation);
   }
 
   public interface QueryHistoryRepository {
@@ -511,8 +843,20 @@ public final class Ports {
   }
 
   public interface GenerationTaskRepository {
+    default cn.lgs.knowledgebase.application.compilation.CompilationPublication publication(
+        GenerationTask task) {
+      return cn.lgs.knowledgebase.application.compilation.CompilationPublication.direct(
+          writes -> withinPublication(task, writes));
+    }
+
     GenerationTask queue(
         String versionId, GenerationTaskType taskType, String subjectId, Instant now);
+
+    /** Repair bypasses daily selection quotas, never the same-input retry chain or its deadline. */
+    default GenerationTask queueRepair(
+        String versionId, GenerationTaskType type, String subjectId, Instant now) {
+      return queue(versionId, type, subjectId, now);
+    }
 
     List<GenerationTask> claimPending(int limit, Instant now);
 
@@ -523,13 +867,42 @@ public final class Ports {
 
     void complete(GenerationTask task, String outputHash, Instant now);
 
+    /** Short authoritative publication transaction; never enclose model or embedding calls. */
+    default void withinPublication(GenerationTask task, Runnable publication) {
+      publication.run();
+    }
+
     void completeConceptAndQueueDerived(GenerationTask task, String outputHash, Instant now);
 
-    void fail(String taskId, String errorCode, String errorMessage, Instant now);
+    /** A failure belongs to the same claimed attempt, never just to a task ID. */
+    void fail(GenerationTask task, String errorCode, String errorMessage, Instant now);
+
+    /** Persist a transient dependency failure and its deadline for this exact claimed attempt. */
+    void defer(
+        GenerationTask task,
+        String errorCode,
+        String errorMessage,
+        Instant nextAttemptAt,
+        Instant now);
 
     void retry(String taskId, Instant now);
 
-    void resetInterrupted(Instant now);
+    /** Recover only expired stages of these types; startup is never evidence of expiry. */
+    void resetInterrupted(List<GenerationTaskType> taskTypes, Instant now);
+  }
+
+  /** Typed dependency transport failure; never use this for JSON decoding or business rejection. */
+  public static final class TransientDependencyFailure extends IllegalStateException {
+    public TransientDependencyFailure(String message, Throwable cause) {
+      super(message, cause);
+    }
+
+    public static boolean causedBy(Throwable failure) {
+      for (Throwable current = failure; current != null; current = current.getCause()) {
+        if (current instanceof TransientDependencyFailure) return true;
+      }
+      return false;
+    }
   }
 
   public interface KnowledgeGenerationRecommendationRepository {
@@ -559,6 +932,35 @@ public final class Ports {
   }
 
   public interface SourcePackageService {
+    PublishedPackage packageAnswerSources(
+        String userId, String sessionId, List<String> evidenceIds);
+
+    void recordCompletedTransfer(String userId, String packageId, long transferredBytes);
+
+    default EvidenceSource source(String userId, String evidenceId) {
+      return source(evidenceId);
+    }
+
+    default StoredObject openOriginal(String userId, String evidenceId) {
+      return openOriginal(evidenceId);
+    }
+
+    default PublishedPackage packageSources(String userId, List<String> evidenceIds) {
+      return packageSources(evidenceIds);
+    }
+
+    default PublishedPackage packageGroupedSources(String userId, List<SourcePackageGroup> groups) {
+      return packageGroupedSources(groups);
+    }
+
+    default PackageAccess accessPackage(String userId, String objectKey) {
+      return accessPackage(objectKey);
+    }
+
+    default StoredObject openPackage(String userId, String packageId) {
+      throw new UnsupportedOperationException("authenticated package download is unavailable");
+    }
+
     EvidenceSource source(String evidenceId);
 
     PublishedPackage packageSources(List<String> evidenceIds);
@@ -572,7 +974,28 @@ public final class Ports {
     StoredObject openOriginal(String evidenceId);
   }
 
-  public record SourcePackageGroup(String folderName, List<String> evidenceIds) {
+  public record PackageAuthorization(
+      String packageId,
+      String userId,
+      String objectKey,
+      List<String> evidenceIds,
+      Instant expiresAt) {}
+
+  public interface PackageAuthorizationRepository {
+    void save(PackageAuthorization authorization);
+
+    java.util.Optional<PackageAuthorization> find(String packageId, String userId);
+
+    java.util.Optional<PackageAuthorization> findByObjectKey(String objectKey, String userId);
+
+    void markDeleted(String objectKey);
+  }
+
+  public record SourcePackageGroup(String folderName, List<String> evidenceIds, String sessionId) {
+    public SourcePackageGroup(String folderName, List<String> evidenceIds) {
+      this(folderName, evidenceIds, null);
+    }
+
     public SourcePackageGroup {
       if (folderName == null || folderName.isBlank())
         throw new IllegalArgumentException("source package folder name is required");
@@ -587,6 +1010,7 @@ public final class Ports {
       String documentId,
       String versionId,
       String objectKey,
+      String sourceFilename,
       String contentType,
       long sizeBytes,
       Map<String, Object> location,
@@ -611,11 +1035,34 @@ public final class Ports {
   }
 
   public record PackageManifest(
-      Instant generatedAt, List<String> evidenceIds, List<PackageVersion> versions) {
+      Instant generatedAt,
+      List<String> evidenceIds,
+      List<PackageVersion> versions,
+      List<PackageAnswer> answers) {
+    public PackageManifest(
+        Instant generatedAt, List<String> evidenceIds, List<PackageVersion> versions) {
+      this(generatedAt, evidenceIds, versions, List.of());
+    }
+
     public PackageManifest {
       evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
       versions = versions == null ? List.of() : List.copyOf(versions);
+      answers = answers == null ? List.of() : List.copyOf(answers);
     }
+  }
+
+  public record PackageAnswer(String sessionId, List<String> evidenceIds) {
+    public PackageAnswer {
+      if (sessionId == null || sessionId.isBlank())
+        throw new IllegalArgumentException("answer id is required");
+      evidenceIds = evidenceIds == null ? List.of() : evidenceIds.stream().distinct().toList();
+    }
+  }
+
+  public interface DownloadUsageRepository {
+    void saveManifest(String userId, String packageId, PackageManifest manifest, long sizeBytes);
+
+    void recordCompletedTransfer(String userId, String packageId, long transferredBytes);
   }
 
   public record PublishedPackage(

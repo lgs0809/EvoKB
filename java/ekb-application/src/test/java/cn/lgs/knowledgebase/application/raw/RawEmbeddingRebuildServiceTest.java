@@ -73,7 +73,13 @@ class RawEmbeddingRebuildServiceTest {
     RecordingIndex resumedIndex = new RecordingIndex();
     RawEmbeddingRebuildService resumed =
         new RawEmbeddingRebuildService(
-            new Repository(fixture.source), resumedIndex, resumedEmbedder, checkpoints);
+            new Repository(fixture.source),
+            resumedIndex,
+            resumedEmbedder,
+            checkpoints,
+            RawTestFixtures.TOKENS,
+            RawChunkProfile.DEFAULT,
+            RawTestFixtures.encoder(resumedEmbedder));
 
     resumed.rebuild("v1");
 
@@ -91,7 +97,9 @@ class RawEmbeddingRebuildServiceTest {
                 fixture.source.documentId(),
                 fixture.source.versionId(),
                 fixture.source.metadata(),
-                fixture.source.blocks())
+                fixture.source.blocks(),
+                RawChunkProfile.DEFAULT,
+                RawTestFixtures.TOKENS)
             .get(0);
     checkpoints.markSucceeded(
         List.of(
@@ -105,7 +113,13 @@ class RawEmbeddingRebuildServiceTest {
 
     RecordingEmbedder embedder = new RecordingEmbedder(false);
     new RawEmbeddingRebuildService(
-            new Repository(fixture.source), new RecordingIndex(), embedder, checkpoints)
+            new Repository(fixture.source),
+            new RecordingIndex(),
+            embedder,
+            checkpoints,
+            RawTestFixtures.TOKENS,
+            RawChunkProfile.DEFAULT,
+            RawTestFixtures.encoder(embedder))
         .rebuild("v1");
 
     assertEquals(1, embedder.texts.size());
@@ -154,7 +168,14 @@ class RawEmbeddingRebuildServiceTest {
       embedder = new RecordingEmbedder(failEmbedding);
       this.checkpoints = checkpoints;
       service =
-          new RawEmbeddingRebuildService(new Repository(source), index, embedder, checkpoints);
+          new RawEmbeddingRebuildService(
+              new Repository(source),
+              index,
+              embedder,
+              checkpoints,
+              RawTestFixtures.TOKENS,
+              RawChunkProfile.DEFAULT,
+              RawTestFixtures.encoder(embedder));
     }
   }
 

@@ -36,6 +36,7 @@ public final class DocumentMetadataApplicationService {
     requireManageAccess(actor);
     if (requested == null)
       throw new IllegalArgumentException("document metadata update is required");
+    DocumentClassificationPolicy.requireAllowed(actor, requested.securityLevel());
     DocumentMetadataUpdate normalized = normalize(requested);
     DocumentVersionView updated =
         repository
@@ -75,7 +76,14 @@ public final class DocumentMetadataApplicationService {
     String documentType = optional(value.documentType(), 128);
     List<String> tags = normalizeTags(value.manualTags());
     return new DocumentMetadataUpdate(
-        versionId, logicalName, department, category, documentType, value.documentDate(), tags);
+        versionId,
+        logicalName,
+        department,
+        category,
+        documentType,
+        value.documentDate(),
+        tags,
+        value.securityLevel());
   }
 
   private static List<String> normalizeTags(List<String> values) {

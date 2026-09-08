@@ -1,17 +1,23 @@
 server:
   port: ${EKB_SERVER_PORT:18080}
-  address: ${EKB_SERVER_HOST:0.0.0.0}
+  address: ${EKB_SERVER_HOST:127.0.0.1}
   forward-headers-strategy: ${EKB_FORWARD_HEADERS_STRATEGY:none}
 
 spring:
   application:
     name: evokb
+  data:
+    redis:
+      host: ${EKB_REDIS_HOST:127.0.0.1}
+      port: ${EKB_REDIS_PORT:16385}
+      database: ${EKB_REDIS_DATABASE:0}
+      timeout: 5s
   datasource:
-    url: ${EKB_JDBC_URL:jdbc:mysql://127.0.0.1:23316/enterprise_kb?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC}
-    username: ${EKB_MYSQL_USER:ekb}
-    password: ${EKB_MYSQL_PASSWORD:}
+    url: ${EKB_JDBC_URL:jdbc:postgresql://127.0.0.1:15465/evokb_target?stringtype=unspecified}
+    username: ${EKB_DB_USER:evokb_target}
+    password: ${EKB_DB_PASSWORD:}
     hikari:
-      maximum-pool-size: ${EKB_MYSQL_POOL_SIZE:20}
+      maximum-pool-size: ${EKB_DB_POOL_SIZE:6}
   jackson:
     property-naming-strategy: SNAKE_CASE
     default-property-inclusion: non_null
@@ -26,7 +32,9 @@ spring:
         - "file:${EKB_WEB_DIR:./web/dist}/"
         - "classpath:/static/"
   flyway:
-    enabled: false
+    enabled: true
+    baseline-on-migrate: ${EKB_FLYWAY_BASELINE_ON_MIGRATE:false}
+    baseline-version: 0
   ai:
     mcp:
       server:

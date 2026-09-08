@@ -187,7 +187,8 @@ public final class SafeBatchUploadStager {
         d.company(),
         d.documentType(),
         d.documentDate(),
-        d.manualTags());
+        d.manualTags(),
+        d.securityLevel());
   }
 
   private Path destination(Path batchDir, String relative) {
@@ -287,7 +288,25 @@ public final class SafeBatchUploadStager {
       String company,
       String documentType,
       java.time.LocalDate documentDate,
-      List<String> manualTags) {
+      List<String> manualTags,
+      Integer securityLevel) {
+    public Defaults(
+        String sourceDepartment,
+        String materialCategory,
+        String company,
+        String documentType,
+        java.time.LocalDate documentDate,
+        List<String> manualTags) {
+      this(
+          sourceDepartment,
+          materialCategory,
+          company,
+          documentType,
+          documentDate,
+          manualTags,
+          null);
+    }
+
     public Defaults {
       manualTags = manualTags == null ? List.of() : List.copyOf(manualTags);
     }

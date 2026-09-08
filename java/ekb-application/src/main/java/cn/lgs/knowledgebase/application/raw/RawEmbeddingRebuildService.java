@@ -28,11 +28,13 @@ import java.util.stream.Collectors;
  * OpenSearch only after the complete rebuild succeeds.
  */
 public final class RawEmbeddingRebuildService {
-  private static final String CHECKPOINT_STRATEGY = "raw-smart-chunk-full-content-v1";
   private final CompilationRepository compilation;
   private final RawSearchIndex search;
   private final EmbeddingPort embedder;
   private final EmbeddingRebuildCheckpointRepository checkpoints;
+  private final RawTokenCounter tokens;
+  private final RawChunkProfile chunkProfile;
+  private final RawVectorEncoder vectorEncoder;
 
   public RawEmbeddingRebuildService(
       CompilationRepository compilation, RawSearchIndex search, EmbeddingPort embedder) {
@@ -44,6 +46,27 @@ public final class RawEmbeddingRebuildService {
       RawSearchIndex search,
       EmbeddingPort embedder,
       EmbeddingRebuildCheckpointRepository checkpoints) {
+    this(
+        compilation,
+        search,
+        embedder,
+        checkpoints,
+        RawTokenCounter.unconfigured(),
+        RawChunkProfile.DEFAULT,
+        null);
+  }
+
+  public RawEmbeddingRebuildService(
+      CompilationRepository compilation,
+      RawSearchIndex search,
+      EmbeddingPort embedder,
+      EmbeddingRebuildCheckpointRepository checkpoints,
+      RawTokenCounter tokens,
+      RawChunkProfile chunkProfile,
+      RawVectorEncoder vectorEncoder) {
+    this.tokens = require(tokens, "raw tokenizer");
+    this.chunkProfile = require(chunkProfile, "chunk profile");
+    this.vectorEncoder = vectorEncoder;
     this.compilation = require(compilation, "compilation repository");
     this.search = require(search, "raw search index");
     this.embedder = require(embedder, "embedder");
@@ -51,11 +74,18 @@ public final class RawEmbeddingRebuildService {
   }
 
   public RebuildResult rebuild(String versionId) {
+    return rebuild(versionId, RawExecution.legacy());
+  }
+
+  public RebuildResult rebuild(String versionId, RawExecution execution) {
+    require(execution, "raw rebuild execution").check();
     String id = requireText(versionId, "version id");
     VersionSource source = compilation.loadVersionSource(id);
     if (!id.equals(source.versionId()))
       throw new IllegalStateException(
           "compilation repository returned a different version source: " + source.versionId());
+    execution.bind(source.documentId(), source.versionId());
+    execution.phase(cn.lgs.knowledgebase.domain.ingestion.IngestionDomain.ProgressStage.EMBEDDING);
     if (source.blocks().isEmpty())
       throw new IllegalStateException("cannot rebuild a version without RawBlocks: " + id);
     List<Evidence> evidence = new ArrayList<>(source.evidenceByBlock().values());
@@ -67,7 +97,17 @@ public final class RawEmbeddingRebuildService {
 
     List<RawKnowledgeBuilder.ChunkDraft> chunks =
         RawKnowledgeBuilder.smartChunks(
-            source.documentId(), source.versionId(), source.metadata(), source.blocks());
+            source.documentId(),
+            source.versionId(),
+            source.metadata(),
+            source.blocks(),
+            chunkProfile,
+            tokens);
+    if (vectorEncoder == null)
+      throw new IllegalStateException("Raw vector identity/cache is not configured");
+    RawVectorEncoder.Session encoding =
+        vectorEncoder.open(source.documentId(), tokens, chunkProfile);
+    String strategy = encoding.checkpointStrategy();
     if (chunks.isEmpty())
       throw new IllegalStateException("cannot rebuild a version without evidence chunks: " + id);
 
@@ -97,7 +137,11 @@ public final class RawEmbeddingRebuildService {
           .append(';');
     }
 
-    Set<String> completed = completedChunks(id, expected);
+    // A new epoch has new physical members. Cache reuse saves actual encoding, never proves that
+    // another epoch wrote this attempt's immutable projections.
+    Set<String> completed =
+        execution.projectionScope().isBlank() ? completedChunks(id, expected, strategy) : Set.of();
+    List<String> physicalIds = new ArrayList<>();
     List<RawKnowledgeBuilder.ChunkDraft> pending =
         chunks.stream().filter(chunk -> !completed.contains(chunk.id())).toList();
     int from = 0;
@@ -107,7 +151,8 @@ public final class RawEmbeddingRebuildService {
       // Use the exact persisted chunk content. There is intentionally no truncation, summary,
       // head/tail selection, or ellipsis insertion in this path.
       List<String> texts = batch.stream().map(RawKnowledgeBuilder.ChunkDraft::content).toList();
-      List<List<Float>> vectors = embedder.embed(texts);
+      List<List<Float>> vectors = encoding.encode(texts);
+      execution.check();
       if (vectors.size() != batch.size())
         throw new IllegalStateException(
             "embedding count " + vectors.size() + " != chunks " + batch.size());
@@ -120,31 +165,47 @@ public final class RawEmbeddingRebuildService {
           throw new IllegalStateException(
               "rebuild produced an ungrounded raw chunk: " + document.id());
       }
-      search.indexRawRebuild(source.documentId(), source.versionId(), indexed);
+      if (execution.projectionScope().isBlank())
+        search.indexRawRebuild(source.documentId(), source.versionId(), indexed);
+      else
+        physicalIds.addAll(
+            search.stageRaw(
+                source.documentId(), source.versionId(), execution.projectionScope(), indexed));
       // The index write intentionally happens before the checkpoint write. If the process stops
       // between the two operations, the next run may repeat this batch, but it can never skip a
       // chunk whose vector was not durably written.
-      checkpoints.markSucceeded(
-          batch.stream()
-              .map(
-                  chunk -> {
-                    ChunkState state = expected.get(chunk.id());
-                    return new EmbeddingRebuildCheckpoint(
-                        id,
-                        chunk.id(),
-                        state.contentHash(),
-                        state.evidenceFingerprint(),
-                        state.evidenceIds(),
-                        CHECKPOINT_STRATEGY);
-                  })
-              .toList());
+      execution.fenced(
+          () ->
+              checkpoints.markSucceeded(
+                  batch.stream()
+                      .map(
+                          chunk -> {
+                            ChunkState state = expected.get(chunk.id());
+                            return new EmbeddingRebuildCheckpoint(
+                                id,
+                                chunk.id(),
+                                state.contentHash(),
+                                state.evidenceFingerprint(),
+                                state.evidenceIds(),
+                                strategy);
+                          })
+                      .toList()));
       from = to;
     }
 
     // The previous active index is still available if any step above failed. Only now remove IDs
     // that are no longer produced by the current deterministic chunk builder.
-    search.deleteVersionExcept(source.versionId(), keepChunkIds);
-    search.activateVersion(source.documentId(), source.versionId());
+    encoding.assertCurrent();
+    if (execution.projectionScope().isBlank()) {
+      search.deleteVersionExcept(source.versionId(), keepChunkIds);
+      search.activateVersion(source.documentId(), source.versionId());
+    } else {
+      execution.publish(
+          source.documentId(),
+          source.versionId(),
+          List.copyOf(physicalIds),
+          () -> search.activateRaw(source.documentId(), source.versionId(), physicalIds));
+    }
     return new RebuildResult(
         source.documentId(),
         source.versionId(),
@@ -153,7 +214,8 @@ public final class RawEmbeddingRebuildService {
         fingerprint.toString());
   }
 
-  private Set<String> completedChunks(String versionId, Map<String, ChunkState> expected) {
+  private Set<String> completedChunks(
+      String versionId, Map<String, ChunkState> expected, String strategy) {
     List<EmbeddingRebuildCheckpoint> stored = checkpoints.find(versionId);
     if (stored == null || stored.isEmpty()) return Set.of();
     Set<String> completed = new LinkedHashSet<>();
@@ -161,7 +223,7 @@ public final class RawEmbeddingRebuildService {
       ChunkState state = expected.get(checkpoint.chunkId());
       if (state == null) continue;
       if (versionId.equals(checkpoint.versionId())
-          && CHECKPOINT_STRATEGY.equals(checkpoint.strategyKey())
+          && strategy.equals(checkpoint.strategyKey())
           && state.contentHash().equals(checkpoint.contentHash())
           && state.evidenceFingerprint().equals(checkpoint.evidenceFingerprint())
           && state.evidenceIds().equals(checkpoint.evidenceIds())) {

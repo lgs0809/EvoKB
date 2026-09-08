@@ -27,10 +27,13 @@ public final class OpenSearchDerivedIndexAdapter implements DerivedSearchIndex {
   }
 
   @Override
-  public void ensureIndex(int embeddingDimensions) {
+  public synchronized void ensureIndex(int embeddingDimensions) {
     if (embeddingDimensions <= 0)
       throw new IllegalArgumentException("embedding dimensions must be > 0");
-    if (client.indexExists(index)) return;
+    if (client.indexExists(index)) {
+      validateEmbeddingMapping(embeddingDimensions);
+      return;
+    }
     Map<String, Object> properties = new LinkedHashMap<>();
     properties.put("knowledge_type", keyword());
     properties.put("knowledge_id", keyword());
@@ -71,6 +74,21 @@ public final class OpenSearchDerivedIndexAdapter implements DerivedSearchIndex {
                 Map.of(
                     "index", Map.of("knn", true, "number_of_shards", 1, "number_of_replicas", 0)),
             "mappings", Map.of("dynamic", "strict", "properties", properties)));
+  }
+
+  private void validateEmbeddingMapping(int dimensions) {
+    JsonNode mappings = client.json("GET", path("/_mapping"), null);
+    if (mappings.isEmpty()) throw new IllegalStateException("derived index mapping is missing");
+    for (JsonNode mapping : mappings) {
+      JsonNode embedding = mapping.path("mappings").path("properties").path("embedding");
+      if (!"knn_vector".equals(embedding.path("type").asText())
+          || embedding.path("dimension").asInt() != dimensions) {
+        throw new IllegalStateException(
+            "derived index embedding mapping is incompatible; preserve the existing index and rebuild into a new index with "
+                + dimensions
+                + " dimensions");
+      }
+    }
   }
 
   @Override
@@ -124,6 +142,9 @@ public final class OpenSearchDerivedIndexAdapter implements DerivedSearchIndex {
       boolean active) {
     if (embedding == null || embedding.isEmpty())
       throw new IllegalArgumentException("derived embedding is required");
+    // OpenSearch otherwise auto-creates a float-array field on the first write. Configure
+    // the vector contract before every publication, including fresh installs and rebuilds.
+    ensureIndex(embedding.size());
     Map<String, Object> body = new LinkedHashMap<>();
     body.put("knowledge_type", type);
     body.put("knowledge_id", id);

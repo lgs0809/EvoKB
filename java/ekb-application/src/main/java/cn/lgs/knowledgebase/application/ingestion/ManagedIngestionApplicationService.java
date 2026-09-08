@@ -4,6 +4,8 @@ import cn.lgs.knowledgebase.application.port.Ports.FileSourcePort;
 import cn.lgs.knowledgebase.application.port.Ports.RuntimeConfigRepository;
 import cn.lgs.knowledgebase.application.port.Ports.SourceFile;
 import cn.lgs.knowledgebase.application.port.Ports.UploadRepository;
+import cn.lgs.knowledgebase.application.raw.RawIngestionApplicationService;
+import cn.lgs.knowledgebase.application.raw.RawTaskRetryPolicy;
 import cn.lgs.knowledgebase.domain.identity.IdentityDomain.User;
 import cn.lgs.knowledgebase.domain.ingestion.IngestionDomain.Batch;
 import cn.lgs.knowledgebase.domain.ingestion.IngestionDomain.FileItem;
@@ -22,10 +24,59 @@ public final class ManagedIngestionApplicationService {
   private final RuntimeConfigRepository config;
   private final FileSourcePort files;
   private final Clock clock;
+  private java.util.function.Consumer<String> onRawCommit = ignored -> {};
 
   public ManagedIngestionApplicationService(
       UploadRepository uploads, RuntimeConfigRepository config, FileSourcePort files) {
     this(uploads, config, files, Clock.systemUTC());
+  }
+
+  public ManagedIngestionApplicationService(
+      UploadRepository uploads,
+      RuntimeConfigRepository config,
+      FileSourcePort files,
+      java.util.function.Consumer<String> onRawCommit) {
+    this(uploads, config, files);
+    this.onRawCommit = require(onRawCommit, "raw post-commit association callback");
+  }
+
+  /**
+   * Compatibility upload runs the very same durable task, never an unowned alternative pipeline.
+   */
+  public record SynchronousIngestion(
+      String batchId, RawIngestionApplicationService.IngestResult result) {}
+
+  public SynchronousIngestion ingestNow(
+      User actor, StagedDraft draft, RawIngestionApplicationService raw) {
+    var batch = createBatch(actor, 1, List.of(draft));
+    queueBatch(actor, batch.batchId());
+    var claim = uploads.claimRaw(batch.files().get(0).fileId(), UUID.randomUUID().toString());
+    if (claim.isEmpty()) return new SynchronousIngestion(batch.batchId(), null);
+    var task = claim.get();
+    var file = task.file();
+    try {
+      var result =
+          new ClaimedRawIngestionExecutor(uploads, raw, clock)
+              .execute(task, "web-upload:" + file.originalFilename());
+      try {
+        onRawCommit.accept(result.versionId());
+      } catch (RuntimeException associationFailure) {
+        /* Raw is already committed; the durable selection scanner owns recovery. */
+      }
+      try {
+        files.delete(file.stagingPath());
+      } catch (RuntimeException ignored) {
+      }
+      return new SynchronousIngestion(batch.batchId(), result);
+    } catch (RuntimeException failure) {
+      String code = RawTaskRetryPolicy.code(failure, "INGEST_FAILED");
+      try {
+        uploads.rawFailure(
+            task, code, failure.getMessage(), RawTaskRetryPolicy.retryable(code, failure));
+      } catch (RuntimeException stale) {
+      }
+      throw failure;
+    }
   }
 
   ManagedIngestionApplicationService(
@@ -58,6 +109,8 @@ public final class ManagedIngestionApplicationService {
     List<FileItem> items = new ArrayList<>(drafts.size());
     for (StagedDraft draft : drafts) {
       if (draft == null) continue;
+      cn.lgs.knowledgebase.application.operations.DocumentClassificationPolicy.requireUploadAllowed(
+          actor, draft.securityLevel());
       SourceFile source = files.inspect(draft.stagingPath());
       String logicalName =
           draft.logicalName() == null || draft.logicalName().isBlank()
@@ -71,7 +124,8 @@ public final class ManagedIngestionApplicationService {
               draft.company(),
               draft.documentType(),
               draft.documentDate(),
-              draft.manualTags());
+              draft.manualTags(),
+              draft.securityLevel());
       items.add(
           new FileItem(
               UUID.randomUUID().toString(),
@@ -147,6 +201,10 @@ public final class ManagedIngestionApplicationService {
         patch == null
             ? new MetadataPatch(null, null, null, null, null, null, false, null, false)
             : patch;
+    cn.lgs.knowledgebase.application.operations.DocumentClassificationPolicy.requireUploadAllowed(
+        actor, value.clearSecurityLevel() ? 10 : value.securityLevel());
+    if (value.clearSecurityLevel() && value.securityLevel() != null)
+      throw new Validation("security level and clear security level are mutually exclusive");
     FileMetadata next =
         file.metadata()
             .patch(
@@ -158,7 +216,9 @@ public final class ManagedIngestionApplicationService {
                 value.documentDate(),
                 value.clearDocumentDate(),
                 value.manualTags(),
-                value.replaceTags());
+                value.replaceTags(),
+                value.securityLevel(),
+                value.clearSecurityLevel());
     FileItem updated = file.withMetadata(next, clock.instant());
     uploads.saveFile(updated);
     return uploads.findFile(file.fileId()).orElse(updated);
@@ -183,6 +243,15 @@ public final class ManagedIngestionApplicationService {
     if (!file.retryable()) throw new Conflict("only FAILED ingestion files can be retried");
     uploads.retryFile(file.fileId(), clock.instant());
     return uploads.findFile(file.fileId()).orElseThrow(() -> new NotFound("file not found"));
+  }
+
+  public UploadRepository.ReparseReservation reparse(
+      User actor, String versionId, RawIngestionApplicationService raw) {
+    requireUpload(actor);
+    var source = uploads.reparseSource(actor.id(), requiredText(versionId, "versionId"));
+    // This may call the actual parser's metadata endpoint; do not keep a SQL transaction open.
+    var pipeline = raw.currentPipeline(source.originalFilename());
+    return uploads.reserveReparse(actor.id(), source, pipeline, clock.instant());
   }
 
   private void requireUpload(User actor) {
@@ -237,7 +306,33 @@ public final class ManagedIngestionApplicationService {
       String company,
       String documentType,
       LocalDate documentDate,
-      List<String> manualTags) {}
+      List<String> manualTags,
+      Integer securityLevel) {
+    public StagedDraft(
+        String relativePath,
+        String originalFilename,
+        String stagingPath,
+        String logicalName,
+        String sourceDepartment,
+        String materialCategory,
+        String company,
+        String documentType,
+        LocalDate documentDate,
+        List<String> manualTags) {
+      this(
+          relativePath,
+          originalFilename,
+          stagingPath,
+          logicalName,
+          sourceDepartment,
+          materialCategory,
+          company,
+          documentType,
+          documentDate,
+          manualTags,
+          null);
+    }
+  }
 
   public record MetadataPatch(
       String logicalName,
@@ -248,7 +343,57 @@ public final class ManagedIngestionApplicationService {
       LocalDate documentDate,
       boolean clearDocumentDate,
       List<String> manualTags,
-      boolean replaceTags) {}
+      boolean replaceTags,
+      Integer securityLevel,
+      boolean clearSecurityLevel) {
+    public MetadataPatch(
+        String logicalName,
+        String sourceDepartment,
+        String materialCategory,
+        String company,
+        String documentType,
+        LocalDate documentDate,
+        boolean clearDocumentDate,
+        List<String> manualTags,
+        boolean replaceTags,
+        Integer securityLevel) {
+      this(
+          logicalName,
+          sourceDepartment,
+          materialCategory,
+          company,
+          documentType,
+          documentDate,
+          clearDocumentDate,
+          manualTags,
+          replaceTags,
+          securityLevel,
+          false);
+    }
+
+    public MetadataPatch(
+        String logicalName,
+        String sourceDepartment,
+        String materialCategory,
+        String company,
+        String documentType,
+        LocalDate documentDate,
+        boolean clearDocumentDate,
+        List<String> manualTags,
+        boolean replaceTags) {
+      this(
+          logicalName,
+          sourceDepartment,
+          materialCategory,
+          company,
+          documentType,
+          documentDate,
+          clearDocumentDate,
+          manualTags,
+          replaceTags,
+          null);
+    }
+  }
 
   public static class IngestionException extends RuntimeException {
     public IngestionException(String message) {

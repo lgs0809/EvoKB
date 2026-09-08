@@ -1,64 +1,92 @@
 package cn.lgs.knowledgebase.interfaces.http;
 
-import cn.lgs.knowledgebase.application.compilation.GraphCompilationService;
-import cn.lgs.knowledgebase.application.compilation.SummaryCompilationService;
-import cn.lgs.knowledgebase.application.compilation.WikiCompilationService;
-import cn.lgs.knowledgebase.application.compilation.WikiKeywordProjectionService;
+import cn.lgs.knowledgebase.application.compilation.CompilationCommands;
+import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTask;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.List;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
 
-/** ADMIN-only runtime entry points equivalent to the Go summary/graph/wiki commands. */
+/** ADMIN commands are durable jobs; HTTP requests never run models or bypass compilation locks. */
 @RestController
 @RequestMapping("/api/enterprise/compilation")
 public final class EnterpriseCompilationController {
-  private final SummaryCompilationService summaries;
-  private final GraphCompilationService graph;
-  private final WikiCompilationService wikis;
-  private final WikiKeywordProjectionService wikiKeywords;
+  private final CompilationCommands.Store commands;
 
-  public EnterpriseCompilationController(
-      SummaryCompilationService summaries,
-      GraphCompilationService graph,
-      WikiCompilationService wikis,
-      WikiKeywordProjectionService wikiKeywords) {
-    this.summaries = summaries;
-    this.graph = graph;
-    this.wikis = wikis;
-    this.wikiKeywords = wikiKeywords;
+  public EnterpriseCompilationController(CompilationCommands.Store commands) {
+    this.commands = commands;
   }
 
   @PostMapping("/summary")
-  public List<SummaryCompilationService.PreparedSummary> summary(
+  public ResponseEntity<GenerationTask> summary(
       @RequestBody SummaryRequest body, HttpServletRequest request) {
-    EnterpriseRequestContext.admin(request);
-    return summaries.compileVersion(body.versionId());
+    return submit(
+        request,
+        new CompilationCommands.Request(
+            CompilationCommands.Kind.SUMMARY, body.versionId(), List.of(), "", "", "", "", 0));
   }
 
   @PostMapping("/graph")
-  public GraphCompilationService.CompileResult graph(
+  public ResponseEntity<GenerationTask> graph(
       @RequestBody GraphRequest body, HttpServletRequest request) {
-    EnterpriseRequestContext.admin(request);
-    return graph.compileSummary(body.summaryId());
+    return submit(
+        request,
+        new CompilationCommands.Request(
+            CompilationCommands.Kind.GRAPH, "", List.of(body.summaryId()), "", "", "", "", 0));
+  }
+
+  @PostMapping("/concept-projection")
+  public ResponseEntity<GenerationTask> conceptProjection(
+      @RequestBody GraphRequest body, HttpServletRequest request) {
+    return submit(
+        request,
+        new CompilationCommands.Request(
+            CompilationCommands.Kind.CONCEPT_PROJECTION,
+            "",
+            List.of(body.summaryId()),
+            "",
+            "",
+            "",
+            "",
+            0));
   }
 
   @PostMapping("/wiki")
-  public WikiCompilationService.CompileResult wiki(
+  public ResponseEntity<GenerationTask> wiki(
       @RequestBody WikiRequest body, HttpServletRequest request) {
-    EnterpriseRequestContext.admin(request);
-    return wikis.compile(
-        new WikiCompilationService.CompileRequest(
-            body.wikiType(), body.title(), body.canonicalSubjectId(), body.summaryIds()));
+    return submit(
+        request,
+        new CompilationCommands.Request(
+            CompilationCommands.Kind.WIKI,
+            "",
+            body.summaryIds(),
+            body.wikiType(),
+            body.title(),
+            body.canonicalSubjectId(),
+            "",
+            0));
   }
 
   @PostMapping("/wiki-keywords")
-  public WikiKeywordProjectionService.ProjectionResult wikiKeywords(
+  public ResponseEntity<GenerationTask> wikiKeywords(
       @RequestBody WikiKeywordRequest body, HttpServletRequest request) {
-    EnterpriseRequestContext.admin(request);
-    return wikiKeywords.project(body.wikiId(), body.wikiVersion());
+    return submit(
+        request,
+        new CompilationCommands.Request(
+            CompilationCommands.Kind.WIKI_KEYWORDS,
+            "",
+            List.of(),
+            "",
+            "",
+            "",
+            body.wikiId(),
+            body.wikiVersion()));
+  }
+
+  private ResponseEntity<GenerationTask> submit(
+      HttpServletRequest request, CompilationCommands.Request command) {
+    var user = EnterpriseRequestContext.admin(request);
+    return ResponseEntity.accepted().body(commands.submit(user.id(), command));
   }
 
   public record SummaryRequest(String versionId) {}

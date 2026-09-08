@@ -22,12 +22,20 @@ import org.springframework.web.bind.annotation.*;
 public final class AuthController {
   private final IdentityApplicationService identity;
   private final boolean secureCookie;
+  private final String cookieName;
 
+  public AuthController(IdentityApplicationService identity, boolean secureCookie) {
+    this(identity, secureCookie, EnterpriseSessionInterceptor.SESSION_COOKIE);
+  }
+
+  @org.springframework.beans.factory.annotation.Autowired
   public AuthController(
       IdentityApplicationService identity,
-      @Value("${ekb.auth.secure-cookie:false}") boolean secureCookie) {
+      @Value("${ekb.auth.secure-cookie:false}") boolean secureCookie,
+      @Value("${EKB_SESSION_COOKIE_NAME:ekb_session}") String cookieName) {
     this.identity = identity;
     this.secureCookie = secureCookie;
+    this.cookieName = cookieName;
   }
 
   @GetMapping("/auth/status")
@@ -66,7 +74,7 @@ public final class AuthController {
 
   @PostMapping("/auth/logout")
   public Map<String, Object> logout(HttpServletRequest request, HttpServletResponse response) {
-    identity.logout(EnterpriseSessionInterceptor.sessionToken(request));
+    identity.logout(EnterpriseSessionInterceptor.sessionToken(request, cookieName));
     clearCookie(response);
     return Map.of("status", "logged_out");
   }
@@ -100,7 +108,8 @@ public final class AuthController {
                 request.username(),
                 request.displayName(),
                 chars(request.password()),
-                parseRole(request.role())));
+                parseRole(request.role()),
+                request.securityClearance()));
     return ResponseEntity.status(HttpStatus.CREATED).body(Map.of("user", UserView.of(user)));
   }
 
@@ -116,7 +125,8 @@ public final class AuthController {
             new IdentityApplicationService.UpdateUser(
                 request.displayName(),
                 request.role() == null ? null : parseRole(request.role()),
-                request.status() == null ? null : parseStatus(request.status())));
+                request.status() == null ? null : parseStatus(request.status()),
+                request.securityClearance()));
     return Map.of("user", UserView.of(user));
   }
 
@@ -131,7 +141,7 @@ public final class AuthController {
   private void setCookie(HttpServletResponse response, String token, Instant expiresAt) {
     long seconds = Math.max(1, Duration.between(Instant.now(), expiresAt).toSeconds());
     ResponseCookie cookie =
-        ResponseCookie.from(EnterpriseSessionInterceptor.SESSION_COOKIE, token)
+        ResponseCookie.from(cookieName, token)
             .httpOnly(true)
             .secure(secureCookie)
             .sameSite("Lax")
@@ -144,7 +154,7 @@ public final class AuthController {
   private void clearCookie(HttpServletResponse response) {
     response.addHeader(
         HttpHeaders.SET_COOKIE,
-        ResponseCookie.from(EnterpriseSessionInterceptor.SESSION_COOKIE, "")
+        ResponseCookie.from(cookieName, "")
             .httpOnly(true)
             .secure(secureCookie)
             .sameSite("Lax")
@@ -176,7 +186,11 @@ public final class AuthController {
   }
 
   public record CreateUserRequest(
-      String username, String displayName, String password, String role) {}
+      String username,
+      String displayName,
+      String password,
+      String role,
+      Integer securityClearance) {}
 
   public record LoginRequest(String username, String password) {}
 
@@ -184,7 +198,8 @@ public final class AuthController {
 
   public record PasswordResetRequest(String userId, String newPassword) {}
 
-  public record UpdateUserRequest(String displayName, String role, String status) {}
+  public record UpdateUserRequest(
+      String displayName, String role, String status, Integer securityClearance) {}
 
   public record UserView(
       String userId,
@@ -194,7 +209,8 @@ public final class AuthController {
       String status,
       Instant lastLoginAt,
       Instant createdAt,
-      Instant updatedAt) {
+      Instant updatedAt,
+      int securityClearance) {
     static UserView of(User user) {
       return new UserView(
           user.id(),
@@ -204,7 +220,8 @@ public final class AuthController {
           user.status().name(),
           user.lastLoginAt(),
           user.createdAt(),
-          user.updatedAt());
+          user.updatedAt(),
+          user.securityClearance());
     }
   }
 }

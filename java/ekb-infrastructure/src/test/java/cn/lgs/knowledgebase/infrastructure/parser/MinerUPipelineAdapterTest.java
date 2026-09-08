@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
@@ -44,7 +45,12 @@ class MinerUPipelineAdapterTest {
     String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
     var adapter =
         new MinerUPipelineAdapter(
-            baseUrl, new ObjectMapper(), Duration.ofMillis(5), Duration.ofMillis(40), "auto", "ch");
+            baseUrl,
+            new ObjectMapper(),
+            Duration.ofMillis(5),
+            Duration.ofMillis(400),
+            "auto",
+            "ch");
 
     IllegalStateException failure =
         assertThrows(
@@ -67,7 +73,7 @@ class MinerUPipelineAdapterTest {
         exchange ->
             respond(
                 exchange,
-                "{\"version\":\"3.4.3\",\"results\":{\"resume.pdf\":{\"md_content\":\"# resumed\",\"middle_json\":{\"pdf_info\":[]},\"content_list\":[]}}}"));
+                "{\"version\":\"3.4.5\",\"backend\":\"hybrid-engine\",\"results\":{\"resume.pdf\":{\"md_content\":\"# resumed\",\"middle_json\":{\"pdf_info\":[]},\"content_list\":[{\"type\":\"text\",\"text\":\"resumed source\",\"page_idx\":0}]}}}"));
     server.createContext(
         "/tasks/resume-task",
         exchange -> respond(exchange, "{\"task_id\":\"resume-task\",\"status\":\"completed\"}"));
@@ -95,7 +101,7 @@ class MinerUPipelineAdapterTest {
     assertEquals(0, submits.get());
     assertTrue(reported.isEmpty());
     assertEquals("# resumed", parsed.markdown());
-    assertEquals("mineru-pipeline", parsed.parserName());
+    assertEquals("mineru-hybrid-engine", parsed.parserName());
   }
 
   @Test
@@ -113,7 +119,7 @@ class MinerUPipelineAdapterTest {
         exchange ->
             respond(
                 exchange,
-                "{\"version\":\"3.4.3\",\"results\":{\"resume.pdf\":{\"md_content\":\"# recovered\",\"middle_json\":{\"pdf_info\":[]},\"content_list\":[]}}}"));
+                "{\"version\":\"3.4.5\",\"backend\":\"hybrid-engine\",\"results\":{\"resume.pdf\":{\"md_content\":\"# recovered\",\"middle_json\":{\"pdf_info\":[]},\"content_list\":[{\"type\":\"text\",\"text\":\"recovered source\",\"page_idx\":0}]}}}"));
     server.createContext(
         "/tasks/recovered-task",
         exchange -> respond(exchange, "{\"task_id\":\"recovered-task\",\"status\":\"completed\"}"));
@@ -164,7 +170,12 @@ class MinerUPipelineAdapterTest {
     String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
     var adapter =
         new MinerUPipelineAdapter(
-            baseUrl, new ObjectMapper(), Duration.ofMillis(5), Duration.ofMillis(40), "auto", "ch");
+            baseUrl,
+            new ObjectMapper(),
+            Duration.ofMillis(5),
+            Duration.ofMillis(400),
+            "auto",
+            "ch");
     List<String> reported = new ArrayList<>();
 
     assertThrows(
@@ -178,6 +189,219 @@ class MinerUPipelineAdapterTest {
 
     assertFalse(reported.isEmpty());
     assertEquals("persist-me", reported.get(0));
+  }
+
+  @Test
+  void typedCurrentPipelineAcceptsOnlyItsExactSourceReceipt() throws Exception {
+    var mapper = new ObjectMapper();
+    var declaration = pipelineDeclaration();
+    var sourceSha =
+        cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity.hash(
+            "synthetic-pdf-input".getBytes(StandardCharsets.UTF_8));
+    server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/pipeline",
+        exchange ->
+            respond(
+                exchange,
+                mapper.writeValueAsString(
+                    java.util.Map.of(
+                        "components", declaration.components(), "sha256", declaration.sha256()))));
+    server.createContext(
+        "/tasks/certified/result",
+        exchange ->
+            respond(exchange, mapper.writeValueAsString(typedResult(declaration, sourceSha))));
+    server.createContext(
+        "/tasks/certified",
+        exchange -> respond(exchange, "{\"task_id\":\"certified\",\"status\":\"completed\"}"));
+    server.start();
+    var adapter =
+        new MinerUPipelineAdapter(
+            "http://127.0.0.1:" + server.getAddress().getPort(),
+            mapper,
+            Duration.ofMillis(5),
+            Duration.ofSeconds(1),
+            "auto",
+            "ch");
+    var current = adapter.currentPipeline("fixture.pdf").orElseThrow();
+    var parsed =
+        adapter.parse(
+            "fixture.pdf",
+            new ByteArrayInputStream(new byte[0]),
+            "certified",
+            task -> fail("no resubmit"),
+            current,
+            sourceSha);
+    assertEquals("Synthetic native source", parsed.markdown());
+    assertEquals(
+        sourceSha,
+        ((java.util.Map<?, ?>) parsed.blocks().get(0).raw().get("_evokb_parser_receipt"))
+            .get("sourceSha256"));
+  }
+
+  @Test
+  void completedForeignSourceClearsPersistedExternalTaskAndGetsBoundedDurableClassification()
+      throws Exception {
+    var mapper = new ObjectMapper();
+    var declaration = pipelineDeclaration();
+    server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/tasks/foreign/result",
+        exchange ->
+            respond(exchange, mapper.writeValueAsString(typedResult(declaration, "a".repeat(64)))));
+    server.createContext(
+        "/tasks/foreign",
+        exchange -> respond(exchange, "{\"task_id\":\"foreign\",\"status\":\"completed\"}"));
+    server.start();
+    var adapter =
+        new MinerUPipelineAdapter(
+            "http://127.0.0.1:" + server.getAddress().getPort(),
+            mapper,
+            Duration.ofMillis(5),
+            Duration.ofSeconds(1),
+            "auto",
+            "ch");
+    List<String> tasks = new ArrayList<>();
+    var failure =
+        assertThrows(
+            cn.lgs.knowledgebase.application.raw.ParserCheckpointPolicy.ResultStale.class,
+            () ->
+                adapter.parse(
+                    "fixture.pdf",
+                    new ByteArrayInputStream(new byte[0]),
+                    "foreign",
+                    tasks::add,
+                    declaration,
+                    "b".repeat(64)));
+    assertEquals(List.of(""), tasks);
+    assertEquals(
+        "PARSER_RESULT_STALE",
+        cn.lgs.knowledgebase.application.raw.RawTaskRetryPolicy.code(failure, "FAILED"));
+    assertTrue(
+        cn.lgs.knowledgebase.application.raw.RawTaskRetryPolicy.retryable(
+            "PARSER_RESULT_STALE", failure));
+    assertFalse(
+        cn.lgs.knowledgebase.application.port.Ports.TransientDependencyFailure.causedBy(failure));
+  }
+
+  @Test
+  void typedResumeRejectsLegacyCompletedTaskWithoutCurrentDeclaration() throws Exception {
+    server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/tasks/legacy/result",
+        exchange ->
+            respond(
+                exchange,
+                "{\"version\":\"3.4.5\",\"backend\":\"hybrid-engine\",\"results\":{\"fixture.pdf\":{\"md_content\":\"Synthetic source\",\"middle_json\":{\"pdf_info\":[]},\"content_list\":[{\"type\":\"text\",\"text\":\"Synthetic source\",\"page_idx\":0}]}}}"));
+    server.createContext(
+        "/tasks/legacy",
+        exchange -> respond(exchange, "{\"task_id\":\"legacy\",\"status\":\"completed\"}"));
+    server.start();
+    var adapter =
+        new MinerUPipelineAdapter(
+            "http://127.0.0.1:" + server.getAddress().getPort(),
+            new ObjectMapper(),
+            Duration.ofMillis(5),
+            Duration.ofSeconds(1),
+            "auto",
+            "ch");
+    List<String> tasks = new ArrayList<>();
+    assertThrows(
+        cn.lgs.knowledgebase.application.raw.ParserCheckpointPolicy.ResultStale.class,
+        () ->
+            adapter.parse(
+                "fixture.pdf",
+                new ByteArrayInputStream(new byte[0]),
+                "legacy",
+                tasks::add,
+                pipelineDeclaration(),
+                "a".repeat(64)));
+    assertEquals(List.of(""), tasks);
+  }
+
+  @Test
+  void currentPipelineCannotCertifyAnotherFileFormatEvenWithAValidDigest() throws Exception {
+    var mapper = new ObjectMapper();
+    var wrong = new java.util.TreeMap<>(pipelineDeclaration().components());
+    wrong.put("parser.format", ".docx");
+    var declaration = new cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity(wrong);
+    server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/pipeline",
+        exchange ->
+            respond(
+                exchange,
+                mapper.writeValueAsString(
+                    java.util.Map.of(
+                        "components", declaration.components(), "sha256", declaration.sha256()))));
+    server.start();
+    var adapter =
+        new MinerUPipelineAdapter(
+            "http://127.0.0.1:" + server.getAddress().getPort(),
+            mapper,
+            Duration.ofMillis(5),
+            Duration.ofSeconds(1),
+            "auto",
+            "ch");
+    var failure =
+        assertThrows(IllegalStateException.class, () -> adapter.currentPipeline("fixture.pdf"));
+    assertTrue(failure.getMessage().startsWith("PARSER_PROFILE_INVALID"));
+  }
+
+  private static cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity pipelineDeclaration() {
+    return new cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity(
+        java.util.Map.of(
+            "parser.name",
+            "mineru-hybrid-engine",
+            "parser.version",
+            "3.4.5",
+            "parser.format",
+            ".pdf",
+            "runtime.sha256",
+            "1".repeat(64),
+            "config.backend",
+            "hybrid-engine",
+            "config.effort",
+            "medium",
+            "config.parse_method",
+            "auto",
+            "config.language",
+            "ch"));
+  }
+
+  private static java.util.Map<String, Object> typedResult(
+      cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity pipeline, String sourceSha) {
+    return java.util.Map.of(
+        "version",
+        "3.4.5",
+        "backend",
+        "hybrid-engine",
+        "parser_profile",
+        java.util.Map.of(
+            "pipeline",
+            java.util.Map.of("components", pipeline.components(), "sha256", pipeline.sha256()),
+            "sourceSha256",
+            sourceSha,
+            "backend",
+            "hybrid-engine",
+            "effort",
+            "medium",
+            "parseMethod",
+            "auto",
+            "language",
+            "ch"),
+        "results",
+        java.util.Map.of(
+            "fixture.pdf",
+            java.util.Map.of(
+                "md_content",
+                "Synthetic native source",
+                "middle_json",
+                java.util.Map.of("pdf_info", List.of()),
+                "content_list",
+                List.of(
+                    java.util.Map.of(
+                        "type", "text", "text", "Synthetic native source", "page_idx", 0)))));
   }
 
   private static void respond(HttpExchange exchange, String json) throws IOException {

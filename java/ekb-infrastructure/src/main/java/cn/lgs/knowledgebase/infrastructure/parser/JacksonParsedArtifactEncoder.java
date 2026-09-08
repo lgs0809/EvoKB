@@ -24,6 +24,11 @@ public final class JacksonParsedArtifactEncoder implements ParsedArtifactEncoder
       Map<String, Object> artifact = new LinkedHashMap<>();
       artifact.put("parser_name", parsed.parserName());
       artifact.put("parser_version", parsed.parserVersion());
+      parsed.blocks().stream()
+          .map(block -> block.raw().get("_evokb_parser_receipt"))
+          .filter(java.util.Objects::nonNull)
+          .findFirst()
+          .ifPresent(receipt -> artifact.put("parser_receipt", receipt));
       artifact.put("middle_json", middle);
       artifact.put("content_list", content);
       return mapper.writeValueAsBytes(artifact);

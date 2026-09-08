@@ -1,10 +1,17 @@
 package cn.lgs.knowledgebase.infrastructure.compilation;
 
+import cn.lgs.knowledgebase.application.compilation.CompilationCommands;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.CompilationRepository;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.SummaryRecord;
 import cn.lgs.knowledgebase.application.compilation.CompilationContracts.VersionSource;
+import cn.lgs.knowledgebase.application.compilation.CompilationExecutionBudget;
+import cn.lgs.knowledgebase.application.compilation.CompilationPublication;
 import cn.lgs.knowledgebase.application.compilation.ConceptCompilationService;
+import cn.lgs.knowledgebase.application.compilation.ConceptTaskBinding;
+import cn.lgs.knowledgebase.application.compilation.EntryAssociationService;
 import cn.lgs.knowledgebase.application.compilation.GraphCompilationService;
+import cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit;
+import cn.lgs.knowledgebase.application.compilation.KnowledgeEntryCatalogue;
 import cn.lgs.knowledgebase.application.compilation.SummaryCompilationService;
 import cn.lgs.knowledgebase.application.compilation.WikiCompilationService;
 import cn.lgs.knowledgebase.application.compilation.WikiKeywordProjectionService;
@@ -32,8 +39,19 @@ public final class DurableCompilationWorker implements SmartLifecycle {
   private final Duration pollInterval;
   private final int claimLimit;
   private final Clock clock;
+  private final KnowledgeEntryCatalogue entries;
+  private final EntryAssociationService association;
+  private final CompilationCommands.Store commands;
   private final AtomicBoolean running = new AtomicBoolean(false);
   private ExecutorService executor;
+  private java.util.function.BooleanSupplier foregroundActive = () -> false;
+
+  /** Cooperatively yield shared model capacity; never block an HTTP caller or lose queued work. */
+  public DurableCompilationWorker withForegroundActivity(
+      java.util.function.BooleanSupplier active) {
+    foregroundActive = java.util.Objects.requireNonNull(active);
+    return this;
+  }
 
   public DurableCompilationWorker(
       GenerationTaskRepository tasks,
@@ -69,6 +87,146 @@ public final class DurableCompilationWorker implements SmartLifecycle {
       Duration pollInterval,
       int claimLimit,
       Clock clock) {
+    this(
+        tasks,
+        compilation,
+        summaries,
+        concepts,
+        graph,
+        wiki,
+        wikiProjection,
+        pollInterval,
+        claimLimit,
+        clock,
+        null,
+        null);
+  }
+
+  public DurableCompilationWorker(
+      GenerationTaskRepository tasks,
+      CompilationRepository compilation,
+      SummaryCompilationService summaries,
+      ConceptCompilationService concepts,
+      GraphCompilationService graph,
+      WikiCompilationService wiki,
+      WikiKeywordProjectionService wikiProjection,
+      Duration pollInterval,
+      int claimLimit,
+      KnowledgeEntryCatalogue entries) {
+    this(
+        tasks,
+        compilation,
+        summaries,
+        concepts,
+        graph,
+        wiki,
+        wikiProjection,
+        pollInterval,
+        claimLimit,
+        Clock.systemUTC(),
+        require(entries, "entry catalogue"),
+        null);
+  }
+
+  public DurableCompilationWorker(
+      GenerationTaskRepository tasks,
+      CompilationRepository compilation,
+      SummaryCompilationService summaries,
+      ConceptCompilationService concepts,
+      GraphCompilationService graph,
+      WikiCompilationService wiki,
+      WikiKeywordProjectionService wikiProjection,
+      Duration pollInterval,
+      int claimLimit,
+      KnowledgeEntryCatalogue entries,
+      EntryAssociationService association) {
+    this(
+        tasks,
+        compilation,
+        summaries,
+        concepts,
+        graph,
+        wiki,
+        wikiProjection,
+        pollInterval,
+        claimLimit,
+        Clock.systemUTC(),
+        require(entries, "entry catalogue"),
+        require(association, "source association"));
+  }
+
+  private DurableCompilationWorker(
+      GenerationTaskRepository tasks,
+      CompilationRepository compilation,
+      SummaryCompilationService summaries,
+      ConceptCompilationService concepts,
+      GraphCompilationService graph,
+      WikiCompilationService wiki,
+      WikiKeywordProjectionService wikiProjection,
+      Duration pollInterval,
+      int claimLimit,
+      Clock clock,
+      KnowledgeEntryCatalogue entries,
+      EntryAssociationService association) {
+    this(
+        tasks,
+        compilation,
+        summaries,
+        concepts,
+        graph,
+        wiki,
+        wikiProjection,
+        pollInterval,
+        claimLimit,
+        clock,
+        entries,
+        association,
+        null);
+  }
+
+  public DurableCompilationWorker(
+      GenerationTaskRepository tasks,
+      CompilationRepository compilation,
+      SummaryCompilationService summaries,
+      ConceptCompilationService concepts,
+      GraphCompilationService graph,
+      WikiCompilationService wiki,
+      WikiKeywordProjectionService wikiProjection,
+      Duration pollInterval,
+      int claimLimit,
+      KnowledgeEntryCatalogue entries,
+      EntryAssociationService association,
+      CompilationCommands.Store commands) {
+    this(
+        tasks,
+        compilation,
+        summaries,
+        concepts,
+        graph,
+        wiki,
+        wikiProjection,
+        pollInterval,
+        claimLimit,
+        Clock.systemUTC(),
+        require(entries, "entry catalogue"),
+        require(association, "source association"),
+        require(commands, "command store"));
+  }
+
+  private DurableCompilationWorker(
+      GenerationTaskRepository tasks,
+      CompilationRepository compilation,
+      SummaryCompilationService summaries,
+      ConceptCompilationService concepts,
+      GraphCompilationService graph,
+      WikiCompilationService wiki,
+      WikiKeywordProjectionService wikiProjection,
+      Duration pollInterval,
+      int claimLimit,
+      Clock clock,
+      KnowledgeEntryCatalogue entries,
+      EntryAssociationService association,
+      CompilationCommands.Store commands) {
     this.tasks = require(tasks, "generation task repository");
     this.compilation = require(compilation, "compilation repository");
     this.summaries = require(summaries, "summary compiler");
@@ -80,14 +238,26 @@ public final class DurableCompilationWorker implements SmartLifecycle {
         pollInterval == null || pollInterval.isZero() || pollInterval.isNegative()
             ? Duration.ofSeconds(1)
             : pollInterval;
-    this.claimLimit = claimLimit <= 0 ? 1 : Math.min(claimLimit, 8);
+    // One executor can start only one stage at a time; queued stages must not spend their deadline
+    // waiting.
+    this.claimLimit = 1;
     this.clock = require(clock, "clock");
+    this.entries = entries;
+    this.association = association;
+    this.commands = commands;
   }
 
   @Override
   public synchronized void start() {
     if (!running.compareAndSet(false, true)) return;
-    tasks.resetInterrupted(clock.instant());
+    tasks.resetInterrupted(
+        List.of(
+            GenerationTaskType.SOURCE_ASSOCIATION,
+            GenerationTaskType.SUMMARY,
+            GenerationTaskType.CONCEPT,
+            GenerationTaskType.GRAPH,
+            GenerationTaskType.WIKI),
+        clock.instant());
     executor =
         Executors.newSingleThreadExecutor(
             runnable -> {
@@ -120,6 +290,7 @@ public final class DurableCompilationWorker implements SmartLifecycle {
   }
 
   public int runOneCycle() {
+    if (foregroundActive.getAsBoolean()) return 0;
     List<GenerationTask> claimed = tasks.claimPending(claimLimit, clock.instant());
     for (GenerationTask task : claimed) process(task);
     return claimed.size();
@@ -145,27 +316,85 @@ public final class DurableCompilationWorker implements SmartLifecycle {
 
   private void process(GenerationTask task) {
     try {
-      switch (task.taskType()) {
-        case SUMMARY -> processSummary(task);
-        case CONCEPT -> processConcept(task);
-        case GRAPH -> processGraph(task);
-        case WIKI -> processWiki(task);
+      var command =
+          commands == null
+              ? java.util.Optional.<CompilationCommands.Command>empty()
+              : commands.find(task);
+      var taskGate = tasks.publication(task);
+      var authority =
+          command.isPresent()
+              ? commands.publication(task, command.orElseThrow(), taskGate)
+              : taskGate;
+      var gate =
+          new CompilationPublication() {
+            public void captureInputs(List<String> versions) {
+              authority.captureInputs(versions);
+            }
+
+            public void publish(Runnable writes) {
+              authority.publish(writes);
+            }
+
+            public String objectKey(String key) {
+              return authority.objectKey(key);
+            }
+
+            public void check() {
+              if (foregroundActive.getAsBoolean()) throw new ForegroundBusy();
+              authority.check();
+            }
+          };
+      try (var budget = CompilationExecutionBudget.open(task, gate, clock)) {
+        if (command.isPresent()) {
+          processCommand(task, command.orElseThrow(), gate);
+          return;
+        }
+        if (task.subjectId().startsWith("command/"))
+          throw new IllegalStateException("compilation command store is unavailable");
+        switch (task.taskType()) {
+          case SOURCE_ASSOCIATION -> {
+            if (association == null)
+              throw new IllegalStateException("background source association is unavailable");
+            int count = association.associate(task.versionId(), gate);
+            tasks.complete(
+                task, KnowledgeDomain.sha256("related_entries=" + count), clock.instant());
+          }
+          case SUMMARY -> processSummary(task, gate);
+          case CONCEPT -> processConcept(task, gate);
+          case GRAPH -> processGraph(task, gate);
+          case WIKI -> processWiki(task, gate);
+        }
       }
     } catch (RuntimeException failure) {
-      tasks.fail(task.taskId(), errorCode(task.taskType()), failure.getMessage(), clock.instant());
+      if (Thread.currentThread().isInterrupted()) return;
+      GenerationTaskFailureHandler.persist(
+          tasks, task, errorCode(task.taskType()), failure, clock.instant());
     }
   }
 
-  private void processSummary(GenerationTask task) {
+  static final class ForegroundBusy extends IllegalStateException {
+    ForegroundBusy() {
+      super(
+          "前台查询正在使用共享资源，后台任务将保留并稍后继续。",
+          new cn.lgs.knowledgebase.application.port.Ports.TransientDependencyFailure(
+              "foreground workload active", null));
+    }
+  }
+
+  private void processSummary(GenerationTask task, CompilationPublication publication) {
     List<SummaryCompilationService.PreparedSummary> prepared =
-        summaries.compileVersion(task.versionId());
+        summaries.compileVersion(task.versionId(), publication);
     StringBuilder fingerprint = new StringBuilder();
     int downstream = 0;
     for (SummaryCompilationService.PreparedSummary item : prepared) {
       SummaryRecord summary = item.summary();
       fingerprint.append(summary.id()).append(':').append(summary.contentHash()).append(';');
       if (summary.activeAndGrounded()) {
-        tasks.queue(task.versionId(), GenerationTaskType.CONCEPT, summary.id(), clock.instant());
+        String subject =
+            entries == null ? summary.id() : ConceptTaskBinding.from(summary, task).subject();
+        if (task.subjectId().startsWith("repair/"))
+          tasks.queueRepair(task.versionId(), GenerationTaskType.CONCEPT, subject, clock.instant());
+        else tasks.queue(task.versionId(), GenerationTaskType.CONCEPT, subject, clock.instant());
         downstream++;
       }
     }
@@ -177,10 +406,63 @@ public final class DurableCompilationWorker implements SmartLifecycle {
         clock.instant());
   }
 
-  private void processConcept(GenerationTask task) {
+  private void processCommand(
+      GenerationTask task, CompilationCommands.Command command, CompilationPublication gate) {
+    var request = command.request();
+    String hash;
+    switch (request.kind()) {
+      case SUMMARY -> {
+        processSummary(task, gate);
+        return;
+      }
+      case GRAPH -> {
+        var result =
+            graph.compileSummary(request.summaryIds().get(0), gate, command.sourceVersions());
+        hash =
+            KnowledgeDomain.sha256(
+                result.summaryId() + "|" + result.entities() + "|" + result.relations());
+      }
+      case CONCEPT_PROJECTION -> {
+        var result = concepts.rebuildProjections(request.summaryIds().get(0), gate);
+        hash = KnowledgeDomain.sha256(result.toString());
+      }
+      case WIKI -> {
+        var result =
+            wiki.compile(
+                new WikiCompilationService.CompileRequest(
+                    request.wikiType(),
+                    request.title(),
+                    request.canonicalSubjectId(),
+                    request.summaryIds()),
+                gate,
+                published -> wikiProjection.project(published.id(), published.version()));
+        hash = result.wiki().contentHash();
+      }
+      case WIKI_KEYWORDS -> {
+        // The target graph is PostgreSQL: all projection work is a short native DB commit,
+        // with no model or remote index request hidden in this ownership transaction.
+        var result =
+            new java.util.concurrent.atomic.AtomicReference<
+                WikiKeywordProjectionService.ProjectionResult>();
+        gate.captureInputs(command.sourceVersions());
+        gate.check();
+        gate.publish(
+            () -> result.set(wikiProjection.project(request.wikiId(), request.wikiVersion())));
+        hash = KnowledgeDomain.sha256(result.get().toString());
+      }
+      default -> throw new IllegalStateException("unsupported compilation command");
+    }
+    tasks.complete(task, hash, clock.instant());
+  }
+
+  private void processConcept(GenerationTask task, CompilationPublication gate) {
     if (task.subjectId().isBlank())
       throw new IllegalStateException("CONCEPT task summary ID is missing");
-    ConceptCompilationService.CompileResult result = concepts.compileSummary(task.subjectId());
+    ConceptCompilationService.CompileResult result =
+        concepts.compileSummary(
+            ConceptTaskBinding.verifiedSummaryId(task, compilation),
+            gate,
+            task.errorCode().equals("CONCEPT_GENERATION_FAILED") ? task.errorMessage() : "");
     String fingerprint =
         result.summaryId()
             + "|concepts="
@@ -194,14 +476,20 @@ public final class DurableCompilationWorker implements SmartLifecycle {
                             + concept.preferredLabel())
                 .sorted()
                 .toList();
-    tasks.completeConceptAndQueueDerived(
-        task, KnowledgeDomain.sha256(fingerprint), clock.instant());
+    if (entries == null)
+      tasks.completeConceptAndQueueDerived(
+          task, KnowledgeDomain.sha256(fingerprint), clock.instant());
+    else tasks.complete(task, KnowledgeDomain.sha256(fingerprint), clock.instant());
   }
 
-  private void processGraph(GenerationTask task) {
+  private void processGraph(GenerationTask task, CompilationPublication gate) {
+    if (entries != null && task.subjectId().startsWith("entry/")) {
+      processEntryGraph(task, gate);
+      return;
+    }
     if (task.subjectId().isBlank())
       throw new IllegalStateException("GRAPH task summary ID is missing");
-    GraphCompilationService.CompileResult result = graph.compileSummary(task.subjectId());
+    GraphCompilationService.CompileResult result = graph.compileSummary(task.subjectId(), gate);
     String fingerprint =
         result.summaryId()
             + "|entities="
@@ -213,7 +501,20 @@ public final class DurableCompilationWorker implements SmartLifecycle {
     tasks.complete(task, KnowledgeDomain.sha256(fingerprint), clock.instant());
   }
 
-  private void processWiki(GenerationTask task) {
+  private void processWiki(GenerationTask task, CompilationPublication gate) {
+    if (entries != null && task.subjectId().startsWith("entry/")) {
+      var entry = frozenEntry(task);
+      var result =
+          wiki.compileEntry(
+              entry,
+              gate,
+              published -> {
+                entries.wikiPublished(entry);
+                wikiProjection.project(published.id(), published.version());
+              });
+      tasks.complete(task, result.wiki().contentHash(), clock.instant());
+      return;
+    }
     VersionSource source = compilation.loadVersionSource(task.versionId());
     String company = text(source.metadata().company());
     List<SummaryRecord> active =
@@ -238,9 +539,59 @@ public final class DurableCompilationWorker implements SmartLifecycle {
                 wikiType,
                 title,
                 canonicalSubjectId,
-                active.stream().map(SummaryRecord::id).toList()));
-    wikiProjection.project(result.wiki().id(), result.wiki().version());
+                active.stream().map(SummaryRecord::id).toList()),
+            gate,
+            published -> wikiProjection.project(published.id(), published.version()));
     tasks.complete(task, result.wiki().contentHash(), clock.instant());
+  }
+
+  private KnowledgeEntryCatalogue.Entry frozenEntry(GenerationTask task) {
+    String[] key = task.subjectId().split("/", -1);
+    if (key.length != 4 || !key[0].equals("entry") || !key[2].equals("revision"))
+      throw new IllegalStateException("entry compilation subject is invalid");
+    var entry =
+        entries.find(key[1]).orElseThrow(() -> new IllegalStateException("entry is missing"));
+    if (entry.revision() != Long.parseLong(key[3])
+        || !entry.versionIds().contains(task.versionId()))
+      throw new IllegalStateException("entry compilation inputs changed");
+    GroundingConstraintAudit.requireCurrentEntry(entry, compilation);
+    return entry;
+  }
+
+  private void processEntryGraph(GenerationTask task, CompilationPublication gate) {
+    var entry = frozenEntry(task);
+    gate.captureInputs(entry.versionIds());
+    var writes = new java.util.ArrayList<Runnable>();
+    var fingerprints = new java.util.ArrayList<String>();
+    CompilationPublication preparation =
+        new CompilationPublication() {
+          public void captureInputs(List<String> versions) {
+            if (versions.isEmpty() || !entry.versionIds().containsAll(versions))
+              throw new IllegalStateException("graph attempted to add an unfrozen entry source");
+          }
+
+          public void publish(Runnable callback) {
+            writes.add(callback);
+          }
+
+          public String objectKey(String key) {
+            return gate.objectKey(key);
+          }
+        };
+    for (String summaryId : entry.summaryIds()) {
+      gate.check();
+      var result = graph.compileSummary(summaryId, preparation, entry.versionIds());
+      fingerprints.add(
+          result.summaryId()
+              + ":"
+              + result.relations().stream().map(r -> r.id()).sorted().toList());
+    }
+    gate.publish(
+        () -> {
+          writes.forEach(Runnable::run);
+          entries.graphPublished(entry);
+        });
+    tasks.complete(task, KnowledgeDomain.sha256(fingerprints.toString()), clock.instant());
   }
 
   private static String wikiType(String documentType, String company) {
@@ -256,6 +607,7 @@ public final class DurableCompilationWorker implements SmartLifecycle {
 
   private static String errorCode(GenerationTaskType type) {
     return switch (type) {
+      case SOURCE_ASSOCIATION -> "SOURCE_ASSOCIATION_FAILED";
       case SUMMARY -> "SUMMARY_GENERATION_FAILED";
       case CONCEPT -> "CONCEPT_GENERATION_FAILED";
       case GRAPH -> "GRAPH_GENERATION_FAILED";

@@ -54,7 +54,27 @@ public final class IngestionDomain {
       String company,
       String documentType,
       LocalDate documentDate,
-      List<String> manualTags) {
+      List<String> manualTags,
+      Integer securityLevel) {
+    public FileMetadata(
+        String logicalName,
+        String sourceDepartment,
+        String materialCategory,
+        String company,
+        String documentType,
+        LocalDate documentDate,
+        List<String> manualTags) {
+      this(
+          logicalName,
+          sourceDepartment,
+          materialCategory,
+          company,
+          documentType,
+          documentDate,
+          manualTags,
+          null);
+    }
+
     public FileMetadata {
       logicalName = requireText(logicalName, "logicalName");
       sourceDepartment = trim(sourceDepartment);
@@ -82,6 +102,56 @@ public final class IngestionDomain {
         boolean clearDocumentDate,
         List<String> manualTags,
         boolean replaceTags) {
+      return patch(
+          logicalName,
+          sourceDepartment,
+          materialCategory,
+          company,
+          documentType,
+          documentDate,
+          clearDocumentDate,
+          manualTags,
+          replaceTags,
+          null);
+    }
+
+    public FileMetadata patch(
+        String logicalName,
+        String sourceDepartment,
+        String materialCategory,
+        String company,
+        String documentType,
+        LocalDate documentDate,
+        boolean clearDocumentDate,
+        List<String> manualTags,
+        boolean replaceTags,
+        Integer securityLevel) {
+      return patch(
+          logicalName,
+          sourceDepartment,
+          materialCategory,
+          company,
+          documentType,
+          documentDate,
+          clearDocumentDate,
+          manualTags,
+          replaceTags,
+          securityLevel,
+          false);
+    }
+
+    public FileMetadata patch(
+        String logicalName,
+        String sourceDepartment,
+        String materialCategory,
+        String company,
+        String documentType,
+        LocalDate documentDate,
+        boolean clearDocumentDate,
+        List<String> manualTags,
+        boolean replaceTags,
+        Integer securityLevel,
+        boolean clearSecurityLevel) {
       return new FileMetadata(
           logicalName == null ? this.logicalName : requireText(logicalName, "logicalName"),
           sourceDepartment == null ? this.sourceDepartment : sourceDepartment,
@@ -89,7 +159,8 @@ public final class IngestionDomain {
           company == null ? this.company : company,
           documentType == null ? this.documentType : documentType,
           clearDocumentDate ? null : (documentDate == null ? this.documentDate : documentDate),
-          replaceTags ? manualTags : this.manualTags);
+          replaceTags ? manualTags : this.manualTags,
+          clearSecurityLevel ? null : securityLevel == null ? this.securityLevel : securityLevel);
     }
   }
 
@@ -132,7 +203,8 @@ public final class IngestionDomain {
       Instant createdAt,
       Instant updatedAt,
       Instant startedAt,
-      Instant finishedAt) {
+      Instant finishedAt,
+      Instant nextAttemptAt) {
     public FileItem {
       fileId = requireText(fileId, "fileId");
       batchId = requireText(batchId, "batchId");
@@ -151,6 +223,52 @@ public final class IngestionDomain {
       versionId = trim(versionId);
       errorCode = trim(errorCode);
       errorMessage = errorMessage == null ? "" : errorMessage;
+    }
+
+    /** Existing in-memory/staged callers have no scheduled persistent retry. */
+    public FileItem(
+        String fileId,
+        String batchId,
+        String relativePath,
+        String originalFilename,
+        String stagingPath,
+        long sizeBytes,
+        String sha256,
+        FileMetadata metadata,
+        FileStatus status,
+        ProgressStage progressStage,
+        int attempt,
+        String documentId,
+        String versionId,
+        DuplicateHint duplicateHint,
+        String errorCode,
+        String errorMessage,
+        Instant createdAt,
+        Instant updatedAt,
+        Instant startedAt,
+        Instant finishedAt) {
+      this(
+          fileId,
+          batchId,
+          relativePath,
+          originalFilename,
+          stagingPath,
+          sizeBytes,
+          sha256,
+          metadata,
+          status,
+          progressStage,
+          attempt,
+          documentId,
+          versionId,
+          duplicateHint,
+          errorCode,
+          errorMessage,
+          createdAt,
+          updatedAt,
+          startedAt,
+          finishedAt,
+          null);
     }
 
     public boolean metadataEditable() {
@@ -339,7 +457,8 @@ public final class IngestionDomain {
           createdAt,
           updatedAt,
           startedAt,
-          finishedAt);
+          finishedAt,
+          nextAttemptAt);
     }
   }
 

@@ -36,7 +36,8 @@ class CompilationServicesTest {
                     "合同主体", "甲公司与乙公司签署协议。", List.of("b1")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     // Coverage is evaluated once per exact prompt fragment after the transport-boundary split.
     for (int i = 0; i < 4; i++)
       f.model.enqueue(
@@ -70,6 +71,280 @@ class CompilationServicesTest {
     assertTrue(
         f.model.structuredPrompts.stream().noneMatch(prompt -> prompt.startsWith("SUMMARY\n")));
     assertEquals(0, f.derived.summaryIndexes);
+  }
+
+  @Test
+  void legacySummaryCannotBeReusedAsEvidenceByAnyFreshHigherLayer() {
+    Fixture f = new Fixture();
+    var prior = activeSummary("legacy");
+    var original = prior.facts().get(0);
+    var legacyFact =
+        new SummaryFact(
+            original.id(),
+            prior.id(),
+            original.section(),
+            original.factText(),
+            original.evidenceBlockIds(),
+            original.evidenceIds(),
+            "PASS",
+            "old model reason");
+    var legacy =
+        new SummaryRecord(
+            prior.id(),
+            prior.unitId(),
+            prior.documentId(),
+            prior.versionId(),
+            prior.objectKey(),
+            prior.contentHash(),
+            "PASS",
+            "PASS",
+            "ACTIVE",
+            prior.model(),
+            prior.markdown(),
+            List.of(legacyFact),
+            prior.createdAt());
+    f.repo.summaries.put(legacy.id(), legacy);
+    assertThrows(
+        IllegalStateException.class,
+        () -> new GraphCompilationService(f.repo, f.model, f.graph).compileSummary(legacy.id()));
+    assertThrows(
+        IllegalStateException.class,
+        () -> new ConceptCompilationService(f.repo, f.model).compileSummary(legacy.id()));
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+                .compile(
+                    new WikiCompilationService.CompileRequest(
+                        "COMPANY", "synthetic prior subject", "", List.of(legacy.id()))));
+    assertTrue(f.model.structuredPrompts.isEmpty());
+    assertTrue(f.repo.wikis.isEmpty());
+    assertEquals("PASS", f.repo.summaries.get(legacy.id()).groundingStatus());
+  }
+
+  @Test
+  void entryWikiCannotUseAnUncitedUnauditedModelDependency() {
+    assertEntryWikiInputRejected(false);
+  }
+
+  @Test
+  void entryWikiCannotSilentlyIgnoreAMissingModelDependency() {
+    assertEntryWikiInputRejected(true);
+  }
+
+  @Test
+  void entryWikiPersistsUncitedAuditedInputsSeparatelyFromItsCitations() {
+    Fixture f = groundedWikiFixture();
+    var cited = f.repo.summaries.get("s1");
+    var uncited = activeSummary("uncited-input");
+    f.repo.summaries.put(uncited.id(), uncited);
+    var entry =
+        new KnowledgeEntryCatalogue.Entry(
+            "entry-full-inputs",
+            1,
+            "synthetic-scope",
+            Map.of(),
+            "COMPANY",
+            "甲公司",
+            List.of(),
+            "synthetic grounded identity",
+            "CONCEPT",
+            "ACTIVE",
+            List.of(
+                new KnowledgeEntryCatalogue.Source(
+                    cited.documentId(),
+                    cited.versionId(),
+                    cited.id(),
+                    "concept",
+                    1,
+                    cited.facts().stream().map(SummaryFact::id).toList())),
+            List.of(
+                new KnowledgeEntryCatalogue.BuildInput(cited.id(), cited.versionId(), 1),
+                new KnowledgeEntryCatalogue.BuildInput(uncited.id(), uncited.versionId(), 1)));
+    var result =
+        new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+            .compileEntry(entry, f.repo.newPublication(), ignored -> {});
+    assertEquals(List.of("f1"), result.wiki().claims().get(0).factIds());
+    assertEquals(List.of("s1", "uncited-input"), f.repo.wikiBuildInputs);
+    assertEquals(1, f.derived.wikiIndexes);
+  }
+
+  private static void assertEntryWikiInputRejected(boolean missing) {
+    Fixture f = new Fixture();
+    var current = activeSummary("s1");
+    f.repo.summaries.put(current.id(), current);
+    if (!missing) {
+      var prior = activeSummary("legacy");
+      var original = prior.facts().get(0);
+      var unreviewed =
+          new SummaryFact(
+              original.id(),
+              prior.id(),
+              original.section(),
+              original.factText(),
+              original.evidenceBlockIds(),
+              original.evidenceIds(),
+              "PASS",
+              "historical unreviewed reason");
+      f.repo.summaries.put(
+          prior.id(),
+          new SummaryRecord(
+              prior.id(),
+              prior.unitId(),
+              prior.documentId(),
+              prior.versionId(),
+              prior.objectKey(),
+              prior.contentHash(),
+              "PASS",
+              "PASS",
+              "ACTIVE",
+              prior.model(),
+              prior.markdown(),
+              List.of(unreviewed),
+              prior.createdAt()));
+    }
+    var entry =
+        new KnowledgeEntryCatalogue.Entry(
+            "entry",
+            1,
+            "synthetic-scope",
+            Map.of(),
+            "CONTRACT",
+            "synthetic entry",
+            List.of(),
+            "synthetic prose",
+            "CONCEPT",
+            "ACTIVE",
+            List.of(
+                new KnowledgeEntryCatalogue.Source(
+                    current.documentId(),
+                    current.versionId(),
+                    current.id(),
+                    "concept",
+                    1,
+                    current.facts().stream().map(SummaryFact::id).toList())),
+            List.of(
+                new KnowledgeEntryCatalogue.BuildInput(current.id(), current.versionId(), 1),
+                new KnowledgeEntryCatalogue.BuildInput("legacy", current.versionId(), 1)));
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+                .compileEntry(entry, f.repo.newPublication(), ignored -> {}));
+    assertTrue(f.model.structuredPrompts.isEmpty());
+    assertTrue(f.repo.wikis.isEmpty());
+    assertEquals(0, f.derived.wikiIndexes);
+  }
+
+  @Test
+  void originalUnsupportedWikiBatchFixtureIsRejectedWithoutChangingTheOracle() {
+    Fixture f = new Fixture();
+    var prior = activeSummary("s1");
+    String unsupported = "李四担任甲公司监事。";
+    var claimed =
+        new SummaryFact(
+            "f2",
+            prior.id(),
+            "Governance",
+            unsupported,
+            List.of("b2"),
+            List.of("ev2"),
+            "PASS",
+            "synthetic audit",
+            GroundingConstraintAudit.accepted(
+                unsupported,
+                GroundingConstraintAudit.exactCopyChecks(unsupported, List.of(unsupported))));
+    var priorFacts = new java.util.ArrayList<>(prior.facts());
+    priorFacts.add(claimed);
+    var inconsistent =
+        new SummaryRecord(
+            prior.id(),
+            prior.unitId(),
+            prior.documentId(),
+            prior.versionId(),
+            prior.objectKey(),
+            prior.contentHash(),
+            "PASS",
+            "PASS",
+            "ACTIVE",
+            prior.model(),
+            prior.markdown(),
+            priorFacts,
+            prior.createdAt());
+    // Original b2 says only agreement duration. Keep that source as the rejection oracle.
+    assertEquals("协议期限为一年。", f.repo.source.evidenceByBlock().get("b2").content());
+    assertFalse(GroundingConstraintAudit.currentSummary(inconsistent, f.repo.source));
+    f.repo.summaries.put(inconsistent.id(), inconsistent);
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+                .compile(
+                    new WikiCompilationService.CompileRequest(
+                        "COMPANY", "synthetic subject", "", List.of(inconsistent.id()))));
+    assertTrue(f.model.structuredPrompts.isEmpty());
+  }
+
+  @Test
+  void legacyPassWithAuditLookingReasonCannotSkipNormalRecompilation() {
+    Fixture f = new Fixture();
+    var prior = activeSummary("legacy");
+    var fact = prior.facts().get(0);
+    var legacy =
+        new SummaryFact(
+            fact.id(),
+            prior.id(),
+            fact.section(),
+            fact.factText(),
+            fact.evidenceBlockIds(),
+            fact.evidenceIds(),
+            "PASS",
+            GroundingConstraintAudit.POLICY_VERSION + " all supported");
+    f.repo.summaries.put(
+        prior.id(),
+        new SummaryRecord(
+            prior.id(),
+            prior.unitId(),
+            prior.documentId(),
+            prior.versionId(),
+            prior.objectKey(),
+            prior.contentHash(),
+            "PASS",
+            "PASS",
+            "ACTIVE",
+            prior.model(),
+            prior.markdown(),
+            List.of(legacy),
+            prior.createdAt()));
+    f.repo.persistedDocumentUnits =
+        List.of(new DocumentUnit("u1", "v1", 1, "", "single", "合同/协议", 0, 1));
+    f.model.enqueue(
+        Ports.ModelTask.CLASSIFY_UNIT,
+        new SummaryCompilationService.Classification("合同/协议", "single", List.of()));
+    f.model.enqueue(
+        Ports.ModelTask.SUMMARY,
+        new SummaryCompilationService.FactProposalSet(
+            List.of(
+                new SummaryCompilationService.FactProposal("主体", "张三担任甲公司董事。", List.of("b1")))));
+    f.model.enqueue(
+        Ports.ModelTask.SUMMARY_JUDGE,
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "synthetic located check"));
+    f.model.enqueue(
+        Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
+    var rebuilt =
+        new SummaryCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+            .compileVersion("v1")
+            .get(0)
+            .summary();
+    assertTrue(rebuilt.activeAndGrounded());
+    assertFalse(rebuilt.id().equals(prior.id()));
+    assertTrue(GroundingConstraintAudit.currentSummary(rebuilt, f.repo.source));
+    assertTrue(
+        f.repo.summaries.containsKey(prior.id()),
+        "History is retained instead of fabricating old audit");
+    assertTrue(
+        f.model.structuredPrompts.stream().anyMatch(prompt -> prompt.startsWith("SUMMARY\n")));
   }
 
   @Test
@@ -116,12 +391,14 @@ class CompilationServicesTest {
       f.model.enqueue(
           Ports.ModelTask.SUMMARY, new SummaryCompilationService.FactProposalSet(List.of()));
     f.model.enqueueType(
-        SummaryCompilationService.SupportDecision.class,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision.class,
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     for (int i = 0; i < 12; i++)
       f.model.enqueueType(
-          SummaryCompilationService.SupportDecision.class,
-          new SummaryCompilationService.SupportDecision(false, "other fragment"));
+          cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision.class,
+          new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+              false, "other fragment"));
     for (int i = 0; i < 24; i++)
       f.model.enqueueType(
           SummaryCompilationService.CoverageDecision.class,
@@ -157,7 +434,8 @@ class CompilationServicesTest {
                     "合同主体", "甲公司与乙公司签署协议。", List.of("b1")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     // The extraction retry can split the oversized block more than once; queue one coverage
     // response for every exact source-preserving fragment produced by the recursive splitter.
     for (int i = 0; i < 8; i++)
@@ -186,7 +464,8 @@ class CompilationServicesTest {
                     "合同主体", "甲公司与乙公司签署协议。", List.of("b1")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
 
@@ -213,7 +492,8 @@ class CompilationServicesTest {
                     "合同主体", "甲公司与乙公司签署协议。", List.of("b1")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
 
@@ -348,7 +628,8 @@ class CompilationServicesTest {
                     "协议事实", "甲公司与乙公司签署协议，期限为一年。", List.of("b1", "b2")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
 
@@ -376,10 +657,12 @@ class CompilationServicesTest {
                 new SummaryCompilationService.FactProposal("期限", "协议期限为一年。", List.of("b2")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecisionSet(
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch(
             List.of(
-                new SummaryCompilationService.SupportDecisionItem("C1", true, "direct"),
-                new SummaryCompilationService.SupportDecisionItem("C2", true, "direct"))));
+                new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Item(
+                    "C1", true, "direct"),
+                new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Item(
+                    "C2", true, "direct"))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
 
@@ -414,12 +697,15 @@ class CompilationServicesTest {
     for (int i = 0; i < 4; i++) {
       f.model.enqueue(
           Ports.ModelTask.SUMMARY_JUDGE,
-          new SummaryCompilationService.SupportDecision(true, "direct"));
+          new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+              true, "direct"));
     }
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecisionSet(
-            List.of(new SummaryCompilationService.SupportDecisionItem("C5", true, "direct"))));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch(
+            List.of(
+                new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Item(
+                    "C5", true, "direct"))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
 
@@ -483,10 +769,12 @@ class CompilationServicesTest {
             List.of(new SummaryCompilationService.FactProposal("期限", "协议期限为一年。", List.of("b2")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecisionSet(
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch(
             List.of(
-                new SummaryCompilationService.SupportDecisionItem("C1", true, "direct"),
-                new SummaryCompilationService.SupportDecisionItem("C2", true, "direct"))));
+                new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Item(
+                    "C1", true, "direct"),
+                new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Item(
+                    "C2", true, "direct"))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
 
@@ -512,10 +800,12 @@ class CompilationServicesTest {
                 new SummaryCompilationService.FactProposal("无证据", "乙公司已付款。", List.of("b2")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecisionSet(
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch(
             List.of(
-                new SummaryCompilationService.SupportDecisionItem("C1", true, "direct"),
-                new SummaryCompilationService.SupportDecisionItem("C2", false, "not stated"))));
+                new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Item(
+                    "C1", true, "direct"),
+                new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Item(
+                    "C2", false, "not stated"))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
 
@@ -552,7 +842,8 @@ class CompilationServicesTest {
                     "适用范围", "本规则适用于董事会运作。", List.of("b1")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
 
@@ -562,6 +853,53 @@ class CompilationServicesTest {
 
     assertEquals("公司治理制度", result.get(0).unit().documentType());
     assertTrue(result.get(0).summary().activeAndGrounded());
+  }
+
+  @Test
+  void completeRawCoverageProjectionCarriesTheSameAuditWithoutSemanticInference() {
+    Fixture f = new Fixture();
+    f.model.enqueue(
+        Ports.ModelTask.CLASSIFY_UNIT,
+        new SummaryCompilationService.Classification("合同/协议", "single", List.of()));
+    f.model.enqueue(
+        Ports.ModelTask.SUMMARY,
+        new SummaryCompilationService.FactProposalSet(
+            List.of(
+                new SummaryCompilationService.FactProposal(
+                    "合同主体", "甲公司与乙公司签署协议。", List.of("b1")))));
+    f.model.enqueue(
+        Ports.ModelTask.SUMMARY_JUDGE,
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "synthetic fixture support"));
+    f.model.enqueue(
+        Ports.ModelTask.SUMMARY_JUDGE,
+        new SummaryCompilationService.CoverageDecision(
+            List.of(
+                new SummaryCompilationService.MissingFact("missing clause", "期限", List.of("b2")))));
+    f.model.enqueue(
+        Ports.ModelTask.SUMMARY, new SummaryCompilationService.FactProposalSet(List.of()));
+    f.model.enqueue(
+        Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
+    var summary =
+        new SummaryCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+            .compileVersion("v1")
+            .get(0)
+            .summary();
+    var raw =
+        f.repo.source.blocks().stream()
+            .filter(block -> block.id().equals("b2"))
+            .findFirst()
+            .orElseThrow();
+    var projected =
+        summary.facts().stream()
+            .filter(fact -> fact.evidenceBlockIds().equals(List.of("b2")))
+            .findFirst()
+            .orElseThrow();
+    assertTrue(summary.activeAndGrounded());
+    assertEquals(raw.content().trim(), projected.factText());
+    assertTrue(projected.groundingReason().contains(GroundingConstraintAudit.POLICY_VERSION));
+    assertTrue(projected.groundingReason().contains("direct raw evidence projection"));
+    assertTrue(projected.groundingReason().contains(raw.content().trim()));
   }
 
   @Test
@@ -578,7 +916,8 @@ class CompilationServicesTest {
                     "合同主体", "甲公司与乙公司签署协议。", List.of("b1")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     var missing = new SummaryCompilationService.MissingFact("协议期限为一年", "期限与时间节点", List.of("b2"));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
@@ -590,7 +929,8 @@ class CompilationServicesTest {
                 new SummaryCompilationService.FactProposal("期限与时间节点", "协议期限为一年。", List.of("b2")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
         new SummaryCompilationService.CoverageDecision(List.of(missing)));
@@ -656,7 +996,8 @@ class CompilationServicesTest {
                     "合同主体", "甲公司与乙公司签署协议。", List.of("b1")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE, new SummaryCompilationService.CoverageDecision(List.of()));
 
@@ -681,7 +1022,8 @@ class CompilationServicesTest {
                     "合同主体", "甲公司与乙公司签署协议。", List.of("b1")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
         new SummaryCompilationService.CoverageDecision(
@@ -740,7 +1082,8 @@ class CompilationServicesTest {
                     "合同主体", "甲公司与乙公司签署协议。", List.of("b1")))));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
-        new SummaryCompilationService.SupportDecision(true, "direct"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
         new IllegalStateException(
@@ -806,8 +1149,9 @@ class CompilationServicesTest {
     // evidence block is split into many prompt-only fragments.
     for (int i = 0; i < 16; i++)
       f.model.enqueueType(
-          SummaryCompilationService.SupportDecision.class,
-          new SummaryCompilationService.SupportDecision(true, "direct"));
+          cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision.class,
+          new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+              true, "direct"));
     f.model.enqueue(
         Ports.ModelTask.SUMMARY_JUDGE,
         new IllegalStateException(
@@ -880,8 +1224,9 @@ class CompilationServicesTest {
           Ports.ModelTask.SUMMARY, new SummaryCompilationService.FactProposalSet(List.of()));
     for (int i = 0; i < 16; i++)
       f.model.enqueueType(
-          SummaryCompilationService.SupportDecision.class,
-          new SummaryCompilationService.SupportDecision(true, "direct"));
+          cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision.class,
+          new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+              true, "direct"));
     // Coverage is evaluated once per exact prompt fragment after recursive splitting.
     for (int i = 0; i < 8; i++)
       f.model.enqueue(
@@ -921,6 +1266,305 @@ class CompilationServicesTest {
   }
 
   @Test
+  void graphMapsShortReferencesForCoverageRelationsAndBusinessAnchors() {
+    Fixture f = new Fixture();
+    f.repo.summaries.put("s1", activeSummary("s1"));
+    f.model.enqueue(
+        Ports.ModelTask.RELATION_EXTRACT,
+        new GraphCompilationService.Extraction(
+            List.of(),
+            List.of(
+                new GraphCompilationService.ProposedRelation(
+                    "张三",
+                    "PERSON",
+                    "DIRECTOR_OF",
+                    "甲公司",
+                    "COMPANY",
+                    List.of("F001"),
+                    "",
+                    "",
+                    0.95,
+                    List.of(new GraphScopeIdentity.Anchor("COMPANY", "甲公司", List.of("F001"))),
+                    "")),
+            List.of(new GraphCompilationService.FactDecision("F001", true, ""))));
+    var result = new GraphCompilationService(f.repo, f.model, f.graph).compileSummary("s1");
+    assertTrue(result.coverage().pass());
+    var relation =
+        result.relations().stream()
+            .filter(r -> r.predicate().equals("DIRECTOR_OF"))
+            .findFirst()
+            .orElseThrow();
+    assertEquals(List.of("f1"), relation.qualifiers().get("supporting_fact_ids"));
+    assertEquals(List.of("ev1"), relation.evidenceIds());
+    assertTrue(
+        result.entities().stream()
+            .filter(e -> !e.entityType().equals("DOCUMENT"))
+            .allMatch(e -> "SCOPE_GROUNDED".equals(e.attributes().get("identity_status"))));
+  }
+
+  @Test
+  void wikiMapsShortReferencesBeforeIndependentGroundingAndPublication() {
+    Fixture f = new Fixture();
+    f.repo.summaries.put("s1", activeSummary("s1"));
+    f.model.enqueue(
+        Ports.ModelTask.WIKI_WRITE,
+        new WikiCompilationService.Proposal(
+            "COMPANY",
+            "甲公司",
+            List.of(
+                new WikiCompilationService.ProposedClaim(
+                    "治理", "[[张三]]担任[[甲公司]]董事。", List.of("F001"))),
+            List.of(new WikiCompilationService.FactDecision("F001", true, ""))));
+    f.model.enqueue(
+        Ports.ModelTask.WIKI_JUDGE,
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
+    var result =
+        new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+            .compile(
+                new WikiCompilationService.CompileRequest(
+                    "COMPANY", "甲公司", "company", List.of("s1")));
+    assertTrue(result.coverage().pass());
+    assertEquals(List.of("f1"), result.wiki().claims().get(0).factIds());
+    assertEquals(List.of("ev1"), result.wiki().claims().get(0).evidenceIds());
+    assertEquals(1, f.derived.wikiIndexes);
+  }
+
+  @Test
+  void wikiProjectionRunsInsidePublicationAfterTheWikiAndIndexAreSaved() {
+    Fixture f = groundedWikiFixture();
+    boolean[] inPublication = {false};
+    int[] projections = {0};
+    CompilationPublication publication =
+        new CompilationPublication() {
+          public void captureInputs(List<String> versions) {}
+
+          public String objectKey(String key) {
+            return key;
+          }
+
+          public void publish(Runnable writes) {
+            inPublication[0] = true;
+            try {
+              writes.run();
+            } finally {
+              inPublication[0] = false;
+            }
+          }
+        };
+    new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+        .compile(
+            new WikiCompilationService.CompileRequest("COMPANY", "甲公司", "company", List.of("s1")),
+            publication,
+            wiki -> {
+              assertTrue(inPublication[0]);
+              assertEquals(wiki, f.repo.wikis.get(wiki.id()));
+              assertEquals(1, f.derived.wikiIndexes);
+              projections[0]++;
+            });
+    assertEquals(1, projections[0]);
+  }
+
+  @Test
+  void revokedPublicationNeverRunsWikiDatabaseProjection() {
+    Fixture f = groundedWikiFixture();
+    int[] projections = {0};
+    CompilationPublication publication =
+        new CompilationPublication() {
+          public void captureInputs(List<String> versions) {}
+
+          public String objectKey(String key) {
+            return key;
+          }
+
+          public void publish(Runnable writes) {
+            throw new IllegalStateException("source permissions changed");
+          }
+        };
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+                .compile(
+                    new WikiCompilationService.CompileRequest(
+                        "COMPANY", "甲公司", "company", List.of("s1")),
+                    publication,
+                    wiki -> projections[0]++));
+    assertEquals(0, projections[0]);
+    assertTrue(f.repo.wikis.isEmpty());
+    assertEquals(0, f.derived.wikiIndexes);
+  }
+
+  @Test
+  void wikiJudgesLargeProposalInCompleteBoundedBatches() {
+    Fixture f = largeWikiFixture(27);
+    for (int start = 1; start <= 27; start += 4)
+      enqueueWikiBatch(f, start, Math.min(27, start + 3), -1);
+    var result =
+        new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+            .compile(
+                new WikiCompilationService.CompileRequest(
+                    "COMPANY", "甲公司", "company", List.of("s1")));
+    assertEquals(27, result.wiki().claims().size());
+    assertEquals(1, f.repo.wikis.size());
+    assertEquals(1, f.derived.wikiIndexes);
+    var prompts =
+        f.model.structuredPrompts.stream().filter(p -> p.startsWith("WIKI_JUDGE\n")).toList();
+    assertEquals(7, prompts.size());
+    var seen = new LinkedHashMap<String, Integer>();
+    for (String prompt : prompts) {
+      var ids = java.util.regex.Pattern.compile("candidate_id=(C\\d+)\\n").matcher(prompt);
+      int count = 0;
+      while (ids.find()) {
+        seen.merge(ids.group(1), 1, Integer::sum);
+        count++;
+      }
+      assertTrue(count > 0 && count <= 4);
+    }
+    assertEquals(27, seen.size());
+    assertTrue(seen.values().stream().allMatch(n -> n == 1));
+    assertTrue(
+        result.wiki().claims().stream().allMatch(c -> c.evidenceIds().equals(List.of("ev1"))));
+  }
+
+  @Test
+  void wikiFinalSingleClaimKeepsTheCompleteIndependentAuditProtocol() {
+    Fixture f = largeWikiFixture(5);
+    enqueueWikiBatch(f, 1, 4, -1);
+    f.model.enqueue(
+        Ports.ModelTask.WIKI_JUDGE, new GroundingJudgeProtocol.Decision(true, "direct"));
+    var result =
+        new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+            .compile(
+                new WikiCompilationService.CompileRequest(
+                    "COMPANY", "甲公司", "company", List.of("s1")));
+    assertEquals(5, result.wiki().claims().size());
+    var prompts =
+        f.model.structuredPrompts.stream().filter(p -> p.startsWith("WIKI_JUDGE\n")).toList();
+    assertEquals(2, prompts.size());
+    assertTrue(prompts.get(1).contains("CLAIM="));
+    assertTrue(result.wiki().claims().stream().allMatch(c -> c.groundingAudit() != null));
+  }
+
+  @Test
+  void wikiNegativeLaterBatchCannotPublishAnyPartialPage() {
+    Fixture f = largeWikiFixture(8);
+    enqueueWikiBatch(f, 1, 4, -1);
+    enqueueWikiBatch(f, 5, 8, 7);
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+                .compile(
+                    new WikiCompilationService.CompileRequest(
+                        "COMPANY", "甲公司", "company", List.of("s1"))));
+    assertTrue(f.repo.wikis.isEmpty());
+    assertEquals(0, f.derived.wikiIndexes);
+  }
+
+  @Test
+  void wikiDecisionFromAnotherBatchCannotStandInForAMissingCandidate() {
+    Fixture f = largeWikiFixture(8);
+    enqueueWikiBatch(f, 1, 4, -1);
+    f.model.enqueue(
+        Ports.ModelTask.WIKI_JUDGE,
+        new GroundingJudgeProtocol.Batch(
+            List.of(
+                new GroundingJudgeProtocol.Item("C1", true, "wrong batch"),
+                new GroundingJudgeProtocol.Item("C6", true, "direct"),
+                new GroundingJudgeProtocol.Item("C7", true, "direct"),
+                new GroundingJudgeProtocol.Item("C8", true, "direct"))));
+    assertThrows(
+        ModelOutputRejectedException.class,
+        () ->
+            new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
+                .compile(
+                    new WikiCompilationService.CompileRequest(
+                        "COMPANY", "甲公司", "company", List.of("s1"))));
+    assertTrue(f.repo.wikis.isEmpty());
+    assertEquals(0, f.derived.wikiIndexes);
+  }
+
+  private static Fixture largeWikiFixture(int size) {
+    Fixture f = new Fixture();
+    f.repo.summaries.put("s1", activeSummary("s1"));
+    var claims = new ArrayList<WikiCompilationService.ProposedClaim>();
+    for (int index = 1; index <= size; index++)
+      claims.add(
+          new WikiCompilationService.ProposedClaim(
+              "治理" + index, "[[张三]]担任[[甲公司]]董事。", List.of("F001")));
+    f.model.enqueue(
+        Ports.ModelTask.WIKI_WRITE,
+        new WikiCompilationService.Proposal(
+            "COMPANY",
+            "甲公司",
+            claims,
+            List.of(new WikiCompilationService.FactDecision("F001", true, ""))));
+    return f;
+  }
+
+  private static void enqueueWikiBatch(Fixture f, int start, int end, int negative) {
+    var decisions = new ArrayList<GroundingJudgeProtocol.Item>();
+    for (int index = start; index <= end; index++)
+      decisions.add(
+          new GroundingJudgeProtocol.Item(
+              "C" + index, index != negative, index == negative ? "synthetic negative" : "direct"));
+    f.model.enqueue(Ports.ModelTask.WIKI_JUDGE, new GroundingJudgeProtocol.Batch(decisions));
+  }
+
+  private static Fixture groundedWikiFixture() {
+    Fixture f = new Fixture();
+    f.repo.summaries.put("s1", activeSummary("s1"));
+    f.model.enqueue(
+        Ports.ModelTask.WIKI_WRITE,
+        new WikiCompilationService.Proposal(
+            "COMPANY",
+            "甲公司",
+            List.of(
+                new WikiCompilationService.ProposedClaim(
+                    "治理", "[[张三]]担任[[甲公司]]董事。", List.of("F001"))),
+            List.of(new WikiCompilationService.FactDecision("F001", true, ""))));
+    f.model.enqueue(
+        Ports.ModelTask.WIKI_JUDGE,
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
+    return f;
+  }
+
+  @Test
+  void graphPublicationInheritsAllFrozenEntryInputsEvenWhenNoAdditionalFactIsCited() {
+    Fixture f = new Fixture();
+    f.repo.summaries.put("s1", activeSummary("s1"));
+    f.model.enqueue(
+        Ports.ModelTask.RELATION_EXTRACT,
+        new GraphCompilationService.Extraction(
+            List.of(),
+            List.of(),
+            List.of(
+                new GraphCompilationService.FactDecision(
+                    "f1", false, "Synthetic non-relation fact"))));
+    var captured = new ArrayList<String>();
+    CompilationPublication publication =
+        new CompilationPublication() {
+          public void captureInputs(List<String> versions) {
+            captured.addAll(versions);
+          }
+
+          public void publish(Runnable writes) {
+            writes.run();
+          }
+
+          public String objectKey(String key) {
+            return key;
+          }
+        };
+    new GraphCompilationService(f.repo, f.model, f.graph)
+        .compileSummary("s1", publication, List.of("v1", "uncited-entry-input"));
+    assertEquals(List.of("uncited-entry-input", "v1"), captured);
+    assertEquals(captured, f.graph.buildInputs);
+  }
+
+  @Test
   void graphPersistsCanonicalEntitiesAndRawEvidenceBackedRelation() {
     Fixture f = new Fixture();
     SummaryRecord summary = activeSummary("s1");
@@ -944,11 +1588,70 @@ class CompilationServicesTest {
 
     var result = new GraphCompilationService(f.repo, f.model, f.graph).compileSummary("s1");
 
-    assertEquals(2, result.entities().size());
-    assertEquals(1, result.relations().size());
-    assertEquals(List.of("ev1"), result.relations().get(0).evidenceIds());
-    assertEquals(Instant.parse("2026-01-01T00:00:00Z"), result.relations().get(0).validFrom());
-    assertEquals(1, f.graph.relations.size());
+    assertEquals(3, result.entities().size());
+    assertEquals(3, result.relations().size());
+    assertEquals(List.of("v1"), f.graph.buildInputs);
+    var direct =
+        result.relations().stream()
+            .filter(r -> r.predicate().equals("DIRECTOR_OF"))
+            .findFirst()
+            .orElseThrow();
+    assertEquals(List.of("ev1"), direct.evidenceIds());
+    assertEquals(Instant.parse("2026-01-01T00:00:00Z"), direct.validFrom());
+    assertEquals(3, f.graph.relations.size());
+    assertEquals(
+        2, result.relations().stream().filter(r -> r.predicate().equals("DOCUMENTS")).count());
+    assertTrue(result.entities().stream().allMatch(e -> e.attributes().containsKey("scope_key")));
+  }
+
+  @Test
+  void graphFailedPublicationNeverPersistsSuccessfulCompatibilityFacts() {
+    Fixture f = new Fixture();
+    f.repo.summaries.put("s1", activeSummary("s1"));
+    f.model.enqueue(
+        Ports.ModelTask.RELATION_EXTRACT,
+        new GraphCompilationService.Extraction(
+            List.of(),
+            List.of(
+                new GraphCompilationService.ProposedRelation(
+                    "张三", "PERSON", "DIRECTOR_OF", "甲公司", "COMPANY", List.of("f1"), "", "", .9)),
+            List.of(new GraphCompilationService.FactDecision("f1", true, ""))));
+    f.graph.failPublication = true;
+    assertThrows(
+        IllegalStateException.class,
+        () -> new GraphCompilationService(f.repo, f.model, f.graph).compileSummary("s1"));
+    assertEquals(0, f.repo.graphSaves);
+    assertTrue(f.graph.relations.isEmpty());
+  }
+
+  @Test
+  void graphRejectsInventedBusinessScopeWithRecordedReasonAndNoPublication() {
+    Fixture f = new Fixture();
+    f.repo.summaries.put("s1", activeSummary("s1"));
+    f.model.enqueue(
+        Ports.ModelTask.RELATION_EXTRACT,
+        new GraphCompilationService.Extraction(
+            List.of(),
+            List.of(
+                new GraphCompilationService.ProposedRelation(
+                    "张三",
+                    "PERSON",
+                    "DIRECTOR_OF",
+                    "甲公司",
+                    "COMPANY",
+                    List.of("f1"),
+                    "",
+                    "",
+                    .9,
+                    List.of(new GraphScopeIdentity.Anchor("COMPANY", "乙公司", List.of("f1"))),
+                    "")),
+            List.of(new GraphCompilationService.FactDecision("f1", true, ""))));
+    assertThrows(
+        IllegalStateException.class,
+        () -> new GraphCompilationService(f.repo, f.model, f.graph).compileSummary("s1"));
+    assertEquals(0, f.repo.graphSaves);
+    assertTrue(f.graph.relations.isEmpty());
+    assertTrue(f.repo.graphRejections.get(0).reason().contains("scope anchor is not stated"));
   }
 
   @Test
@@ -1000,10 +1703,10 @@ class CompilationServicesTest {
     var result = new GraphCompilationService(f.repo, f.model, f.graph).compileSummary("s1");
 
     assertTrue(result.coverage().pass());
-    assertEquals(1, result.relations().size());
+    assertEquals(3, result.relations().size());
     assertEquals(8, result.rejectedRelations().size());
     assertEquals(8, f.repo.graphRejections.size());
-    assertEquals(1, f.graph.relations.size());
+    assertEquals(3, f.graph.relations.size());
     assertTrue(
         result.rejectedRelations().stream()
             .anyMatch(rejected -> rejected.reason().contains("unsupported entity type")));
@@ -1067,7 +1770,8 @@ class CompilationServicesTest {
             List.of(new WikiCompilationService.FactDecision("f1", true, ""))));
     f.model.enqueue(
         Ports.ModelTask.WIKI_JUDGE,
-        new WikiCompilationService.SupportDecision(false, "unsupported"));
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            false, "unsupported"));
 
     assertThrows(
         IllegalStateException.class,
@@ -1094,7 +1798,9 @@ class CompilationServicesTest {
                     "动态治理事实", "[[张三]]担任[[甲公司]]董事。", List.of("f1"))),
             List.of(new WikiCompilationService.FactDecision("f1", true, ""))));
     f.model.enqueue(
-        Ports.ModelTask.WIKI_JUDGE, new WikiCompilationService.SupportDecision(true, "direct"));
+        Ports.ModelTask.WIKI_JUDGE,
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
 
     var result =
         new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
@@ -1132,7 +1838,11 @@ class CompilationServicesTest {
                     List.of("b1"),
                     List.of("ev1"),
                     "PASS",
-                    "direct"),
+                    "synthetic audited fixture",
+                    GroundingConstraintAudit.accepted(
+                        "张三担任甲公司董事。",
+                        GroundingConstraintAudit.exactCopyChecks(
+                            "张三担任甲公司董事。", List.of("张三担任甲公司董事。")))),
                 new SummaryFact(
                     "f2",
                     "s1",
@@ -1141,8 +1851,33 @@ class CompilationServicesTest {
                     List.of("b2"),
                     List.of("ev2"),
                     "PASS",
-                    "direct")),
+                    "synthetic audited fixture",
+                    GroundingConstraintAudit.accepted(
+                        "李四担任甲公司监事。",
+                        GroundingConstraintAudit.exactCopyChecks(
+                            "李四担任甲公司监事。", List.of("李四担任甲公司监事。"))))),
             Instant.parse("2026-08-14T00:00:00Z"));
+    var original = f.repo.source;
+    var block2 = block("b2", 1, "李四担任甲公司监事。");
+    var evidence2 =
+        new Evidence(
+            "ev2",
+            "d1",
+            "v1",
+            "b2",
+            "synthetic-original",
+            Map.of(),
+            block2.content(),
+            block2.contentHash());
+    f.repo.source =
+        new VersionSource(
+            original.documentId(),
+            original.versionId(),
+            original.logicalName(),
+            original.manualDocumentType(),
+            original.metadata(),
+            List.of(original.blocks().get(0), block2),
+            Map.of("b1", original.evidenceByBlock().get("b1"), "b2", evidence2));
     f.repo.summaries.put(summary.id(), summary);
     f.model.enqueue(
         Ports.ModelTask.WIKI_WRITE,
@@ -1158,10 +1893,12 @@ class CompilationServicesTest {
                 new WikiCompilationService.FactDecision("f2", true, ""))));
     f.model.enqueue(
         Ports.ModelTask.WIKI_JUDGE,
-        new WikiCompilationService.SupportDecisionSet(
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch(
             List.of(
-                new WikiCompilationService.SupportDecisionItem("C1", true, "direct"),
-                new WikiCompilationService.SupportDecisionItem("C2", true, "direct"))));
+                new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Item(
+                    "C1", true, "direct"),
+                new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Item(
+                    "C2", true, "direct"))));
 
     var result =
         new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
@@ -1189,7 +1926,9 @@ class CompilationServicesTest {
                     "Governance", "[[张三]]担任[[甲公司]]董事。", List.of("f1"))),
             List.of(new WikiCompilationService.FactDecision("f1", true, ""))));
     f.model.enqueue(
-        Ports.ModelTask.WIKI_JUDGE, new WikiCompilationService.SupportDecision(true, "direct"));
+        Ports.ModelTask.WIKI_JUDGE,
+        new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            true, "direct"));
 
     var result =
         new WikiCompilationService(f.repo, f.model, f.objects, f.embedding, f.derived)
@@ -1206,7 +1945,17 @@ class CompilationServicesTest {
   private static SummaryRecord activeSummary(String id) {
     SummaryFact fact =
         new SummaryFact(
-            "f1", id, "Governance", "张三担任甲公司董事。", List.of("b1"), List.of("ev1"), "PASS", "direct");
+            "f1",
+            id,
+            "Governance",
+            "张三担任甲公司董事。",
+            List.of("b1"),
+            List.of("ev1"),
+            "PASS",
+            "direct",
+            GroundingConstraintAudit.accepted(
+                "张三担任甲公司董事。",
+                GroundingConstraintAudit.exactCopyChecks("张三担任甲公司董事。", List.of("张三担任甲公司董事。"))));
     return new SummaryRecord(
         id,
         "u1",
@@ -1331,7 +2080,73 @@ class CompilationServicesTest {
                           .map(Deque::pollFirst)
                           .orElseThrow(() -> new AssertionError("no scripted output for " + task)));
       if (next instanceof RuntimeException failure) throw failure;
-      return outputType.cast(next);
+      return outputType.cast(withFixtureAudit(next, userPrompt));
+    }
+
+    // Explicit model fixture, not a semantic judge. Source and candidate spans are real prompt
+    // spans so the production audit gate remains active in these orchestration regressions.
+    private static Object withFixtureAudit(Object value, String prompt) {
+      if (value
+              instanceof
+              cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision d
+          && d.checks() == null)
+        return new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Decision(
+            d.supported(), d.reason(), fixtureChecks(prompt, ""));
+      if (value
+          instanceof cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch set)
+        return new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Batch(
+            set.decisions().stream()
+                .map(
+                    d ->
+                        d.checks() == null
+                            ? new cn.lgs.knowledgebase.application.compilation
+                                .GroundingJudgeProtocol.Item(
+                                d.candidateId(),
+                                d.supported(),
+                                d.reason(),
+                                fixtureChecks(prompt, d.candidateId()))
+                            : d)
+                .toList());
+      return value;
+    }
+
+    private static List<
+            cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol.Constraint>
+        fixtureChecks(String prompt, String id) {
+      String part = prompt;
+      int start = id.isEmpty() ? -1 : prompt.indexOf("candidate_id=" + id + "\n");
+      if (start >= 0) part = prompt.substring(start);
+      int end = part.indexOf("\n===\n");
+      if (end >= 0) part = part.substring(0, end);
+      String marker = part.contains("\nSUPPORTING FACTS:") ? "\nSUPPORTING FACTS:" : "\nEVIDENCE:";
+      int split = part.indexOf(marker);
+      int begin = part.indexOf("FACT: ");
+      int prefix = 6;
+      if (begin < 0) {
+        begin = part.indexOf("FACT=");
+        prefix = 5;
+      }
+      if (begin < 0) {
+        begin = part.indexOf("CLAIM=");
+        prefix = 6;
+      }
+      if (begin < 0 || split < 0)
+        throw new AssertionError("No grounding contract in fixture prompt");
+      String claim = part.substring(begin + prefix, split).trim();
+      String evidence = part.substring(split + marker.length()).trim();
+      return java.util.Arrays.stream(
+              cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit.Dimension
+                  .values())
+          .map(
+              d ->
+                  new cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol
+                      .Constraint(
+                      d,
+                      cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit.Finding
+                          .SUPPORTED,
+                      List.of(evidence),
+                      "Explicit orchestration fixture support"))
+          .toList();
     }
   }
 
@@ -1342,7 +2157,9 @@ class CompilationServicesTest {
     List<DocumentUnit> persistedDocumentUnits = List.of();
     final Map<String, List<ConceptRecord>> conceptsBySummary = new LinkedHashMap<>();
     List<GraphRelationRejection> graphRejections = List.of();
+    int graphSaves;
     final Map<String, WikiRecord> wikis = new LinkedHashMap<>();
+    List<String> wikiBuildInputs = List.of();
     long wikiVersion = 0;
 
     @Override
@@ -1431,7 +2248,9 @@ class CompilationServicesTest {
         String summaryId,
         List<Entity> entities,
         List<Relation> relations,
-        List<CompilationContracts.EntityResolution> resolutions) {}
+        List<CompilationContracts.EntityResolution> resolutions) {
+      graphSaves++;
+    }
 
     @Override
     public long nextWikiVersion(String wikiId) {
@@ -1441,6 +2260,12 @@ class CompilationServicesTest {
     @Override
     public void saveWiki(WikiRecord wiki) {
       wikis.put(wiki.id(), wiki);
+    }
+
+    @Override
+    public void saveWiki(WikiRecord wiki, List<String> inputSummaryIds) {
+      wikiBuildInputs = inputSummaryIds.stream().distinct().sorted().toList();
+      saveWiki(wiki);
     }
 
     @Override
@@ -1570,6 +2395,20 @@ class CompilationServicesTest {
 
   private static final class FakeGraph implements Ports.GraphStore {
     final List<Relation> relations = new ArrayList<>();
+    List<String> buildInputs = List.of();
+    boolean failPublication;
+
+    @Override
+    public void publish(List<Entity> entities, List<Relation> relations, List<String> inputs) {
+      buildInputs = List.copyOf(inputs);
+      publish(entities, relations);
+    }
+
+    @Override
+    public void publish(List<Entity> entities, List<Relation> relations) {
+      if (failPublication) throw new IllegalStateException("actual graph publication failure");
+      Ports.GraphStore.super.publish(entities, relations);
+    }
 
     @Override
     public void upsertEntities(List<Entity> entities) {}

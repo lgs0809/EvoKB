@@ -34,6 +34,17 @@ public final class RawIngestionApplicationService {
   private final RawSearchIndex search;
   private final EmbeddingPort embedder;
   private final DerivedSearchIndex derivedSearch;
+  private final RawTokenCounter tokens;
+  private final RawChunkProfile chunkProfile;
+  private final RawVectorEncoder vectorEncoder;
+
+  public ParserPipelineIdentity currentPipeline(String filename) {
+    return ParserCheckpointPolicy.current(parser, filename, chunkProfile, tokens, artifactEncoder);
+  }
+
+  public SourceFile inspectOriginal(String path) {
+    return files.inspect(path);
+  }
 
   public RawIngestionApplicationService(
       FileSourcePort files,
@@ -44,6 +55,35 @@ public final class RawIngestionApplicationService {
       RawSearchIndex search,
       EmbeddingPort embedder,
       DerivedSearchIndex derivedSearch) {
+    this(
+        files,
+        objects,
+        metadata,
+        parser,
+        artifactEncoder,
+        search,
+        embedder,
+        derivedSearch,
+        RawTokenCounter.unconfigured(),
+        RawChunkProfile.DEFAULT,
+        null);
+  }
+
+  public RawIngestionApplicationService(
+      FileSourcePort files,
+      ObjectStore objects,
+      KnowledgeRepository metadata,
+      ParserPort parser,
+      ParsedArtifactEncoder artifactEncoder,
+      RawSearchIndex search,
+      EmbeddingPort embedder,
+      DerivedSearchIndex derivedSearch,
+      RawTokenCounter tokens,
+      RawChunkProfile chunkProfile,
+      RawVectorEncoder vectorEncoder) {
+    this.tokens = require(tokens, "raw tokenizer");
+    this.chunkProfile = require(chunkProfile, "chunk profile");
+    this.vectorEncoder = vectorEncoder;
     this.files = require(files, "file source");
     this.objects = require(objects, "object store");
     this.metadata = require(metadata, "knowledge repository");
@@ -63,10 +103,31 @@ public final class RawIngestionApplicationService {
       Consumer<ProgressStage> progress,
       String resumeParserTaskId,
       Consumer<String> parserTaskIdSink) {
+    return ingest(command, progress, resumeParserTaskId, parserTaskIdSink, RawExecution.legacy());
+  }
+
+  public IngestResult ingest(
+      IngestCommand command,
+      Consumer<ProgressStage> progress,
+      String resumeParserTaskId,
+      Consumer<String> parserTaskIdSink,
+      RawExecution execution) {
+    java.util.Objects.requireNonNull(execution).check();
+    Consumer<ProgressStage> guarded =
+        stage -> {
+          execution.phase(stage);
+          emit(progress, stage);
+        };
     if (command == null) throw new IllegalArgumentException("ingest command is required");
     if (command.path() == null || command.path().isBlank())
       throw new IllegalArgumentException("path is required");
-    Consumer<String> taskSink = parserTaskIdSink == null ? ignored -> {} : parserTaskIdSink;
+    Consumer<String> taskSink =
+        task -> {
+          execution.fenced(
+              () -> {
+                if (parserTaskIdSink != null) parserTaskIdSink.accept(task);
+              });
+        };
     SourceFile source = files.inspect(command.path());
     String logicalName =
         command.logicalName() == null || command.logicalName().isBlank()
@@ -76,30 +137,361 @@ public final class RawIngestionApplicationService {
         command.metadata() == null
             ? new Metadata(null, null, List.of(), null, null, null)
             : command.metadata();
+    cn.lgs.knowledgebase.application.operations.DocumentClassificationPolicy.requireValid(
+        command.securityLevel());
 
+    ParserPipelineIdentity pinned =
+        execution.projectionScope().isBlank() ? null : currentPipeline(source.filename());
+    CheckedCheckpoint checked = null;
+    if (pinned != null) {
+      DocumentVersion candidate = execution.reservedInput().orElse(null);
+      if (candidate == null) {
+        var prior = metadata.findDocumentByLogicalName(logicalName);
+        if (prior.isPresent())
+          candidate =
+              metadata
+                  .findVersionBySourceAndPipeline(
+                      prior.get().id(), source.sha256(), pinned.sha256())
+                  .orElse(null);
+      }
+      if (candidate != null) {
+        var proof = metadata.parseCheckpoint(candidate.id()).orElse(null);
+        var blocks = metadata.rawBlocks(candidate.id());
+        if (ParserCheckpointPolicy.reusable(proof, candidate, source, pinned, blocks, objects))
+          checked = new CheckedCheckpoint(candidate.id(), proof);
+      }
+    }
+    final CheckedCheckpoint validated = checked;
+    SourceReservation reserved =
+        execution.reserveSource(
+            logicalName,
+            () ->
+                prepareSource(
+                    command, source, logicalName, requestedMetadata, execution, pinned, validated));
+    Document document = reserved.document();
+    DocumentVersion version = reserved.version();
+    if (reserved.alreadyActive()) {
+      if (pinned != null)
+        ParserCheckpointPolicy.requireCurrent(
+            parser, source.filename(), chunkProfile, tokens, artifactEncoder, pinned);
+      return new IngestResult(
+          document.id(),
+          version.id(),
+          version.versionNo(),
+          true,
+          false,
+          0,
+          0,
+          0,
+          version.originalObjectKey(),
+          version.markdownObjectKey(),
+          version.structuredObjectKey(),
+          List.of());
+    }
+    DocumentVersion retry = reserved.retry(), previousActive = reserved.previousActive();
+    List<RawBlock> reusableBlocks = reserved.reusableBlocks();
+    boolean resumeParsed = reserved.resumeParsed();
+    String versionId = version.id(), originalKey = version.originalObjectKey();
+    String artifactScope =
+        execution.projectionScope().isBlank()
+            ? versionId
+            : versionId + "/" + execution.projectionScope();
+    String markdownKey = "parsed/" + document.id() + "/" + artifactScope + "/markdown.md";
+    String structuredKey = "parsed/" + document.id() + "/" + artifactScope + "/structured.json";
+
+    emit(guarded, ProgressStage.STORING);
+    // Multipart completion already stored this immutable original with its session metadata.
+    // Re-putting the same key would destroy the frozen S3 ETag/version/metadata receipt.
+    if (!execution.immutableOriginalReserved()) {
+      try (InputStream input = files.open(command.path())) {
+        objects.put(originalKey, input, source.size(), source.mediaType());
+      } catch (Exception e) {
+        throw wrap("raw ingest store original failed", e);
+      }
+    }
+
+    if (retry != null) {
+      search.ensureIndex(embedder.dimensions());
+      // A parsed-but-failed retry may already have durable prefix chunks in the raw index.  Keep
+      // those documents so a model/container restart can resume from the checkpoint instead of
+      // throwing away hours of CPU work.  Parser retries without reusable blocks still start from
+      // a clean version.
+      if (!resumeParsed && execution.projectionScope().isBlank()) search.deleteVersion(versionId);
+    }
+    if (execution.projectionScope().isBlank())
+      persistSource(reserved, requestedMetadata, command.securityLevel(), execution, pinned);
+    execution.bind(document.id(), versionId);
+
+    final String finalOriginalKey = originalKey;
+    try {
+      List<RawBlock> blocks;
+      List<Evidence> evidence;
+      if (resumeParsed) {
+        emit(guarded, ProgressStage.EVIDENCE);
+        blocks = reusableBlocks;
+        evidence = RawKnowledgeBuilder.evidence(document.id(), finalOriginalKey, blocks);
+      } else {
+        emit(guarded, ProgressStage.PARSING);
+        ParsedDocument parsed;
+        var stored = objects.get(originalKey);
+        try (InputStream input = stored.stream()) {
+          parsed =
+              pinned == null
+                  ? parser.parse(source.filename(), input, resumeParserTaskId, taskSink)
+                  : parser.parse(
+                      source.filename(),
+                      input,
+                      resumeParserTaskId,
+                      taskSink,
+                      pinned,
+                      source.sha256());
+        } catch (Exception e) {
+          throw failure(
+              versionId, codeFor(wrap("parser failed", e)), wrap("parser failed", e), execution);
+        }
+        if (parsed.parserName() == null
+            || parsed.parserName().isBlank()
+            || parsed.parserVersion() == null
+            || parsed.parserVersion().isBlank()) {
+          throw failure(
+              versionId,
+              "PARSER_IDENTITY_MISSING",
+              new IllegalStateException("parser name/version missing"),
+              execution);
+        }
+        execution.check();
+        if (pinned != null) ParserCheckpointPolicy.requireParsed(parsed, source, pinned);
+        byte[] markdown = parsed.markdown().getBytes(StandardCharsets.UTF_8);
+        objects.put(
+            markdownKey,
+            new ByteArrayInputStream(markdown),
+            markdown.length,
+            "text/markdown; charset=utf-8");
+        byte[] structured = artifactEncoder.structuredArtifact(parsed);
+        objects.put(
+            structuredKey,
+            new ByteArrayInputStream(structured),
+            structured.length,
+            "application/json");
+
+        emit(guarded, ProgressStage.EVIDENCE);
+        blocks = RawKnowledgeBuilder.rawBlocks(versionId, parsed.blocks(), tokens);
+        evidence = RawKnowledgeBuilder.evidence(document.id(), finalOriginalKey, blocks);
+        final List<RawBlock> parsedBlocks = blocks;
+        final List<Evidence> parsedEvidence = evidence;
+        execution.fenced(
+            () -> {
+              if (pinned == null)
+                metadata.saveParsed(
+                    versionId,
+                    markdownKey,
+                    structuredKey,
+                    parsed.parserName(),
+                    parsed.parserVersion(),
+                    parsedBlocks,
+                    parsedEvidence);
+              else
+                metadata.saveParsed(
+                    versionId,
+                    markdownKey,
+                    structuredKey,
+                    parsed.parserName(),
+                    parsed.parserVersion(),
+                    parsedBlocks,
+                    parsedEvidence,
+                    new RawParseCheckpoint(
+                        pinned,
+                        source.sha256(),
+                        source.size(),
+                        ParserPipelineIdentity.hash(markdown),
+                        ParserPipelineIdentity.hash(structured),
+                        RawParseCheckpoint.blocksSha256(parsedBlocks)));
+            });
+        taskSink.accept("");
+      }
+
+      if (pinned != null)
+        ParserCheckpointPolicy.requireCurrent(
+            parser, source.filename(), chunkProfile, tokens, artifactEncoder, pinned);
+      emit(guarded, ProgressStage.EMBEDDING);
+      List<RawKnowledgeBuilder.ChunkDraft> chunks =
+          RawKnowledgeBuilder.smartChunks(
+              document.id(), versionId, requestedMetadata, blocks, chunkProfile, tokens);
+      if (vectorEncoder == null)
+        throw new IllegalStateException("Raw vector identity/cache is not configured");
+      RawVectorEncoder.Session encoding = vectorEncoder.open(document.id(), tokens, chunkProfile);
+      search.ensureIndex(embedder.dimensions());
+      // The embedding request must receive the complete chunk.  The raw chunk is the semantic
+      // unit used for retrieval; do not truncate, summarize, or replace its content with a
+      // head/tail approximation.  Index each completed batch before asking for the next one so a
+      // model restart leaves a durable checkpoint that can be resumed on retry.
+      int batchSize = Math.max(1, Math.min(embedder.preferredBatchSize(), 256));
+      // Rebuild exact chunk identities on retry. A count cannot prove that the indexed rows are
+      // this prefix or were encoded with the same model. Exact vector-cache keys resume work;
+      // index upserts remain grounded in the current evidence and metadata.
+      int from = 0;
+      List<String> physicalIds = new ArrayList<>();
+      while (from < chunks.size()) {
+        emit(guarded, ProgressStage.EMBEDDING);
+        int to = Math.min(chunks.size(), from + batchSize);
+        List<RawKnowledgeBuilder.ChunkDraft> batchChunks = chunks.subList(from, to);
+        List<String> texts =
+            batchChunks.stream().map(RawKnowledgeBuilder.ChunkDraft::content).toList();
+        List<List<Float>> vectors = encoding.encode(texts);
+        execution.check();
+        if (vectors.size() != batchChunks.size()) {
+          throw failure(
+              versionId,
+              "EMBEDDING_COUNT_MISMATCH",
+              new IllegalStateException(
+                  "embedding count " + vectors.size() + " != chunks " + batchChunks.size()),
+              execution);
+        }
+        emit(guarded, ProgressStage.INDEXING);
+        physicalIds.addAll(
+            search.stageRaw(
+                document.id(),
+                versionId,
+                execution.projectionScope(),
+                RawKnowledgeBuilder.toIndexDocuments(batchChunks, evidence, vectors)));
+        from = to;
+      }
+
+      if (pinned != null)
+        ParserCheckpointPolicy.requireCurrent(
+            parser, source.filename(), chunkProfile, tokens, artifactEncoder, pinned);
+      encoding.assertCurrent();
+      emit(guarded, ProgressStage.ACTIVATING);
+      if (!execution.projectionScope().isBlank()) {
+        execution.publish(
+            document.id(),
+            versionId,
+            List.copyOf(physicalIds),
+            () -> {
+              search.activateRaw(document.id(), versionId, physicalIds);
+              metadata.activateVersion(document.id(), versionId);
+            });
+      } else {
+        try {
+          search.activateVersion(document.id(), versionId);
+        } catch (RuntimeException e) {
+          safeDeactivate(versionId);
+          throw failure(versionId, "SEARCH_ACTIVATE_FAILED", e, execution);
+        }
+        try {
+          metadata.activateVersion(document.id(), versionId);
+        } catch (RuntimeException e) {
+          safeDeactivate(versionId);
+          if (previousActive != null) {
+            try {
+              search.activateVersion(document.id(), previousActive.id());
+            } catch (RuntimeException ignored) {
+            }
+          }
+          throw failure(versionId, "METADATA_ACTIVATE_FAILED", e, execution);
+        }
+      }
+      List<String> warnings = new ArrayList<>();
+      if (previousActive != null && derivedSearch != null) {
+        try {
+          derivedSearch.deactivateVersion(previousActive.id());
+        } catch (RuntimeException e) {
+          warnings.add("derived search cleanup failed: " + e.getMessage());
+        }
+      }
+      return new IngestResult(
+          document.id(),
+          versionId,
+          version.versionNo(),
+          false,
+          retry != null,
+          blocks.size(),
+          chunks.size(),
+          evidence.size(),
+          originalKey,
+          markdownKey,
+          structuredKey,
+          List.copyOf(warnings));
+    } catch (RawIngestFailure e) {
+      throw e;
+    } catch (RuntimeException e) {
+      throw failure(versionId, codeFor(e), e, execution);
+    }
+  }
+
+  private RawIngestFailure failure(
+      String versionId, String code, RuntimeException cause, RawExecution execution) {
+    execution.check();
+    execution.fenced(
+        () -> {
+          if (execution.projectionScope().isBlank()) safeDeactivate(versionId);
+          metadata.markVersionFailed(versionId, code, cause.getMessage());
+        });
+    return new RawIngestFailure(code, cause);
+  }
+
+  private record CheckedCheckpoint(String versionId, RawParseCheckpoint proof) {}
+
+  private record SourceReservation(
+      Document document,
+      DocumentVersion version,
+      DocumentVersion previousActive,
+      DocumentVersion retry,
+      List<RawBlock> reusableBlocks,
+      boolean resumeParsed,
+      boolean alreadyActive) {}
+
+  private SourceReservation prepareSource(
+      IngestCommand command,
+      SourceFile source,
+      String logicalName,
+      Metadata requestedMetadata,
+      RawExecution execution,
+      ParserPipelineIdentity pinned,
+      CheckedCheckpoint checked) {
     var existingDocument = metadata.findDocumentByLogicalName(logicalName);
     Document document =
         existingDocument.orElseGet(
             () -> new Document(newUuid(), logicalName, command.sourcePath()));
-    DocumentVersion retry = null;
-    if (existingDocument.isPresent()) {
+    DocumentVersion retry = execution.reservedInput().orElse(null);
+    if (retry != null
+        && (!document.id().equals(retry.documentId())
+            || !source.sha256().equals(retry.sha256())
+            || source.size() != retry.sizeBytes()
+            || !(retry.lifecycle() == VersionLifecycle.PENDING
+                || retry.lifecycle() == VersionLifecycle.FAILED
+                || retry.lifecycle() == VersionLifecycle.ACTIVE)))
+      throw new IllegalStateException(
+          "INPUT_ERROR: reserved multipart version differs from verified source");
+    if (retry != null && retry.lifecycle() == VersionLifecycle.ACTIVE) {
+      if (pinned != null && (checked == null || !checked.versionId().equals(retry.id())))
+        throw new IllegalStateException(
+            "PARSER_CHECKPOINT_UNVERIFIED: active source needs an explicit normal reparse for the current pipeline");
+      requireRequestedClassification(command.securityLevel(), retry.id());
+      if (!execution.completedInputCurrent(document.id(), retry.id()))
+        throw new IllegalStateException(
+            "RAW_SOURCE_REVOKED: reserved active input no longer has a current projection");
+      execution.bind(document.id(), retry.id());
+      return new SourceReservation(document, retry, null, null, List.of(), false, true);
+    }
+    if (retry == null && existingDocument.isPresent()) {
       DocumentVersion existing =
-          metadata.findVersionBySha(document.id(), source.sha256()).orElse(null);
+          (pinned == null
+                  ? metadata.findVersionBySha(document.id(), source.sha256())
+                  : metadata.findVersionBySourceAndPipeline(
+                      document.id(), source.sha256(), pinned.sha256()))
+              .orElse(null);
       if (existing != null) {
         if (existing.lifecycle() == VersionLifecycle.ACTIVE) {
-          return new IngestResult(
-              document.id(),
-              existing.id(),
-              existing.versionNo(),
-              true,
-              false,
-              0,
-              0,
-              0,
-              existing.originalObjectKey(),
-              existing.markdownObjectKey(),
-              existing.structuredObjectKey(),
-              List.of());
+          if (pinned != null && (checked == null || !checked.versionId().equals(existing.id())))
+            throw new IllegalStateException(
+                "PARSER_CHECKPOINT_UNVERIFIED: active source requires explicit current-pipeline reparse");
+          requireRequestedClassification(command.securityLevel(), existing.id());
+          if (pinned != null && !execution.completedInputCurrent(document.id(), existing.id()))
+            throw new IllegalStateException(
+                "RAW_SOURCE_REVOKED: cached source has no current certified publication");
+          execution.bind(document.id(), existing.id());
+          return new SourceReservation(document, existing, null, null, List.of(), false, true);
         }
         if (existing.lifecycle() == VersionLifecycle.FAILED
             || existing.lifecycle() == VersionLifecycle.PENDING) {
@@ -116,7 +508,16 @@ public final class RawIngestionApplicationService {
     boolean resumeParsed = false;
     if (retry != null) {
       reusableBlocks = metadata.rawBlocks(retry.id());
-      resumeParsed = !reusableBlocks.isEmpty();
+      resumeParsed =
+          !reusableBlocks.isEmpty()
+              && (pinned == null
+                  || (checked != null
+                      && checked.versionId().equals(retry.id())
+                      && checked.proof().equals(metadata.parseCheckpoint(retry.id()).orElse(null))
+                      && checked
+                          .proof()
+                          .rawBlocksSha256()
+                          .equals(RawParseCheckpoint.blocksSha256(reusableBlocks))));
     }
 
     DocumentVersion previousActive = metadata.currentActiveVersion(document.id()).orElse(null);
@@ -170,170 +571,46 @@ public final class RawIngestionApplicationService {
             version.structuredObjectKey(),
             version.parserName(),
             version.parserVersion());
-    String markdownKey = "parsed/" + document.id() + "/" + versionId + "/markdown.md";
-    String structuredKey = "parsed/" + document.id() + "/" + versionId + "/structured.json";
-
-    emit(progress, ProgressStage.STORING);
-    try (InputStream input = files.open(command.path())) {
-      objects.put(originalKey, input, source.size(), source.mediaType());
-    } catch (Exception e) {
-      throw wrap("raw ingest store original failed", e);
+    SourceReservation reserved =
+        new SourceReservation(
+            document, version, previousActive, retry, reusableBlocks, resumeParsed, false);
+    if (!execution.projectionScope().isBlank()) {
+      persistSource(reserved, requestedMetadata, command.securityLevel(), execution, pinned);
+      metadata.bindParserPipeline(version.id(), pinned.sha256());
+      execution.bind(document.id(), version.id());
     }
-
-    if (retry != null) {
-      search.ensureIndex(embedder.dimensions());
-      // A parsed-but-failed retry may already have durable prefix chunks in the raw index.  Keep
-      // those documents so a model/container restart can resume from the checkpoint instead of
-      // throwing away hours of CPU work.  Parser retries without reusable blocks still start from
-      // a clean version.
-      if (!resumeParsed) search.deleteVersion(versionId);
-      metadata.resetFailedVersion(versionId, requestedMetadata, resumeParsed);
-    } else {
-      metadata.createPendingVersion(document, version, requestedMetadata);
-    }
-
-    final String finalOriginalKey = originalKey;
-    try {
-      List<RawBlock> blocks;
-      List<Evidence> evidence;
-      if (resumeParsed) {
-        emit(progress, ProgressStage.EVIDENCE);
-        blocks = reusableBlocks;
-        evidence = RawKnowledgeBuilder.evidence(document.id(), finalOriginalKey, blocks);
-      } else {
-        emit(progress, ProgressStage.PARSING);
-        ParsedDocument parsed;
-        var stored = objects.get(originalKey);
-        try (InputStream input = stored.stream()) {
-          parsed = parser.parse(source.filename(), input, resumeParserTaskId, taskSink);
-        } catch (Exception e) {
-          throw failure(versionId, "PARSER_FAILED", wrap("parser failed", e));
-        }
-        if (parsed.parserName() == null
-            || parsed.parserName().isBlank()
-            || parsed.parserVersion() == null
-            || parsed.parserVersion().isBlank()) {
-          throw failure(
-              versionId,
-              "PARSER_IDENTITY_MISSING",
-              new IllegalStateException("parser name/version missing"));
-        }
-        byte[] markdown = parsed.markdown().getBytes(StandardCharsets.UTF_8);
-        objects.put(
-            markdownKey,
-            new ByteArrayInputStream(markdown),
-            markdown.length,
-            "text/markdown; charset=utf-8");
-        byte[] structured = artifactEncoder.structuredArtifact(parsed);
-        objects.put(
-            structuredKey,
-            new ByteArrayInputStream(structured),
-            structured.length,
-            "application/json");
-
-        emit(progress, ProgressStage.EVIDENCE);
-        blocks = RawKnowledgeBuilder.rawBlocks(versionId, parsed.blocks());
-        evidence = RawKnowledgeBuilder.evidence(document.id(), finalOriginalKey, blocks);
-        metadata.saveParsed(
-            versionId,
-            markdownKey,
-            structuredKey,
-            parsed.parserName(),
-            parsed.parserVersion(),
-            blocks,
-            evidence);
-        taskSink.accept("");
-      }
-
-      emit(progress, ProgressStage.EMBEDDING);
-      List<RawKnowledgeBuilder.ChunkDraft> chunks =
-          RawKnowledgeBuilder.smartChunks(document.id(), versionId, requestedMetadata, blocks);
-      search.ensureIndex(embedder.dimensions());
-      // The embedding request must receive the complete chunk.  The raw chunk is the semantic
-      // unit used for retrieval; do not truncate, summarize, or replace its content with a
-      // head/tail approximation.  Index each completed batch before asking for the next one so a
-      // model restart leaves a durable checkpoint that can be resumed on retry.
-      int batchSize = Math.max(1, Math.min(embedder.preferredBatchSize(), 256));
-      int from = 0;
-      if (retry != null && resumeParsed && !chunks.isEmpty()) {
-        int indexed = search.indexedChunkCount(versionId);
-        if (indexed > 0 && indexed <= chunks.size()) from = indexed;
-      }
-      emit(progress, ProgressStage.INDEXING);
-      while (from < chunks.size()) {
-        int to = Math.min(chunks.size(), from + batchSize);
-        List<RawKnowledgeBuilder.ChunkDraft> batchChunks = chunks.subList(from, to);
-        List<String> texts =
-            batchChunks.stream().map(RawKnowledgeBuilder.ChunkDraft::content).toList();
-        List<List<Float>> vectors = embedder.embed(texts);
-        if (vectors.size() != batchChunks.size()) {
-          throw failure(
-              versionId,
-              "EMBEDDING_COUNT_MISMATCH",
-              new IllegalStateException(
-                  "embedding count " + vectors.size() + " != chunks " + batchChunks.size()));
-        }
-        search.indexRaw(
-            document.id(),
-            versionId,
-            RawKnowledgeBuilder.toIndexDocuments(batchChunks, evidence, vectors));
-        from = to;
-      }
-
-      emit(progress, ProgressStage.ACTIVATING);
-      try {
-        search.activateVersion(document.id(), versionId);
-      } catch (RuntimeException e) {
-        safeDeactivate(versionId);
-        throw failure(versionId, "SEARCH_ACTIVATE_FAILED", e);
-      }
-      try {
-        metadata.activateVersion(document.id(), versionId);
-      } catch (RuntimeException e) {
-        safeDeactivate(versionId);
-        if (previousActive != null) {
-          try {
-            search.activateVersion(document.id(), previousActive.id());
-          } catch (RuntimeException ignored) {
-          }
-        }
-        throw failure(versionId, "METADATA_ACTIVATE_FAILED", e);
-      }
-      List<String> warnings = new ArrayList<>();
-      if (previousActive != null && derivedSearch != null) {
-        try {
-          derivedSearch.deactivateVersion(previousActive.id());
-        } catch (RuntimeException e) {
-          warnings.add("derived search cleanup failed: " + e.getMessage());
-        }
-      }
-      return new IngestResult(
-          document.id(),
-          versionId,
-          version.versionNo(),
-          false,
-          retry != null,
-          blocks.size(),
-          chunks.size(),
-          evidence.size(),
-          originalKey,
-          markdownKey,
-          structuredKey,
-          List.copyOf(warnings));
-    } catch (RawIngestFailure e) {
-      throw e;
-    } catch (RuntimeException e) {
-      throw failure(versionId, codeFor(e), e);
-    }
+    return reserved;
   }
 
-  private RawIngestFailure failure(String versionId, String code, RuntimeException cause) {
-    safeDeactivate(versionId);
-    try {
-      metadata.markVersionFailed(versionId, code, cause.getMessage());
-    } catch (RuntimeException ignored) {
-    }
-    return new RawIngestFailure(code, cause);
+  private void requireRequestedClassification(Integer requested, String versionId) {
+    if (requested != null
+        && !metadata.sourceSecurityLevel(versionId).map(requested::equals).orElse(false))
+      throw new IllegalStateException(
+          "INPUT_ERROR: identical active source has another classification; update its document metadata explicitly");
+  }
+
+  private void persistSource(
+      SourceReservation source,
+      Metadata requestedMetadata,
+      Integer securityLevel,
+      RawExecution execution,
+      ParserPipelineIdentity pinned) {
+    execution.fenced(
+        () -> {
+          if (source.retry() != null)
+            metadata.resetFailedVersion(
+                source.version().id(), requestedMetadata, source.resumeParsed(), securityLevel);
+          else if (pinned == null)
+            metadata.createPendingVersion(
+                source.document(), source.version(), requestedMetadata, securityLevel);
+          else
+            metadata.createPendingVersion(
+                source.document(),
+                source.version(),
+                requestedMetadata,
+                securityLevel,
+                pinned.sha256());
+        });
   }
 
   private void safeDeactivate(String versionId) {
@@ -345,6 +622,24 @@ public final class RawIngestionApplicationService {
 
   private static String codeFor(RuntimeException e) {
     String message = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
+    for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+      String text = cause.getMessage() == null ? "" : cause.getMessage();
+      for (String deterministic :
+          List.of(
+              "INPUT_ERROR",
+              "QUALITY_REVIEW_REQUIRED",
+              "TOKENIZER_UNAVAILABLE",
+              "ENCODING_PROFILE_MISMATCH",
+              "PARSER_PROFILE_INVALID",
+              "PARSER_VERSION_MISMATCH",
+              "PARSER_IDENTITY_UNAVAILABLE",
+              "PARSER_IDENTITY_CHANGED",
+              "PARSER_CHECKPOINT_UNVERIFIED",
+              "PARSER_CHECKPOINT_INVALID",
+              "PARSER_RESULT_STALE",
+              "RAW_SOURCE_REVOKED",
+              "RAW_STALE_CLAIM")) if (text.contains(deterministic)) return deterministic;
+    }
     if (message.contains("parser")) return "PARSER_FAILED";
     if (message.contains("embedding")) return "EMBEDDING_FAILED";
     if (message.contains("opensearch") || message.contains("search")) return "SEARCH_INDEX_FAILED";
@@ -370,7 +665,15 @@ public final class RawIngestionApplicationService {
   }
 
   public record IngestCommand(
-      String path, String logicalName, String sourcePath, Metadata metadata) {}
+      String path,
+      String logicalName,
+      String sourcePath,
+      Metadata metadata,
+      Integer securityLevel) {
+    public IngestCommand(String path, String logicalName, String sourcePath, Metadata metadata) {
+      this(path, logicalName, sourcePath, metadata, null);
+    }
+  }
 
   public record IngestResult(
       String documentId,

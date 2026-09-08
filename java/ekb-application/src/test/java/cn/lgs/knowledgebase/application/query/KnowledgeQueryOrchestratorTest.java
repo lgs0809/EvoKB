@@ -2,18 +2,23 @@ package cn.lgs.knowledgebase.application.query;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import cn.lgs.knowledgebase.application.ask.AnswerGroundingVerifier;
 import cn.lgs.knowledgebase.application.ask.AskApplicationService;
 import cn.lgs.knowledgebase.application.port.Ports;
 import cn.lgs.knowledgebase.application.retrieval.RetrievalApplicationService;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.SearchFilters;
+import cn.lgs.knowledgebase.domain.query.QueryDomain.Decision;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryEvidenceRef;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.QuerySession;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryTurn;
+import cn.lgs.knowledgebase.domain.query.QueryDomain.RetrievalReservation;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.RetrievalRound;
 import cn.lgs.knowledgebase.domain.query.QueryDomain.SessionStatus;
+import cn.lgs.knowledgebase.domain.query.RetrievalBudget;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Candidate;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.LaneType;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Quotas;
@@ -25,10 +30,103 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Queue;
+import java.util.UUID;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 
 class KnowledgeQueryOrchestratorTest {
   private static final SearchFilters NO_FILTERS = new SearchFilters(null, null, null, List.of());
+
+  @Test
+  void citedNumbersFromAnotherBusinessObjectMustTriggerFreshBoundedSearch() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.model.sufficiency("ANSWER", List.of(), List.of(), "", List.of());
+    scenario.model.sufficiency("ANSWER", List.of(), List.of(), "", List.of());
+    scenario.model.answerVerifications.add(
+        new AnswerGroundingVerifier.Output(
+            true, false, true, "引用数字存在但属于另一个采购项目", List.of("检索指定项目的原合同金额")));
+    scenario.model.answerVerifications.add(
+        new AnswerGroundingVerifier.Output(true, true, true, "适用对象及事实一致", List.of()));
+
+    var result = scenario.orchestrator.start("user-1", "指定项目的合同金额是多少", NO_FILTERS, 8);
+
+    assertEquals(List.of("指定项目的合同金额是多少", "检索指定项目的原合同金额"), scenario.lane.queries);
+    assertEquals(SessionStatus.ANSWERED, result.session().status());
+    assertEquals(2, scenario.model.verificationCalls);
+    assertEquals(Decision.CONTINUE_SEARCH, result.rounds().get(0).decision());
+    assertEquals(2, scenario.repository.listReservations(result.session().sessionId()).size());
+  }
+
+  @Test
+  void rejectedObjectScopeWithoutNewEvidenceMustNeverBecomeAnswered() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.model.sufficiency("ANSWER", List.of(), List.of(), "", List.of());
+    scenario.model.answerVerifications.add(
+        new AnswerGroundingVerifier.Output(false, false, true, "资料只支持其他合同，尚不能确认指定合同", List.of()));
+
+    var result = scenario.orchestrator.start("user-1", "指定合同的金额是多少", NO_FILTERS, 8);
+
+    assertEquals(SessionStatus.INSUFFICIENT, result.session().status());
+    assertTrue(result.session().evidenceOnly());
+    assertEquals(1, scenario.model.verificationCalls);
+    assertEquals(1, scenario.lane.queries.size());
+    assertFalse(result.session().finalAnswer().contains("依据可验证原文回答"));
+  }
+
+  @Test
+  void verificationDependencyFailurePreservesTheCompletedRoundAndConsumedReservation() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.model.sufficiency("ANSWER", List.of(), List.of(), "", List.of());
+    scenario.model.answerVerifications.add(
+        new Ports.TransientDependencyFailure("synthetic unavailable verifier", null));
+    var result = scenario.orchestrator.start("user-1", "查询合同金额", NO_FILTERS, 8);
+    assertEquals(SessionStatus.FAILED, result.session().status());
+    assertEquals(1, result.rounds().size());
+    assertEquals(1, scenario.repository.listReservations(result.session().sessionId()).size());
+    assertTrue(result.turns().stream().anyMatch(t -> t.content().equals("DEPENDENCY_UNAVAILABLE")));
+    assertFalse(result.session().finalAnswer().contains("依据可验证原文回答"));
+  }
+
+  @Test
+  void repeatedScopeRejectionsCannotCreateANinthRoundOrAnAnsweredSession() {
+    Scenario scenario = scenario(false, 8, 8);
+    scenario.model.understanding("CLEAR", "", List.of());
+    for (int i = 0; i < 8; i++) {
+      scenario.model.sufficiency("ANSWER", List.of(), List.of(), "", List.of());
+      scenario.model.answerVerifications.add(
+          new AnswerGroundingVerifier.Output(
+              false, false, true, "缺少指定对象的原文", List.of("补查明确对象 " + i)));
+    }
+    var result = scenario.orchestrator.start("user-1", "指定对象的金额", NO_FILTERS, 8);
+    assertEquals(SessionStatus.INSUFFICIENT, result.session().status());
+    assertEquals(8, scenario.lane.queries.size());
+    assertEquals(8, result.rounds().size());
+    assertEquals(8, scenario.model.verificationCalls);
+    assertTrue(result.session().finalAnswer().contains("检索预算"));
+  }
+
+  @Test
+  void anUncitedOrInvalidlyCitedFallbackCannotBecomeAnAnsweredSafetyQuestion() {
+    for (String invalid : List.of("本次资料未找到目标对象，无法确认金额。", "引用不存在的编号。[999]")) {
+      Scenario scenario = scenario(false);
+      scenario.model.answerText = invalid;
+      scenario.model.understanding("CLEAR", "", List.of());
+      scenario.model.sufficiency("ANSWER", List.of(), List.of(), "", List.of());
+      var result = scenario.orchestrator.start("user-1", "未登记合同的金额，找不到就说明", NO_FILTERS, 8);
+      assertEquals(SessionStatus.FAILED, result.session().status());
+      assertTrue(result.session().evidenceOnly());
+      assertEquals(2, scenario.model.answerCalls);
+      assertEquals(0, scenario.model.verificationCalls);
+      assertEquals(Ports.ModelRole.LARGE, scenario.model.lastAnswerRole);
+      assertEquals(1, scenario.repository.listReservations(result.session().sessionId()).size());
+      assertTrue(
+          result.turns().stream().anyMatch(t -> t.content().equals("ANSWER_DELIVERY_UNAVAILABLE")));
+      assertFalse(result.session().finalAnswer().contains("证据不足"));
+    }
+  }
 
   @Test
   void simpleQuestionUsesOriginalQueryOnceAndAnswersImmediately() {
@@ -45,6 +143,11 @@ class KnowledgeQueryOrchestratorTest {
     assertTrue(response.session().finalAnswer().contains("[1]"));
     assertEquals(Ports.ModelRole.SMALL, scenario.model.lastAnswerRole);
     assertTrue(scenario.model.lastAnswerPrompt.contains("Raw evidence: 可验证原文"));
+    assertEquals(
+        scenario.model.lastJudgePrompt.substring(
+            scenario.model.lastJudgePrompt.indexOf("[SOURCE 1]")),
+        scenario.model.lastAnswerPrompt.substring(
+            scenario.model.lastAnswerPrompt.indexOf("[SOURCE 1]")));
     assertFalse(scenario.model.lastAnswerPrompt.contains("knowledge for 原始问题"));
   }
 
@@ -64,6 +167,11 @@ class KnowledgeQueryOrchestratorTest {
     assertEquals(List.of("补充A", "补充B"), response.rounds().get(0).nextQueries());
     assertTrue(response.evidence().size() >= 3);
     assertEquals(Ports.ModelRole.LARGE, scenario.model.lastAnswerRole);
+    assertEquals(
+        scenario.model.lastJudgePrompt.substring(
+            scenario.model.lastJudgePrompt.indexOf("[SOURCE 1]")),
+        scenario.model.lastAnswerPrompt.substring(
+            scenario.model.lastAnswerPrompt.indexOf("[SOURCE 1]")));
   }
 
   @Test
@@ -106,7 +214,325 @@ class KnowledgeQueryOrchestratorTest {
     assertFalse(response.turns().isEmpty());
   }
 
+  @Test
+  void failedDispatchHasAlreadyConsumedItsRound() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    var opened = scenario.orchestrator.open("user-1", "断线问题", NO_FILTERS);
+    String id = opened.session().sessionId();
+    scenario.lane.beforeSearch =
+        query -> {
+          assertEquals(
+              List.of(query), scenario.repository.listReservations(id).get(0).inputQueries());
+          throw new IllegalStateException("synthetic transport failure");
+        };
+
+    assertThrows(
+        IllegalStateException.class, () -> scenario.orchestrator.executeNew("user-1", id, 8));
+
+    assertEquals(1, scenario.repository.listReservations(id).size());
+    assertTrue(scenario.repository.listRounds(id).isEmpty());
+    assertEquals(SessionStatus.FAILED, scenario.repository.findSession(id).orElseThrow().status());
+  }
+
+  @Test
+  void configurationCannotExpandTheEightRoundCeiling() {
+    Scenario scenario = scenario(true, 999, 999);
+    scenario.model.understanding("CLEAR", "", List.of());
+    for (int i = 1; i <= 8; i++) {
+      scenario.model.sufficiency(
+          "CONTINUE_SEARCH", List.of("缺少合同付款依据"), List.of("补充线索" + i), "", List.of());
+    }
+
+    var result = scenario.orchestrator.start("user-1", "首轮问题", NO_FILTERS, 8);
+
+    assertEquals(8, scenario.lane.queries.size());
+    assertEquals(8, result.rounds().size());
+    assertEquals(8, scenario.repository.listReservations(result.session().sessionId()).size());
+    assertEquals(SessionStatus.INSUFFICIENT, result.session().status());
+    assertTrue(result.session().finalAnswer().contains("缺少合同付款依据"));
+    assertTrue(result.session().finalAnswer().contains("检索预算"));
+    assertFalse(result.session().finalAnswer().contains("没有新的检索线索"));
+  }
+
+  @Test
+  void interruptedReservationsRemainConsumedBeforeAnyNewDispatch() {
+    Scenario scenario = scenario(true, 8, 8);
+    var opened = scenario.orchestrator.open("user-1", "重启后的问题", NO_FILTERS);
+    String id = opened.session().sessionId();
+    for (int i = 1; i <= 8; i++)
+      scenario.repository.reserveRound("user-1", id, List.of("旧线索" + i), 8, 8);
+    scenario.model.understanding("CLEAR", "", List.of());
+
+    var response = scenario.orchestrator.executeNew("user-1", id, 8);
+
+    assertTrue(scenario.lane.queries.isEmpty());
+    assertTrue(response.rounds().isEmpty());
+    assertEquals(SessionStatus.INSUFFICIENT, response.session().status());
+    assertEquals(8, scenario.repository.listReservations(id).size());
+  }
+
+  @Test
+  void noNewCluesPreservesTheGapAndOriginalEvidenceWithoutClaimingAnAnswer() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.model.sufficiency(
+        "CONTINUE_SEARCH", List.of("缺少延期条款"), List.of("原始问题"), "", List.of());
+
+    var result = scenario.orchestrator.start("user-1", "原始问题", NO_FILTERS, 8);
+
+    assertEquals(SessionStatus.INSUFFICIENT, result.session().status());
+    assertTrue(result.session().evidenceOnly());
+    assertTrue(result.session().finalAnswer().contains("缺少延期条款"));
+    assertTrue(result.session().finalAnswer().contains("没有新的检索线索"));
+    assertFalse(result.session().finalAnswer().contains("可验证原文"));
+    assertTrue(result.citations().get(0).evidence().content().contains("可验证原文"));
+    assertFalse(result.session().finalAnswer().contains("[1]"));
+    assertEquals(1, result.citations().size());
+    assertEquals(null, scenario.model.lastAnswerRole);
+    assertEquals(1, scenario.lane.queries.size());
+  }
+
+  @Test
+  void queryLimitCutsOffAdditionalSubqueriesWithoutLosingTheGap() {
+    Scenario scenario = scenario(true, 8, 2);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.model.sufficiency(
+        "CONTINUE_SEARCH", List.of("缺少补充资料"), List.of("补搜A", "补搜B"), "", List.of());
+    scenario.model.sufficiency("CONTINUE_SEARCH", List.of("仍缺付款资料"), List.of("补搜C"), "", List.of());
+    var result = scenario.orchestrator.start("user-1", "原始问题", NO_FILTERS, 8);
+    assertEquals(List.of("原始问题", "补搜A"), scenario.lane.queries);
+    assertEquals(SessionStatus.INSUFFICIENT, result.session().status());
+    assertTrue(result.session().finalAnswer().contains("仍缺付款资料"));
+    assertTrue(result.session().finalAnswer().contains("检索预算"));
+  }
+
+  @Test
+  void transientSecondRoundFailurePreservesFirstRoundEvidenceAndGap() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.model.sufficiency(
+        "CONTINUE_SEARCH", List.of("缺少违约金上限"), List.of("补充违约条款"), "", List.of());
+    scenario.lane.beforeSearch =
+        query -> {
+          if (query.equals("补充违约条款"))
+            throw new IllegalStateException(
+                "embedding wrapper",
+                new Ports.TransientDependencyFailure("synthetic unavailable dependency", null));
+        };
+    var result = scenario.orchestrator.start("user-1", "违约金是多少", NO_FILTERS, 8);
+    assertEquals(SessionStatus.FAILED, result.session().status());
+    assertEquals(1, result.rounds().size());
+    assertEquals(2, scenario.repository.listReservations(result.session().sessionId()).size());
+    assertEquals(1, result.citations().size());
+    assertTrue(result.session().finalAnswer().contains("缺少违约金上限"));
+    assertTrue(result.session().finalAnswer().contains("暂时不可用"));
+    assertTrue(result.session().finalAnswer().contains("不能据此认定所需资料不存在"));
+    assertFalse(result.session().finalAnswer().contains("可验证原文"));
+    assertTrue(result.citations().get(0).evidence().content().contains("可验证原文"));
+    assertFalse(result.session().finalAnswer().contains("证据不足"));
+    assertTrue(result.turns().stream().anyMatch(t -> t.content().equals("DEPENDENCY_UNAVAILABLE")));
+    var reopened = scenario.orchestrator.get("user-1", result.session().sessionId());
+    assertEquals(result.session(), reopened.session());
+    assertEquals(result.citations(), reopened.citations());
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            scenario.orchestrator.feedback(
+                "user-1", result.session().sessionId(), "POSITIVE", "", ""));
+    var sourceUnavailable =
+        new KnowledgeQueryOrchestrator.Response(
+            result.session(), result.turns(), result.rounds(), result.evidence(), List.of());
+    assertTrue(sourceUnavailable.evidenceChanged());
+    assertFalse(sourceUnavailable.displayAnswer().contains("可验证原文"));
+  }
+
+  @Test
+  void transientFirstDispatchIsFailedWithConsumedBudgetAndNoInventedCitations() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.lane.beforeSearch =
+        query -> {
+          throw new Ports.TransientDependencyFailure("synthetic unavailable dependency", null);
+        };
+    var result = scenario.orchestrator.start("user-1", "断线后的验收查询", NO_FILTERS, 8);
+    String session = result.session().sessionId();
+    assertEquals(SessionStatus.FAILED, result.session().status());
+    assertTrue(result.session().evidenceOnly());
+    assertTrue(result.session().finalAnswer().contains("查询尚未完成"));
+    assertFalse(result.session().finalAnswer().contains("证据不足"));
+    assertTrue(result.citations().isEmpty());
+    assertTrue(result.rounds().isEmpty());
+    assertEquals(1, scenario.repository.listReservations(session).size());
+    assertEquals(result.session(), scenario.orchestrator.get("user-1", session).session());
+    assertThrows(
+        cn.lgs.knowledgebase.application.access.KnowledgeAccessService.Denied.class,
+        () -> scenario.orchestrator.get("other-user", session));
+    assertThrows(
+        cn.lgs.knowledgebase.application.access.KnowledgeAccessService.Denied.class,
+        () -> scenario.orchestrator.get("user-1", "missing-session"));
+    assertThrows(
+        IllegalStateException.class, () -> scenario.orchestrator.executeNew("user-1", session, 8));
+    assertEquals(1, scenario.repository.listReservations(session).size());
+  }
+
+  @Test
+  void failedCoverageJudgeDoesNotTreatAnyRetrievedEvidenceAsACompleteAnswer() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    // Both structured attempts fail: the scripted queue is empty.
+    var result = scenario.orchestrator.start("user-1", "付款期限和违约金上限", NO_FILTERS, 8);
+    assertEquals(SessionStatus.FAILED, result.session().status());
+    assertTrue(result.session().finalAnswer().contains("证据覆盖判断暂时未完成"));
+    assertFalse(result.session().finalAnswer().contains("证据不足"));
+    assertEquals(null, scenario.model.lastAnswerRole);
+    assertEquals(1, result.citations().size());
+  }
+
+  @Test
+  void malformedDecisionProtocolHasItsOwnFailureClassificationAndNeverConsumesAnotherSearch() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.model.sufficiency("UNKNOWN", List.of(), List.of(), "", List.of());
+    scenario.model.sufficiency("INVALID", List.of(), List.of(), "", List.of());
+    var result = scenario.orchestrator.start("user-1", "原文付款日期", NO_FILTERS, 8);
+    assertEquals(SessionStatus.FAILED, result.session().status());
+    assertEquals(2, scenario.model.judgeCalls);
+    assertEquals(1, scenario.lane.queries.size());
+    assertEquals(1, scenario.repository.listReservations(result.session().sessionId()).size());
+    assertEquals(1, result.citations().size());
+    assertTrue(
+        result.turns().stream().anyMatch(t -> t.content().equals("COVERAGE_DECISION_UNAVAILABLE")));
+    assertFalse(
+        result.turns().stream().anyMatch(t -> t.content().equals("DEPENDENCY_UNAVAILABLE")));
+    assertFalse(result.session().finalAnswer().contains("证据不足"));
+  }
+
+  @Test
+  void coverageDependencyFailureRetainsEvidenceAndStopsAsFailedAfterTwoAttempts() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.model.sufficiencies.add(
+        new Ports.TransientDependencyFailure("synthetic outage", null));
+    scenario.model.sufficiencies.add(
+        new Ports.TransientDependencyFailure("synthetic outage", null));
+
+    var result = scenario.orchestrator.start("user-1", "验收原文覆盖", NO_FILTERS, 8);
+
+    assertEquals(SessionStatus.FAILED, result.session().status());
+    assertTrue(result.session().finalAnswer().contains("查询尚未完成"));
+    assertFalse(result.session().finalAnswer().contains("证据不足"));
+    assertEquals(2, scenario.model.judgeCalls);
+    assertEquals(null, scenario.model.lastAnswerRole);
+    assertEquals(1, result.citations().size());
+    assertEquals(1, scenario.repository.listReservations(result.session().sessionId()).size());
+    assertTrue(result.rounds().isEmpty());
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            scenario.orchestrator.feedback(
+                "user-1", result.session().sessionId(), "POSITIVE", "", ""));
+  }
+
+  @Test
+  void coverageRecoversFromOneDependencyFailureWithoutDiscardingTheRound() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.model.sufficiencies.add(
+        new Ports.TransientDependencyFailure("synthetic outage", null));
+    scenario.model.sufficiency("ANSWER", List.of(), List.of(), "", List.of());
+
+    var result = scenario.orchestrator.start("user-1", "验收原文覆盖", NO_FILTERS, 8);
+
+    assertEquals(SessionStatus.ANSWERED, result.session().status());
+    assertEquals(2, scenario.model.judgeCalls);
+    assertEquals(1, result.rounds().size());
+    assertEquals(1, scenario.repository.listReservations(result.session().sessionId()).size());
+  }
+
+  @Test
+  void insufficientOutcomeKeepsRetrievedFactsOnlyInTheSeparateReferenceCollection() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.model.sufficiency("CONTINUE_SEARCH", List.of("缺少指定对象的资料"), List.of(), "", List.of());
+    var result = scenario.orchestrator.start("user-1", "另一个对象的问题", NO_FILTERS, 8);
+    assertEquals(SessionStatus.INSUFFICIENT, result.session().status());
+    assertFalse(result.session().finalAnswer().contains("可验证原文"));
+    assertFalse(result.session().finalAnswer().contains("[1]"));
+    assertTrue(result.session().finalAnswer().contains("缺少指定对象的资料"));
+    assertTrue(result.citations().get(0).evidence().content().contains("可验证原文"));
+    assertEquals(
+        result.citations(),
+        scenario.orchestrator.get("user-1", result.session().sessionId()).citations());
+  }
+
+  @Test
+  void asyncActivityIncludesQueuedQueriesAndReleasesOnlyAfterTheLastExecution() {
+    Scenario scenario = scenario(false);
+    for (int i = 0; i < 2; i++) {
+      scenario.model.understanding("CLEAR", "", List.of());
+      scenario.model.sufficiency("ANSWER", List.of(), List.of(), "", List.of());
+    }
+    var queue = new ArrayList<Runnable>();
+    var service = new AsyncKnowledgeQueryService(scenario.orchestrator, queue::add);
+    var first = service.start("user-1", "第一条问题", NO_FILTERS, 8);
+    var second = service.start("user-1", "第二条问题", NO_FILTERS, 8);
+    assertTrue(service.hasPendingWork());
+    assertEquals(SessionStatus.RUNNING, second.session().status());
+    queue.get(0).run();
+    assertEquals(
+        SessionStatus.ANSWERED,
+        service.get("user-1", first.session().sessionId()).session().status());
+    assertTrue(service.hasPendingWork());
+    queue.get(1).run();
+    assertFalse(service.hasPendingWork());
+    assertEquals(
+        SessionStatus.ANSWERED,
+        service.get("user-1", second.session().sessionId()).session().status());
+  }
+
+  @Test
+  void rejectedAsyncAdmissionClosesActivityAndPersistsAnUnstartedFailure() {
+    Scenario scenario = scenario(false);
+    var service =
+        new AsyncKnowledgeQueryService(
+            scenario.orchestrator,
+            task -> {
+              throw new java.util.concurrent.RejectedExecutionException("synthetic full executor");
+            });
+    var result = service.start("user-1", "执行器繁忙时的请求", NO_FILTERS, 8);
+    assertFalse(service.hasPendingWork());
+    assertEquals(SessionStatus.FAILED, result.session().status());
+    assertTrue(result.session().finalAnswer().contains("尚未开始检索"));
+    assertEquals(0, scenario.repository.listReservations(result.session().sessionId()).size());
+    assertEquals(
+        SessionStatus.FAILED,
+        service.get("user-1", result.session().sessionId()).session().status());
+  }
+
+  @Test
+  void asynchronousExecutionFailureCannotLeaveBackgroundWorkPermanentlyPaused() {
+    Scenario scenario = scenario(false);
+    scenario.model.understanding("CLEAR", "", List.of());
+    scenario.lane.beforeSearch =
+        query -> {
+          throw new IllegalStateException("synthetic retrieval failure");
+        };
+    var queue = new ArrayList<Runnable>();
+    var service = new AsyncKnowledgeQueryService(scenario.orchestrator, queue::add);
+    var result = service.start("user-1", "执行失败的请求", NO_FILTERS, 8);
+    queue.get(0).run();
+    assertFalse(service.hasPendingWork());
+    assertEquals(
+        SessionStatus.FAILED,
+        service.get("user-1", result.session().sessionId()).session().status());
+  }
+
   private static Scenario scenario(boolean emptyRetrieval) {
+    return scenario(emptyRetrieval, 3, 8);
+  }
+
+  private static Scenario scenario(boolean emptyRetrieval, int maxRounds, int maxQueries) {
     RecordingLane lane = new RecordingLane(emptyRetrieval);
     Ports.EvidenceResolver resolver =
         ids -> ids.stream().map(KnowledgeQueryOrchestratorTest::evidence).toList();
@@ -122,8 +548,62 @@ class KnowledgeQueryOrchestratorTest {
     AskApplicationService ask = new AskApplicationService(retrieval, model, 24000);
     InMemoryRepository repository = new InMemoryRepository();
     KnowledgeQueryOrchestrator orchestrator =
-        new KnowledgeQueryOrchestrator(retrieval, ask, model, repository, resolver, 3, 8, 3, 12000);
-    return new Scenario(orchestrator, model, lane);
+        new KnowledgeQueryOrchestrator(
+            retrieval, ask, model, repository, resolver, maxRounds, maxQueries, 3, 12000);
+    return new Scenario(orchestrator, model, lane, repository);
+  }
+
+  @Test
+  void expiredEvidenceDoesNotRenumberOrDeliverTheOriginalAnswer() {
+    InMemoryRepository repository = new InMemoryRepository();
+    Ports.EvidenceResolver resolver =
+        ids ->
+            ids.stream()
+                .filter(id -> id.equals("second"))
+                .map(KnowledgeQueryOrchestratorTest::evidence)
+                .toList();
+    RecordingLane lane = new RecordingLane(true);
+    RetrievalApplicationService retrieval =
+        new RetrievalApplicationService(
+            List.of(lane), (query, documents) -> List.of(), resolver, Quotas.defaults(), 20, 400);
+    ScriptedModel model = new ScriptedModel();
+    KnowledgeQueryOrchestrator orchestrator =
+        new KnowledgeQueryOrchestrator(
+            retrieval,
+            new AskApplicationService(retrieval, model, 24000),
+            model,
+            repository,
+            resolver,
+            3,
+            8,
+            3,
+            12000);
+    Instant now = Instant.now();
+    QuerySession recorded =
+        new QuerySession(
+            "session",
+            "user",
+            "原始问题",
+            "原始问题",
+            NO_FILTERS,
+            SessionStatus.ANSWERED,
+            "旧事实[1]与另一事实[2]",
+            false,
+            "",
+            List.of(),
+            List.of("first", "second"),
+            now,
+            now);
+    repository.createSession(recorded);
+
+    var replay = orchestrator.get("user", "session");
+
+    assertTrue(replay.evidenceChanged());
+    assertEquals(2, replay.citations().get(0).index());
+    assertEquals("second", replay.citations().get(0).evidence().id());
+    assertTrue(replay.displayAnswer().contains("重新查询"));
+    assertFalse(replay.displayAnswer().contains("旧事实"));
+    assertEquals(recorded, repository.findSession("session").orElseThrow());
   }
 
   private static Evidence evidence(String id) {
@@ -139,11 +619,15 @@ class KnowledgeQueryOrchestratorTest {
   }
 
   private record Scenario(
-      KnowledgeQueryOrchestrator orchestrator, ScriptedModel model, RecordingLane lane) {}
+      KnowledgeQueryOrchestrator orchestrator,
+      ScriptedModel model,
+      RecordingLane lane,
+      InMemoryRepository repository) {}
 
   private static final class RecordingLane implements Ports.RetrievalLane {
     private final boolean empty;
     private final List<String> queries = new ArrayList<>();
+    private Consumer<String> beforeSearch = ignored -> {};
 
     private RecordingLane(boolean empty) {
       this.empty = empty;
@@ -156,6 +640,7 @@ class KnowledgeQueryOrchestratorTest {
 
     @Override
     public List<Candidate> search(String query, SearchFilters filters, int limit) {
+      beforeSearch.accept(query);
       queries.add(query);
       if (empty) return List.of();
       String id = "ev-" + Integer.toUnsignedString(query.hashCode());
@@ -175,10 +660,15 @@ class KnowledgeQueryOrchestratorTest {
   private static final class ScriptedModel implements Ports.KnowledgeModel {
     private final Queue<KnowledgeQueryOrchestrator.UnderstandingOutput> understandings =
         new ArrayDeque<>();
-    private final Queue<KnowledgeQueryOrchestrator.SufficiencyOutput> sufficiencies =
-        new ArrayDeque<>();
+    private final Queue<Object> sufficiencies = new ArrayDeque<>();
+    private final Queue<Object> answerVerifications = new ArrayDeque<>();
+    private int verificationCalls;
+    private int answerCalls;
+    private String answerText = "依据可验证原文回答。[1]";
     private Ports.ModelRole lastAnswerRole;
     private String lastAnswerPrompt = "";
+    private String lastJudgePrompt = "";
+    private int judgeCalls;
 
     void understanding(String decision, String question, List<String> choices) {
       understandings.add(
@@ -212,7 +702,8 @@ class KnowledgeQueryOrchestratorTest {
         Ports.ModelRole role, Ports.ModelTask task, String systemPrompt, String userPrompt) {
       lastAnswerRole = role;
       lastAnswerPrompt = userPrompt;
-      return "依据可验证原文回答。[1]";
+      answerCalls++;
+      return answerText;
     }
 
     @Override
@@ -224,7 +715,23 @@ class KnowledgeQueryOrchestratorTest {
         String userPrompt,
         Class<T> outputType) {
       if (task == Ports.ModelTask.QUERY_UNDERSTANDING) return (T) understandings.remove();
-      if (task == Ports.ModelTask.EVIDENCE_SUFFICIENCY) return (T) sufficiencies.remove();
+      if (task == Ports.ModelTask.EVIDENCE_SUFFICIENCY) {
+        lastJudgePrompt = userPrompt;
+        judgeCalls++;
+        Object output = sufficiencies.remove();
+        if (output instanceof RuntimeException failure) throw failure;
+        return (T) output;
+      }
+      if (task == Ports.ModelTask.ANSWER_VERIFICATION) {
+        verificationCalls++;
+        Object verified =
+            (answerVerifications.isEmpty()
+                ? new AnswerGroundingVerifier.Output(
+                    true, true, true, "synthetic valid fixture", List.of())
+                : answerVerifications.remove());
+        if (verified instanceof RuntimeException failure) throw failure;
+        return (T) verified;
+      }
       throw new IllegalStateException("unexpected structured task: " + task);
     }
   }
@@ -233,8 +740,23 @@ class KnowledgeQueryOrchestratorTest {
     private final Map<String, QuerySession> sessions = new LinkedHashMap<>();
     private final Map<String, List<QueryTurn>> turns = new LinkedHashMap<>();
     private final Map<String, List<RetrievalRound>> rounds = new LinkedHashMap<>();
+    private final Map<String, List<RetrievalReservation>> reservations = new LinkedHashMap<>();
     private final Map<String, LinkedHashMap<String, QueryEvidenceRef>> evidence =
         new LinkedHashMap<>();
+
+    @Override
+    public synchronized void createSessionWithTurn(QuerySession session, QueryTurn turn) {
+      if (!session.sessionId().equals(turn.sessionId())) throw new IllegalArgumentException();
+      createSession(session);
+      appendTurn(turn);
+    }
+
+    @Override
+    public synchronized void transitionSessionWithTurn(QuerySession session, QueryTurn turn) {
+      if (!session.sessionId().equals(turn.sessionId())) throw new IllegalArgumentException();
+      updateSession(session);
+      appendTurn(turn);
+    }
 
     @Override
     public void createSession(QuerySession session) {
@@ -267,6 +789,36 @@ class KnowledgeQueryOrchestratorTest {
     @Override
     public List<QueryTurn> listTurns(String sessionId) {
       return List.copyOf(turns.getOrDefault(sessionId, List.of()));
+    }
+
+    @Override
+    public synchronized Optional<RetrievalReservation> reserveRound(
+        String userId,
+        String sessionId,
+        List<String> proposedQueries,
+        int maxRounds,
+        int maxQueries) {
+      QuerySession session = findSession(sessionId).orElseThrow();
+      if (!session.userId().equals(userId) || session.status() != SessionStatus.RUNNING)
+        throw new IllegalStateException("query session is not runnable");
+      RetrievalBudget budget =
+          new RetrievalBudget(listReservations(sessionId), maxRounds, maxQueries);
+      List<String> queries = budget.freshQueries(proposedQueries, proposedQueries.size());
+      if (queries.isEmpty()) return Optional.empty();
+      RetrievalReservation reservation =
+          new RetrievalReservation(
+              UUID.randomUUID().toString(),
+              sessionId,
+              budget.nextRoundNo(),
+              queries,
+              Instant.now());
+      reservations.computeIfAbsent(sessionId, ignored -> new ArrayList<>()).add(reservation);
+      return Optional.of(reservation);
+    }
+
+    @Override
+    public List<RetrievalReservation> listReservations(String sessionId) {
+      return List.copyOf(reservations.getOrDefault(sessionId, List.of()));
     }
 
     @Override

@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -70,6 +71,47 @@ public final class WikiCompilationService {
   }
 
   public CompileResult compile(CompileRequest request) {
+    return compile(request, repository.newPublication());
+  }
+
+  public CompileResult compile(CompileRequest request, CompilationPublication publication) {
+    return compile(request, publication, ignored -> {});
+  }
+
+  public CompileResult compileEntry(
+      KnowledgeEntryCatalogue.Entry entry,
+      CompilationPublication publication,
+      Consumer<WikiRecord> databaseProjection) {
+    if (entry == null || entry.sources().isEmpty())
+      throw new IllegalArgumentException("grounded stable entry sources are required");
+    return compile(
+        new CompileRequest(entry.type(), entry.label(), entry.id(), entry.summaryIds()),
+        publication,
+        databaseProjection,
+        entry.id(),
+        entry.inputSummaryIds());
+  }
+
+  /** Include database-only projections in the same fenced publication as the Wiki itself. */
+  public CompileResult compile(
+      CompileRequest request,
+      CompilationPublication publication,
+      Consumer<WikiRecord> databaseProjection) {
+    return compile(
+        request,
+        publication,
+        databaseProjection,
+        "",
+        request == null ? List.of() : request.summaryIds());
+  }
+
+  private CompileResult compile(
+      CompileRequest request,
+      CompilationPublication publication,
+      Consumer<WikiRecord> databaseProjection,
+      String stableEntryId,
+      List<String> inputSummaryIds) {
+    require(databaseProjection, "wiki database projection");
     if (request == null) throw new IllegalArgumentException("wiki compile request is required");
     String wikiType = normalizeType(request.wikiType());
     if (wikiType.isEmpty()) wikiType = "GENERIC_TOPIC";
@@ -83,31 +125,50 @@ public final class WikiCompilationService {
             .filter(v -> !v.isEmpty())
             .distinct()
             .toList();
-    List<SummaryRecord> summaries = repository.loadSummaries(summaryIds);
+    var allInputs = new java.util.LinkedHashSet<>(inputSummaryIds);
+    allInputs.addAll(summaryIds);
+    var verifiedInputs =
+        GroundingConstraintAudit.requireCurrentSummaries(List.copyOf(allInputs), repository);
+    List<SummaryRecord> summaries =
+        verifiedInputs.stream().filter(summary -> summaryIds.contains(summary.id())).toList();
+    var context = repository.derivedContextForSummaries(List.copyOf(allInputs));
+    publication.captureInputs(context.versionIds());
     Map<String, SummaryFact> facts = sourceFacts(summaries);
     if (facts.isEmpty())
       throw new IllegalStateException("wiki source contains no grounded active facts");
+    var references = new GroundedFactReferences(facts);
 
     Proposal proposal =
         model.generateStructured(
             ModelRole.LARGE,
             ModelTask.WIKI_WRITE,
             writerPrompt(wikiType),
-            sourcePrompt(summaries, facts),
+            sourcePrompt(summaries, references),
             Proposal.class);
     if (proposal == null) throw new IllegalStateException("wiki writer returned empty proposal");
     if (!trim(proposal.wikiType()).isEmpty()
         && !normalizeType(proposal.wikiType()).equals(wikiType)) {
       throw new IllegalStateException("wiki proposal type mismatch");
     }
-    DecisionValidation decisionValidation = validateDecisions(facts, proposal.factDecisions());
+    DecisionValidation decisionValidation =
+        validateDecisions(facts, references, proposal.factDecisions());
     String wikiId =
-        GraphCompilationService.stableId(
-            "wiki", wikiType, title.toLowerCase(Locale.ROOT), trim(request.canonicalSubjectId()));
+        !stableEntryId.isEmpty()
+            ? stableEntryId
+            : GraphCompilationService.stableId(
+                "wiki",
+                wikiType,
+                title.toLowerCase(Locale.ROOT),
+                trim(request.canonicalSubjectId()));
     long version = repository.nextWikiVersion(wikiId);
     GroundingResult grounded =
         groundClaims(
-            wikiId, version, safe(proposal.claims()), facts, decisionValidation.decisions());
+            wikiId,
+            version,
+            safe(proposal.claims()),
+            facts,
+            references,
+            decisionValidation.decisions());
 
     List<String> missing = new ArrayList<>();
     for (Map.Entry<String, FactDecision> entry : decisionValidation.decisions().entrySet()) {
@@ -129,7 +190,7 @@ public final class WikiCompilationService {
       throw new IllegalStateException("wiki writer produced no grounded claims");
     List<String> keywords = extractWikiLinks(grounded.claims());
     String markdown = render(title, grounded.claims());
-    String objectKey = "wiki/" + wikiId + "/v" + version + ".md";
+    String objectKey = publication.objectKey("wiki/" + wikiId + "/v" + version + ".md");
     byte[] bytes = markdown.getBytes(StandardCharsets.UTF_8);
     objects.put(
         objectKey, new ByteArrayInputStream(bytes), bytes.length, "text/markdown; charset=utf-8");
@@ -148,7 +209,6 @@ public final class WikiCompilationService {
             keywords,
             keywords,
             clock.instant());
-    repository.saveWiki(record);
 
     List<Claim> claims =
         grounded.claims().stream()
@@ -166,7 +226,13 @@ public final class WikiCompilationService {
             clock.instant());
     List<List<Float>> vectors = embedding.embed(List.of(markdown));
     if (vectors.size() != 1) throw new IllegalStateException("wiki embedding response mismatch");
-    derived.indexWiki(page, repository.derivedContextForSummaries(summaryIds), vectors.get(0));
+    Runnable indexPublication = derived.prepareWiki(page, context, vectors.get(0));
+    publication.publish(
+        () -> {
+          repository.saveWiki(record, List.copyOf(allInputs));
+          indexPublication.run();
+          databaseProjection.accept(record);
+        });
     return new CompileResult(
         record, coverage, model.identity(ModelRole.LARGE), model.identity(ModelRole.SMALL));
   }
@@ -176,6 +242,7 @@ public final class WikiCompilationService {
       long version,
       List<ProposedClaim> proposed,
       Map<String, SummaryFact> facts,
+      GroundedFactReferences references,
       Map<String, FactDecision> decisions) {
     List<ClaimCandidate> candidates = new ArrayList<>();
     int candidateNo = 0;
@@ -187,7 +254,7 @@ public final class WikiCompilationService {
           raw.supportingFactIds() == null
               ? List.of()
               : raw.supportingFactIds().stream()
-                  .map(WikiCompilationService::trim)
+                  .map(references::canonicalId)
                   .filter(v -> !v.isEmpty())
                   .distinct()
                   .toList();
@@ -243,59 +310,99 @@ public final class WikiCompilationService {
               candidate.factIds(),
               candidate.evidenceIds(),
               "PASS",
-              "PASS"));
+              "PASS",
+              GroundingConstraintAudit.describe(decision.reason(), decision.checks()),
+              GroundingConstraintAudit.acceptedFullCandidate(
+                  candidate.claimText(), decision.checks())));
       covered.addAll(candidate.factIds());
     }
     return new GroundingResult(List.copyOf(claims), Set.copyOf(covered));
   }
 
   private Map<String, SupportDecision> judgeClaims(List<ClaimCandidate> candidates) {
+    Map<String, SupportDecision> decisions = new LinkedHashMap<>();
+    for (int start = 0;
+        start < candidates.size();
+        start += GroundingJudgeProtocol.MAX_BATCH_CANDIDATES) {
+      var batch =
+          candidates.subList(
+              start,
+              Math.min(candidates.size(), start + GroundingJudgeProtocol.MAX_BATCH_CANDIDATES));
+      for (var decision : judgeClaimBatch(batch).entrySet()) {
+        if (decisions.putIfAbsent(decision.getKey(), decision.getValue()) != null)
+          throw new ModelOutputRejectedException(
+              "wiki grounding duplicated candidate " + decision.getKey());
+      }
+    }
+    return Map.copyOf(decisions);
+  }
+
+  private Map<String, SupportDecision> judgeClaimBatch(List<ClaimCandidate> candidates) {
     if (candidates.isEmpty()) return Map.of();
     if (candidates.size() == 1) {
       ClaimCandidate candidate = candidates.get(0);
-      SupportDecision decision =
+      GroundingJudgeProtocol.Decision decision =
           model.generateStructured(
               ModelRole.SMALL,
               ModelTask.WIKI_JUDGE,
-              "你是独立 Wiki Claim Grounding Judge。只判断 claim 是否被给定的 grounded summary facts 直接支持。禁止使用常识补全；输出 supported 和 reason。",
+              "你是独立 Wiki Claim Grounding Judge。只判断 claim 是否被给定的 grounded summary facts 直接支持。"
+                  + GroundingJudgeProtocol.criteria()
+                  + "输出 supported、reason 和 checks。",
               "CLAIM="
                   + candidate.claimText()
                   + "\nSUPPORTING FACTS:\n"
                   + renderFactSupport(candidate.support()),
-              SupportDecision.class);
-      return Map.of(candidate.judgeId(), decision);
+              GroundingJudgeProtocol.Decision.class);
+      GroundingConstraintAudit.requireModelDecision(decision, "wiki grounding judge");
+      GroundingJudgeProtocol.requireVersion(decision.protocolVersion());
+      var checks = GroundingJudgeProtocol.bind(candidate.claimText(), decision.checks());
+      return Map.of(
+          candidate.judgeId(),
+          new SupportDecision(
+              GroundingConstraintAudit.modelSupported(
+                  candidate.claimText(),
+                  renderFactSupport(candidate.support()),
+                  decision.supported(),
+                  checks),
+              decision.reason(),
+              checks));
     }
 
-    SupportDecisionSet result =
+    GroundingJudgeProtocol.Batch result =
         model.generateStructured(
             ModelRole.SMALL,
             ModelTask.WIKI_JUDGE,
             "你是独立 Wiki Claim Grounding Judge。逐条判断每个 candidate claim 是否被它自己的 grounded summary facts 直接支持。"
-                + "必须为每个 candidate_id 恰好返回一条 decision，不得遗漏、增加或改写 candidate_id；禁止使用常识补全。",
+                + "必须为每个 candidate_id 恰好返回一条 decision，不得遗漏、增加或改写 candidate_id。"
+                + GroundingJudgeProtocol.criteria(),
             renderClaimCandidates(candidates),
-            SupportDecisionSet.class);
-    if (result == null || result.decisions() == null)
-      throw new IllegalStateException("wiki grounding batch returned empty decisions");
-    Set<String> expected =
-        candidates.stream()
-            .map(ClaimCandidate::judgeId)
-            .collect(java.util.stream.Collectors.toSet());
+            GroundingJudgeProtocol.Batch.class);
+    GroundingConstraintAudit.requireModelDecision(result, "wiki grounding batch");
+    GroundingJudgeProtocol.requireVersion(result.protocolVersion());
+    var records =
+        GroundingConstraintAudit.modelDecisions(
+            result == null ? null : result.decisions(),
+            candidates.stream().map(ClaimCandidate::judgeId).toList(),
+            GroundingJudgeProtocol.Item::candidateId,
+            "wiki grounding batch");
     Map<String, SupportDecision> decisions = new LinkedHashMap<>();
-    for (SupportDecisionItem raw : result.decisions()) {
-      if (raw == null)
-        throw new IllegalStateException("wiki grounding batch contains null decision");
-      String candidateId = trim(raw.candidateId());
-      if (!expected.contains(candidateId))
-        throw new IllegalStateException(
-            "wiki grounding batch references unknown candidate " + candidateId);
-      if (decisions.putIfAbsent(
-              candidateId, new SupportDecision(raw.supported(), trim(raw.reason())))
-          != null)
-        throw new IllegalStateException("wiki grounding batch duplicated candidate " + candidateId);
+    for (var record : records.entrySet()) {
+      String candidateId = record.getKey();
+      GroundingJudgeProtocol.Item raw = record.getValue();
+      var candidate =
+          candidates.stream()
+              .filter(c -> c.judgeId().equals(candidateId))
+              .findFirst()
+              .orElseThrow();
+      var checks = GroundingJudgeProtocol.bind(candidate.claimText(), raw.checks());
+      boolean supported =
+          GroundingConstraintAudit.modelSupported(
+              candidate.claimText(),
+              renderFactSupport(candidate.support()),
+              raw.supported(),
+              checks);
+      decisions.put(candidateId, new SupportDecision(supported, trim(raw.reason()), checks));
     }
-    for (String candidateId : expected)
-      if (!decisions.containsKey(candidateId))
-        throw new IllegalStateException("wiki grounding batch missing candidate " + candidateId);
     return Map.copyOf(decisions);
   }
 
@@ -314,11 +421,11 @@ public final class WikiCompilationService {
   }
 
   private static DecisionValidation validateDecisions(
-      Map<String, SummaryFact> facts, List<FactDecision> input) {
+      Map<String, SummaryFact> facts, GroundedFactReferences references, List<FactDecision> input) {
     Map<String, FactDecision> decisions = new LinkedHashMap<>();
     int eligible = 0, skipped = 0;
     for (FactDecision raw : safe(input)) {
-      String factId = trim(raw.factId());
+      String factId = references.canonicalId(raw.factId());
       if (!facts.containsKey(factId))
         throw new IllegalStateException("wiki decision references unknown fact " + factId);
       if (decisions.containsKey(factId))
@@ -384,7 +491,7 @@ public final class WikiCompilationService {
         + " 作为页面分类标签，但 section 不受固定模板限制，应根据事实自然组织为少量清晰、稳定的栏目。"
         + "每条 claim 必须引用 supporting_fact_ids。每个输入 fact 必须输出一个 fact_decision；"
         + "适合 Wiki 的 fact 标记 wiki_eligible=true 且最终必须至少被一个 claim 使用；不适合的必须给 skip_reason。"
-        + "逐字复制每个输入 fact 的 id，fact_decisions 中每个 id 恰好出现一次，不得发明、截断或改写 id。"
+        + "逐字复制每个输入 fact 的短引用键（例如 F001），fact_decisions 中每个引用恰好出现一次；不要输出 UUID，不得发明、截断或改写引用。"
         + "Claim 只能陈述 supporting facts 明确写出的内容，可忠实改写但不得补充因果、职责、审批要求、人数或时间等隐含信息；"
         + "若事实没有明确表达某个关系或义务，就不要在 claim 中添加该关系或义务。"
         + "为确保可验证，优先将 claim_text 直接复制为 supporting fact 的完整原文；只有在不增加任何信息的情况下才可做极短改写。"
@@ -395,7 +502,7 @@ public final class WikiCompilationService {
   }
 
   private static String sourcePrompt(
-      List<SummaryRecord> summaries, Map<String, SummaryFact> facts) {
+      List<SummaryRecord> summaries, GroundedFactReferences references) {
     StringBuilder out = new StringBuilder();
     // Wiki writing is grounded on the normalized facts below.  Re-sending the full derived
     // Summary markdown is redundant and can make an otherwise valid provider request exceed its
@@ -404,14 +511,7 @@ public final class WikiCompilationService {
     for (SummaryRecord summary : summaries)
       out.append("<summary id=\"").append(summary.id()).append("\"/>\n");
     out.append("<facts>\n");
-    for (SummaryFact fact : facts.values())
-      out.append("<fact id=\"")
-          .append(fact.id())
-          .append("\" section=\"")
-          .append(fact.section())
-          .append("\">\n")
-          .append(fact.factText())
-          .append("\n</fact>\n");
+    out.append(references.renderFacts());
     out.append("</facts>");
     return out.toString();
   }
@@ -458,9 +558,22 @@ public final class WikiCompilationService {
       List<ProposedClaim> claims,
       List<FactDecision> factDecisions) {}
 
-  public record SupportDecision(boolean supported, String reason) {}
+  public record SupportDecision(
+      boolean supported, String reason, List<GroundingConstraintAudit.Check> checks) {
+    public SupportDecision(boolean supported, String reason) {
+      this(supported, reason, null);
+    }
+  }
 
-  public record SupportDecisionItem(String candidateId, boolean supported, String reason) {}
+  public record SupportDecisionItem(
+      String candidateId,
+      boolean supported,
+      String reason,
+      List<GroundingConstraintAudit.Check> checks) {
+    public SupportDecisionItem(String candidateId, boolean supported, String reason) {
+      this(candidateId, supported, reason, null);
+    }
+  }
 
   public record SupportDecisionSet(List<SupportDecisionItem> decisions) {}
 

@@ -72,6 +72,7 @@ public final class IdentityApplicationService {
 
   public User setupAdmin(CreateUser command) {
     validateCreate(command);
+    validateClearance(command.securityClearance());
     return transactions.required(
         () -> {
           if (users.countLocked() != 0) throw new Conflict("initial setup is already complete");
@@ -89,13 +90,19 @@ public final class IdentityApplicationService {
     String token = newToken();
     String tokenHash = sha256(token);
     Session session = new Session(tokenHash, user.id(), tokenHash, now.plus(sessionTtl), now);
-    User loggedIn = user.withLastLogin(now);
-    transactions.required(
+    return transactions.required(
         () -> {
-          sessions.save(session);
+          // Lock the parent before inserting its session FK. Concurrent logins otherwise
+          // upgrade shared FK locks to exclusive user locks and can deadlock in MySQL.
+          User current = users.findByIdLocked(user.id()).orElseThrow(InvalidCredentials::new);
+          if (!current.active() || !storedHash.equals(users.passwordHash(user.id()).orElse("")))
+            throw new InvalidCredentials();
+          // Preserve a role/name change that occurred while the password was being checked.
+          User loggedIn = current.withLastLogin(now);
           users.update(loggedIn);
+          sessions.save(session);
+          return new LoginResult(loggedIn, token, session.expiresAt());
         });
-    return new LoginResult(loggedIn, token, session.expiresAt());
   }
 
   public User authenticate(String token) {
@@ -123,18 +130,25 @@ public final class IdentityApplicationService {
 
   public User createUser(CreateUser command) {
     validateCreate(command);
+    validateClearance(command.securityClearance());
     return transactions.required(
         () -> {
           if (users.findByUsername(command.username().trim()).isPresent())
             throw new Conflict("username already exists");
-          return create(
-              command.username(), command.displayName(), command.password(), command.role());
+          User created =
+              create(command.username(), command.displayName(), command.password(), command.role());
+          if (command.securityClearance() != null) {
+            created = created.withSecurityClearance(command.securityClearance(), clock.instant());
+            users.update(created);
+          }
+          return created;
         });
   }
 
   public User updateUser(String userId, UpdateUser command) {
     if (userId == null || userId.isBlank()) throw new Validation("user_id is required");
     if (command == null) throw new Validation("update is required");
+    validateClearance(command.securityClearance());
     if (command.displayName() != null && command.displayName().trim().length() > 128)
       throw new Validation("display_name is too long");
     return transactions.required(
@@ -153,6 +167,8 @@ public final class IdentityApplicationService {
           User next = current.withRoleAndStatus(nextRole, nextStatus, now);
           if (command.displayName() != null)
             next = next.withDisplayName(command.displayName(), now);
+          if (command.securityClearance() != null)
+            next = next.withSecurityClearance(command.securityClearance(), now);
           users.update(next);
           if (next.status() == UserStatus.DISABLED) sessions.deleteByUser(next.id());
           return next;
@@ -186,6 +202,11 @@ public final class IdentityApplicationService {
         });
   }
 
+  private static void validateClearance(Integer clearance) {
+    if (clearance != null && (clearance < 10 || clearance > 127))
+      throw new Validation("security clearance must be between 10 and 127");
+  }
+
   private User create(String username, String displayName, char[] password, Role role) {
     Instant now = clock.instant();
     String normalized = username.trim();
@@ -211,9 +232,19 @@ public final class IdentityApplicationService {
 
   public record Status(boolean setupRequired, long users) {}
 
-  public record CreateUser(String username, String displayName, char[] password, Role role) {}
+  public record CreateUser(
+      String username, String displayName, char[] password, Role role, Integer securityClearance) {
+    public CreateUser(String username, String displayName, char[] password, Role role) {
+      this(username, displayName, password, role, null);
+    }
+  }
 
-  public record UpdateUser(String displayName, Role role, UserStatus status) {}
+  public record UpdateUser(
+      String displayName, Role role, UserStatus status, Integer securityClearance) {
+    public UpdateUser(String displayName, Role role, UserStatus status) {
+      this(displayName, role, status, null);
+    }
+  }
 
   public record LoginResult(User user, String token, Instant expiresAt) {}
 

@@ -65,16 +65,22 @@ final class HttpViews {
         file.createdAt(),
         file.updatedAt(),
         file.startedAt(),
-        file.finishedAt());
+        file.finishedAt(),
+        metadata.securityLevel(),
+        file.nextAttemptAt());
   }
 
   static EvidenceView evidence(Evidence evidence) {
+    return evidence(evidence, sourceFilename(evidence.objectKey()));
+  }
+
+  static EvidenceView evidence(Evidence evidence, String sourceFilename) {
     return new EvidenceView(
         evidence.id(),
         evidence.documentId(),
         evidence.versionId(),
         evidence.objectKey(),
-        sourceFilename(evidence.objectKey()),
+        sourceFilename,
         evidence.location(),
         originalEvidenceContent(evidence),
         evidence.hash());
@@ -170,5 +176,7 @@ final class HttpViews {
       Instant createdAt,
       Instant updatedAt,
       Instant startedAt,
-      Instant finishedAt) {}
+      Instant finishedAt,
+      Integer securityLevel,
+      Instant nextAttemptAt) {}
 }

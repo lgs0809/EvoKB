@@ -179,9 +179,27 @@ public final class KnowledgeDomain {
       String sourceDepartment,
       String materialCategory,
       String documentType,
-      List<String> versionIds) {
+      List<String> versionIds,
+      int securityClearance) {
+    public SearchFilters(
+        String sourceDepartment,
+        String materialCategory,
+        String documentType,
+        List<String> versionIds) {
+      this(sourceDepartment, materialCategory, documentType, versionIds, 10);
+    }
+
     public SearchFilters {
       versionIds = versionIds == null ? List.of() : List.copyOf(versionIds);
+      // Missing historical values are public-only. HTTP DTOs deliberately expose no clearance.
+      if (securityClearance == 0) securityClearance = 10;
+      if (securityClearance < 10 || securityClearance > 127)
+        throw new IllegalArgumentException("security clearance must fit a positive INT8 level");
+    }
+
+    public SearchFilters withClearance(int clearance) {
+      return new SearchFilters(
+          sourceDepartment, materialCategory, documentType, versionIds, clearance);
     }
   }
 

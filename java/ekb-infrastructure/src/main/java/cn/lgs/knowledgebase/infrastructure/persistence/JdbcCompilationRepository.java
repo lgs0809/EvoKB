@@ -55,6 +55,16 @@ public final class JdbcCompilationRepository implements CompilationRepository {
   }
 
   @Override
+  public void withinPublication(Runnable publication) {
+    transactions.executeWithoutResult(ignored -> publication.run());
+  }
+
+  @Override
+  public cn.lgs.knowledgebase.application.compilation.CompilationPublication newPublication() {
+    return new JdbcCompilationPublication(jdbc, transactions, () -> {}, null);
+  }
+
+  @Override
   public VersionSource loadVersionSource(String versionId) {
     Header header =
         jdbc
@@ -122,7 +132,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
         status -> {
           // Keep the durable unit primary key stable when a later classification changes its
           // descriptive fields or boundaries. The database enforces (version_id, unit_no) as a
-          // unique key, and MySQL's ON DUPLICATE KEY UPDATE retains the existing unit_id. Resolve
+          // unique key, and ON CONFLICT retains the existing unit_id. Resolve
           // that key before writing so the cleanup below never deletes a just-updated parent (and
           // so summaries keep pointing at the same unit after a retry).
           Map<Integer, String> existingIds = new LinkedHashMap<>();
@@ -136,8 +146,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
             String unitId = existingIds.getOrDefault(unit.unitNo(), unit.id());
             unitNumbers.add(unit.unitNo());
             jdbc.update(
-                "INSERT INTO document_unit(unit_id,version_id,unit_no,title,structure_type,document_type,boundary_json) VALUES(?,?,?,?,?,?,?) "
-                    + "ON DUPLICATE KEY UPDATE title=VALUES(title),structure_type=VALUES(structure_type),document_type=VALUES(document_type),boundary_json=VALUES(boundary_json)",
+                "INSERT INTO document_unit(unit_id,version_id,unit_no,title,structure_type,document_type,boundary_json) VALUES(?,?,?,?,?,?,?) ON CONFLICT (version_id,unit_no) DO UPDATE SET title=EXCLUDED.title,structure_type=EXCLUDED.structure_type,document_type=EXCLUDED.document_type,boundary_json=EXCLUDED.boundary_json",
                 unitId,
                 unit.versionId(),
                 unit.unitNo(),
@@ -169,10 +178,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
   @Override
   public List<DocumentUnit> loadDocumentUnits(String versionId) {
     return jdbc.query(
-        "SELECT unit_id,version_id,unit_no,COALESCE(title,''),structure_type,COALESCE(document_type,''),"
-            + "CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(boundary_json,'$.start_block_no')),'0') AS UNSIGNED),"
-            + "CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(boundary_json,'$.end_block_no')),'0') AS UNSIGNED) "
-            + "FROM document_unit WHERE version_id=? ORDER BY unit_no",
+        "SELECT unit_id,version_id,unit_no,COALESCE(title,''),structure_type,COALESCE(document_type,''),CAST(COALESCE(boundary_json->>'start_block_no','0') AS INTEGER),CAST(COALESCE(boundary_json->>'end_block_no','0') AS INTEGER) FROM document_unit WHERE version_id=? ORDER BY unit_no",
         (rs, rowNum) ->
             new DocumentUnit(
                 rs.getString(1),
@@ -197,8 +203,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
                 summary.id());
           }
           jdbc.update(
-              "INSERT INTO summary(summary_id,unit_id,version_id,object_key,content_hash,grounding_status,coverage_status,lifecycle,model) VALUES(?,?,?,?,?,?,?,?,?) "
-                  + "ON DUPLICATE KEY UPDATE object_key=VALUES(object_key),content_hash=VALUES(content_hash),grounding_status=VALUES(grounding_status),coverage_status=VALUES(coverage_status),lifecycle=VALUES(lifecycle),model=VALUES(model)",
+              "INSERT INTO summary(summary_id,unit_id,version_id,object_key,content_hash,grounding_status,coverage_status,lifecycle,model) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT (summary_id) DO UPDATE SET object_key=EXCLUDED.object_key,content_hash=EXCLUDED.content_hash,grounding_status=EXCLUDED.grounding_status,coverage_status=EXCLUDED.coverage_status,lifecycle=EXCLUDED.lifecycle,model=EXCLUDED.model",
               summary.id(),
               summary.unitId(),
               summary.versionId(),
@@ -210,16 +215,17 @@ public final class JdbcCompilationRepository implements CompilationRepository {
               nullable(summary.model()));
           for (SummaryFact fact : summary.facts()) {
             jdbc.update(
-                "INSERT INTO summary_fact(fact_id,summary_id,section,fact_text,grounding_status) VALUES(?,?,?,?,?) "
-                    + "ON DUPLICATE KEY UPDATE section=VALUES(section),fact_text=VALUES(fact_text),grounding_status=VALUES(grounding_status)",
+                "INSERT INTO summary_fact(fact_id,summary_id,section,fact_text,grounding_status,grounding_reason,grounding_audit) VALUES(?,?,?,?,?,?,?::jsonb) ON CONFLICT (fact_id) DO UPDATE SET section=EXCLUDED.section,fact_text=EXCLUDED.fact_text,grounding_status=EXCLUDED.grounding_status,grounding_reason=EXCLUDED.grounding_reason,grounding_audit=EXCLUDED.grounding_audit",
                 fact.id(),
                 summary.id(),
                 fact.section(),
                 fact.factText(),
-                fact.groundingStatus());
+                fact.groundingStatus(),
+                fact.groundingReason(),
+                fact.groundingAudit() == null ? null : json(fact.groundingAudit()));
             for (String evidenceId : unique(fact.evidenceIds())) {
               jdbc.update(
-                  "INSERT IGNORE INTO summary_evidence(fact_id,evidence_id) VALUES(?,?)",
+                  "INSERT INTO summary_evidence(fact_id,evidence_id) VALUES(?,?) ON CONFLICT DO NOTHING",
                   fact.id(),
                   evidenceId);
             }
@@ -230,6 +236,11 @@ public final class JdbcCompilationRepository implements CompilationRepository {
   @Override
   public Optional<SummaryRecord> findSummary(String summaryId) {
     return readSummaries(List.of(summaryId)).stream().findFirst();
+  }
+
+  @Override
+  public Optional<SummaryRecord> findSummaryForAudit(String summaryId) {
+    return readSummaries(List.of(summaryId), false).stream().findFirst();
   }
 
   @Override
@@ -273,8 +284,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
               summaryId);
           for (ConceptRecord concept : concepts == null ? List.<ConceptRecord>of() : concepts) {
             jdbc.update(
-                "INSERT INTO concept_candidate(concept_id,summary_id,version_id,preferred_label,concept_type_hint,description,lifecycle,model) VALUES(?,?,?,?,?,?,?,?) "
-                    + "ON DUPLICATE KEY UPDATE preferred_label=VALUES(preferred_label),concept_type_hint=VALUES(concept_type_hint),description=VALUES(description),lifecycle=VALUES(lifecycle),model=VALUES(model),updated_at=CURRENT_TIMESTAMP(6)",
+                "INSERT INTO concept_candidate(concept_id,summary_id,version_id,preferred_label,concept_type_hint,description,lifecycle,model) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT (concept_id) DO UPDATE SET preferred_label=EXCLUDED.preferred_label,concept_type_hint=EXCLUDED.concept_type_hint,description=EXCLUDED.description,lifecycle=EXCLUDED.lifecycle,model=EXCLUDED.model,updated_at=CURRENT_TIMESTAMP(6)",
                 concept.id(),
                 concept.summaryId(),
                 concept.versionId(),
@@ -370,6 +380,10 @@ public final class JdbcCompilationRepository implements CompilationRepository {
   }
 
   private List<SummaryRecord> readSummaries(List<String> ids) {
+    return readSummaries(ids, true);
+  }
+
+  private List<SummaryRecord> readSummaries(List<String> ids, boolean includeBody) {
     if (ids.isEmpty()) return List.of();
     String placeholders = String.join(",", Collections.nCopies(ids.size(), "?"));
     List<SummaryHeader> headers =
@@ -409,7 +423,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
               h.coverage(),
               h.lifecycle(),
               h.model(),
-              readObjectText(h.objectKey()),
+              includeBody ? readObjectText(h.objectKey()) : "",
               facts,
               h.createdAt()));
     }
@@ -421,9 +435,15 @@ public final class JdbcCompilationRepository implements CompilationRepository {
   private List<SummaryFact> readSummaryFacts(String summaryId) {
     List<FactHeader> headers =
         jdbc.query(
-            "SELECT fact_id,section,fact_text,grounding_status FROM summary_fact WHERE summary_id=? ORDER BY created_at,fact_id",
+            "SELECT fact_id,section,fact_text,grounding_status,grounding_reason,grounding_audit FROM summary_fact WHERE summary_id=? ORDER BY created_at,fact_id",
             (rs, rowNum) ->
-                new FactHeader(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4)),
+                new FactHeader(
+                    rs.getString(1),
+                    rs.getString(2),
+                    rs.getString(3),
+                    rs.getString(4),
+                    rs.getString(5),
+                    readAudit(rs.getString(6))),
             summaryId);
     if (headers.isEmpty()) return List.of();
     List<String> factIds = headers.stream().map(FactHeader::id).toList();
@@ -451,7 +471,8 @@ public final class JdbcCompilationRepository implements CompilationRepository {
               factRefs.stream().map(EvidenceRef::blockId).distinct().toList(),
               factRefs.stream().map(EvidenceRef::evidenceId).distinct().toList(),
               h.grounding(),
-              ""));
+              h.groundingReason(),
+              h.groundingAudit()));
     }
     return List.copyOf(out);
   }
@@ -464,8 +485,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
         cn.lgs.knowledgebase.application.compilation.GraphCompilationService.stableId(
             "entity", entityType, key);
     jdbc.update(
-        "INSERT INTO canonical_entity(canonical_entity_id,canonical_name,entity_type,canonical_key) VALUES(?,?,?,?) "
-            + "ON DUPLICATE KEY UPDATE canonical_name=VALUES(canonical_name),updated_at=CURRENT_TIMESTAMP(6)",
+        "INSERT INTO canonical_entity(canonical_entity_id,canonical_name,entity_type,canonical_key) VALUES(?,?,?,?) ON CONFLICT (entity_type,(left(canonical_key,191))) DO UPDATE SET canonical_name=EXCLUDED.canonical_name,updated_at=CURRENT_TIMESTAMP(6)",
         candidateId,
         name,
         entityType,
@@ -525,8 +545,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
         status -> {
           for (Entity entity : entities) {
             jdbc.update(
-                "INSERT INTO canonical_entity(canonical_entity_id,canonical_name,entity_type,canonical_key,attributes_json) VALUES(?,?,?,?,?) "
-                    + "ON DUPLICATE KEY UPDATE canonical_name=VALUES(canonical_name),attributes_json=VALUES(attributes_json),updated_at=CURRENT_TIMESTAMP(6)",
+                "INSERT INTO canonical_entity(canonical_entity_id,canonical_name,entity_type,canonical_key,attributes_json) VALUES(?,?,?,?,?) ON CONFLICT (entity_type,(left(canonical_key,191))) DO UPDATE SET canonical_name=EXCLUDED.canonical_name,attributes_json=EXCLUDED.attributes_json,updated_at=CURRENT_TIMESTAMP(6)",
                 entity.canonicalId(),
                 entity.canonicalName(),
                 entity.entityType(),
@@ -536,16 +555,14 @@ public final class JdbcCompilationRepository implements CompilationRepository {
           for (EntityResolution resolution :
               resolutions == null ? List.<EntityResolution>of() : resolutions) {
             jdbc.update(
-                "INSERT INTO source_entity(source_entity_id,version_id,surface_form,entity_type,evidence_id) VALUES(?,?,?,?,?) "
-                    + "ON DUPLICATE KEY UPDATE surface_form=VALUES(surface_form),entity_type=VALUES(entity_type),evidence_id=VALUES(evidence_id)",
+                "INSERT INTO source_entity(source_entity_id,version_id,surface_form,entity_type,evidence_id) VALUES(?,?,?,?,?) ON CONFLICT (source_entity_id) DO UPDATE SET surface_form=EXCLUDED.surface_form,entity_type=EXCLUDED.entity_type,evidence_id=EXCLUDED.evidence_id",
                 resolution.sourceEntityId(),
                 resolution.versionId(),
                 resolution.surfaceForm(),
                 resolution.entityType(),
                 resolution.evidenceId());
             jdbc.update(
-                "INSERT INTO entity_mapping(source_entity_id,canonical_entity_id,confidence,status,decided_by) VALUES(?,?,?,'APPLIED',?) "
-                    + "ON DUPLICATE KEY UPDATE canonical_entity_id=VALUES(canonical_entity_id),confidence=VALUES(confidence),status='APPLIED',decided_by=VALUES(decided_by)",
+                "INSERT INTO entity_mapping(source_entity_id,canonical_entity_id,confidence,status,decided_by) VALUES(?,?,?,'APPLIED',?) ON CONFLICT (source_entity_id) DO UPDATE SET canonical_entity_id=EXCLUDED.canonical_entity_id,confidence=EXCLUDED.confidence,status='APPLIED',decided_by=EXCLUDED.decided_by",
                 resolution.sourceEntityId(),
                 resolution.canonicalEntityId(),
                 resolution.confidence(),
@@ -553,8 +570,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
           }
           for (Relation relation : relations) {
             jdbc.update(
-                "INSERT INTO relation_fact(relation_id,source_entity_id,relation_type,target_entity_id,valid_from,valid_to,conflict_status,lifecycle) VALUES(?,?,?,?,?,?,?,?) "
-                    + "ON DUPLICATE KEY UPDATE valid_to=VALUES(valid_to),conflict_status=VALUES(conflict_status),lifecycle=VALUES(lifecycle)",
+                "INSERT INTO relation_fact(relation_id,source_entity_id,relation_type,target_entity_id,valid_from,valid_to,conflict_status,lifecycle) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT (relation_id) DO UPDATE SET valid_to=EXCLUDED.valid_to,conflict_status=EXCLUDED.conflict_status,lifecycle=EXCLUDED.lifecycle",
                 relation.id(),
                 relation.subjectEntityId(),
                 relation.predicate(),
@@ -568,8 +584,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
                   cn.lgs.knowledgebase.application.compilation.GraphCompilationService.stableId(
                       "support", relation.id(), evidenceId, summaryId);
               jdbc.update(
-                  "INSERT INTO relation_evidence_support(support_id,relation_id,origin,evidence_id,summary_id,confidence,active) VALUES(?,?,'llm_triple',?,?,?,TRUE) "
-                      + "ON DUPLICATE KEY UPDATE confidence=VALUES(confidence),active=TRUE",
+                  "INSERT INTO relation_evidence_support(support_id,relation_id,origin,evidence_id,summary_id,confidence,active) VALUES(?,?,'llm_triple',?,?,?,TRUE) ON CONFLICT (support_id) DO UPDATE SET confidence=EXCLUDED.confidence,active=TRUE",
                   supportId,
                   relation.id(),
                   evidenceId,
@@ -589,6 +604,43 @@ public final class JdbcCompilationRepository implements CompilationRepository {
   }
 
   @Override
+  public void saveWiki(WikiRecord wiki, List<String> inputSummaryIds) {
+    var ids = unique(inputSummaryIds);
+    if (ids.isEmpty()) throw new IllegalArgumentException("actual Wiki build inputs are required");
+    String marks = String.join(",", java.util.Collections.nCopies(ids.size(), "?"));
+    transactions.executeWithoutResult(
+        status -> {
+          var sources =
+              jdbc.query(
+                  "SELECT s.summary_id,s.version_id,a.acl_version FROM summary s JOIN kb_source_authority a ON a.version_id=s.version_id "
+                      + "JOIN document_version v ON v.version_id=s.version_id JOIN document d ON d.document_id=v.document_id "
+                      + "JOIN document_metadata dm ON dm.version_id=v.version_id WHERE s.lifecycle='ACTIVE' AND s.summary_id IN ("
+                      + marks
+                      + ") ORDER BY s.summary_id FOR SHARE OF s,v,d,dm",
+                  (rs, n) -> new Object[] {rs.getString(1), rs.getString(2), rs.getLong(3)},
+                  ids.toArray());
+          if (sources.size() != ids.size())
+            throw new IllegalStateException("Wiki build has missing or stale source inputs");
+          saveWiki(wiki);
+          for (var source : sources)
+            jdbc.update(
+                "INSERT INTO kb_asset_build_dependency(asset_type,asset_id,build_revision,source_version_id,acl_version) VALUES('WIKI',?,?,?,?) ON CONFLICT DO NOTHING",
+                wiki.id(),
+                Long.toString(wiki.version()),
+                source[1],
+                source[2]);
+          long sourceCount = sources.stream().map(source -> source[1]).distinct().count();
+          jdbc.update(
+              "UPDATE wiki SET input_policy_version=?,input_source_count=? WHERE wiki_id=? AND wiki_version=?",
+              cn.lgs.knowledgebase.application.compilation.CompilationContracts
+                  .COMPLETE_INPUT_POLICY,
+              sourceCount,
+              wiki.id(),
+              wiki.version());
+        });
+  }
+
+  @Override
   public void saveWiki(WikiRecord wiki) {
     transactions.executeWithoutResult(
         status -> {
@@ -599,8 +651,7 @@ public final class JdbcCompilationRepository implements CompilationRepository {
                 wiki.version());
           }
           jdbc.update(
-              "INSERT INTO wiki(wiki_id,wiki_version,wiki_type,canonical_subject_id,title,object_key,content_hash,lifecycle) VALUES(?,?,?,?,?,?,?,?) "
-                  + "ON DUPLICATE KEY UPDATE wiki_type=VALUES(wiki_type),canonical_subject_id=VALUES(canonical_subject_id),title=VALUES(title),object_key=VALUES(object_key),content_hash=VALUES(content_hash),lifecycle=VALUES(lifecycle)",
+              "INSERT INTO wiki(wiki_id,wiki_version,wiki_type,canonical_subject_id,title,object_key,content_hash,lifecycle) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT (wiki_id,wiki_version) DO UPDATE SET wiki_type=EXCLUDED.wiki_type,canonical_subject_id=EXCLUDED.canonical_subject_id,title=EXCLUDED.title,object_key=EXCLUDED.object_key,content_hash=EXCLUDED.content_hash,lifecycle=EXCLUDED.lifecycle",
               wiki.id(),
               wiki.version(),
               wiki.wikiType(),
@@ -611,23 +662,24 @@ public final class JdbcCompilationRepository implements CompilationRepository {
               wiki.lifecycle());
           for (WikiClaim claim : wiki.claims()) {
             jdbc.update(
-                "INSERT INTO wiki_claim(claim_id,wiki_id,wiki_version,section,claim_text,grounding_status,temporal_status) VALUES(?,?,?,?,?,?,?) "
-                    + "ON DUPLICATE KEY UPDATE section=VALUES(section),claim_text=VALUES(claim_text),grounding_status=VALUES(grounding_status),temporal_status=VALUES(temporal_status)",
+                "INSERT INTO wiki_claim(claim_id,wiki_id,wiki_version,section,claim_text,grounding_status,temporal_status,grounding_reason,grounding_audit) VALUES(?,?,?,?,?,?,?,?,?::jsonb) ON CONFLICT (claim_id) DO UPDATE SET section=EXCLUDED.section,claim_text=EXCLUDED.claim_text,grounding_status=EXCLUDED.grounding_status,temporal_status=EXCLUDED.temporal_status,grounding_reason=EXCLUDED.grounding_reason,grounding_audit=EXCLUDED.grounding_audit",
                 claim.id(),
                 claim.wikiId(),
                 claim.wikiVersion(),
                 claim.section(),
                 claim.claimText(),
                 claim.groundingStatus(),
-                claim.temporalStatus());
+                claim.temporalStatus(),
+                claim.groundingReason(),
+                claim.groundingAudit() == null ? null : json(claim.groundingAudit()));
             for (String factId : unique(claim.factIds()))
               jdbc.update(
-                  "INSERT IGNORE INTO wiki_claim_fact(claim_id,fact_id) VALUES(?,?)",
+                  "INSERT INTO wiki_claim_fact(claim_id,fact_id) VALUES(?,?) ON CONFLICT DO NOTHING",
                   claim.id(),
                   factId);
             for (String evidenceId : unique(claim.evidenceIds()))
               jdbc.update(
-                  "INSERT IGNORE INTO wiki_evidence(claim_id,evidence_id) VALUES(?,?)",
+                  "INSERT INTO wiki_evidence(claim_id,evidence_id) VALUES(?,?) ON CONFLICT DO NOTHING",
                   claim.id(),
                   evidenceId);
           }
@@ -752,6 +804,17 @@ public final class JdbcCompilationRepository implements CompilationRepository {
     }
   }
 
+  private cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit.Audit readAudit(
+      String value) {
+    if (value == null || value.isBlank()) return null;
+    try {
+      return mapper.readValue(
+          value, cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit.Audit.class);
+    } catch (JsonProcessingException malformed) {
+      throw new IllegalStateException("invalid stored grounding audit", malformed);
+    }
+  }
+
   private String json(Object value) {
     try {
       return mapper.writeValueAsString(value);
@@ -826,7 +889,13 @@ public final class JdbcCompilationRepository implements CompilationRepository {
       String model,
       Instant createdAt) {}
 
-  private record FactHeader(String id, String section, String text, String grounding) {}
+  private record FactHeader(
+      String id,
+      String section,
+      String text,
+      String grounding,
+      String groundingReason,
+      cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit.Audit groundingAudit) {}
 
   private record EvidenceRef(String evidenceId, String blockId) {}
 

@@ -1,0 +1,82 @@
+# Target dependencies: existing MinIO + PostgreSQL + Redis Stream + Milvus.
+# Isolated volumes; the pre-existing legacy deployment is preserved separately.
+services:
+  postgres:
+    restart: unless-stopped
+    image: postgres:16.14
+    environment:
+      POSTGRES_DB: evokb_target
+      POSTGRES_USER: evokb_target
+      POSTGRES_PASSWORD: ${EKB_POSTGRES_PASSWORD:?private target environment required}
+    ports: ["127.0.0.1:15465:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evokb_target -d evokb_target"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 512m
+    cpus: 1
+  redis:
+    restart: unless-stopped
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["127.0.0.1:16385:6379"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 256m
+    cpus: 1
+  etcd:
+    restart: unless-stopped
+    image: quay.io/coreos/etcd:v3.5.25
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "1073741824"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: ["etcd", "-advertise-client-urls=http://etcd:2379", "-listen-client-urls", "http://0.0.0.0:2379", "--data-dir", "/etcd"]
+    volumes: ["etcd-data:/etcd"]
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    mem_limit: 256m
+    cpus: 1
+  milvus:
+    restart: unless-stopped
+    image: milvusdb/milvus:v2.6.22@sha256:a8ac051e59eb084d41bd317ec51aac28553d664e91c43a806ccd6a1538abc1df
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: evokb-acceptance-minio-1:9000
+      MINIO_ACCESS_KEY_ID: ${EKB_MINIO_ROOT_USER:?reuse existing private local MinIO}
+      MINIO_SECRET_ACCESS_KEY: ${EKB_MINIO_ROOT_PASSWORD:?reuse existing private local MinIO}
+      MINIO_BUCKET_NAME: evokb-milvus-target
+      MQ_TYPE: woodpecker
+    volumes: ["milvus-data:/var/lib/milvus"]
+    ports: ["127.0.0.1:19535:19530", "127.0.0.1:19095:9091"]
+    networks: [default, legacy-minio]
+    depends_on:
+      etcd: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9091/healthz"]
+      interval: 10s
+      start_period: 90s
+      timeout: 5s
+      retries: 30
+    mem_limit: 2048m
+    cpus: 2
+networks:
+  legacy-minio:
+    external: true
+    name: evokb-acceptance_default
+volumes:
+  postgres-data:
+  redis-data:
+  etcd-data:
+  milvus-data:

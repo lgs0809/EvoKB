@@ -3,8 +3,11 @@ NPM ?= npm
 NODE ?= node
 DOCKER ?= docker
 COMPOSE ?= docker compose
+COMPOSE_FILE ?= deploy/docker-compose.yml
+COMPOSE_ENV_FILE ?= .env
+IMAGE ?= evokb:local
 
-.PHONY: verify backend frontend security compose-config docker-build
+.PHONY: verify backend frontend security compose-config docker-build up stop logs
 
 verify: backend frontend security compose-config
 
@@ -22,7 +25,16 @@ security:
 	$(NODE) scripts/release-hygiene.mjs
 
 compose-config:
-	$(COMPOSE) --env-file .env.example -f deploy/docker-compose.yml config -q
+	$(COMPOSE) --env-file .env.example -f $(COMPOSE_FILE) config -q
 
 docker-build:
-	$(DOCKER) build -f deploy/Dockerfile -t evokb:local .
+	$(DOCKER) build -f deploy/Dockerfile -t $(IMAGE) .
+
+up:
+	$(COMPOSE) --env-file $(COMPOSE_ENV_FILE) -f $(COMPOSE_FILE) up -d --build
+
+stop:
+	$(COMPOSE) --env-file $(COMPOSE_ENV_FILE) -f $(COMPOSE_FILE) stop
+
+logs:
+	$(COMPOSE) --env-file $(COMPOSE_ENV_FILE) -f $(COMPOSE_FILE) logs -f app

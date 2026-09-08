@@ -1,5 +1,6 @@
 package cn.lgs.knowledgebase.infrastructure.parser;
 
+import cn.lgs.knowledgebase.application.port.Ports.ObjectStore;
 import cn.lgs.knowledgebase.application.port.Ports.ParsedBlock;
 import cn.lgs.knowledgebase.application.port.Ports.ParsedDocument;
 import cn.lgs.knowledgebase.application.port.Ports.ParserPort;
@@ -27,6 +28,10 @@ public final class MinerUPipelineAdapter implements ParserPort {
   private final Duration taskTimeout;
   private final String parseMethod;
   private final String language;
+  private final String backend;
+  private final String effort;
+  private final String expectedVersion;
+  private final ObjectStore objects;
 
   public MinerUPipelineAdapter(
       String baseUrl,
@@ -34,7 +39,7 @@ public final class MinerUPipelineAdapter implements ParserPort {
       Duration pollInterval,
       String parseMethod,
       String language) {
-    this(baseUrl, mapper, pollInterval, Duration.ofMinutes(45), parseMethod, language);
+    this(baseUrl, mapper, pollInterval, Duration.ofMinutes(10), parseMethod, language);
   }
 
   public MinerUPipelineAdapter(
@@ -44,12 +49,107 @@ public final class MinerUPipelineAdapter implements ParserPort {
       Duration taskTimeout,
       String parseMethod,
       String language) {
-    this.client = RestClient.builder().baseUrl(trimSlash(baseUrl)).build();
+    this(
+        baseUrl,
+        mapper,
+        pollInterval,
+        taskTimeout,
+        parseMethod,
+        language,
+        "hybrid-engine",
+        "medium",
+        "3.4.5");
+  }
+
+  public MinerUPipelineAdapter(
+      String baseUrl,
+      ObjectMapper mapper,
+      Duration pollInterval,
+      Duration taskTimeout,
+      String parseMethod,
+      String language,
+      String backend,
+      String effort,
+      String expectedVersion) {
+    this(
+        baseUrl,
+        mapper,
+        pollInterval,
+        taskTimeout,
+        parseMethod,
+        language,
+        backend,
+        effort,
+        expectedVersion,
+        null);
+  }
+
+  public MinerUPipelineAdapter(
+      String baseUrl,
+      ObjectMapper mapper,
+      Duration pollInterval,
+      Duration taskTimeout,
+      String parseMethod,
+      String language,
+      String backend,
+      String effort,
+      String expectedVersion,
+      ObjectStore objects) {
+    this.objects = objects;
+    this.backend = blankTo(backend, "hybrid-engine");
+    this.effort = blankTo(effort, "medium");
+    this.expectedVersion = blankTo(expectedVersion, "3.4.5");
+    Duration bounded = positive(taskTimeout, Duration.ofMinutes(10));
+    if (bounded.compareTo(Duration.ofMinutes(10)) > 0) bounded = Duration.ofMinutes(10);
+    java.net.http.HttpClient http =
+        java.net.http.HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
+    var factory = new org.springframework.http.client.JdkClientHttpRequestFactory(http);
+    factory.setReadTimeout(
+        bounded.compareTo(Duration.ofSeconds(5)) < 0 ? bounded : Duration.ofSeconds(5));
+    this.client = RestClient.builder().baseUrl(trimSlash(baseUrl)).requestFactory(factory).build();
     this.mapper = mapper;
     this.pollInterval = positive(pollInterval, Duration.ofMillis(500));
-    this.taskTimeout = positive(taskTimeout, Duration.ofMinutes(45));
+    this.taskTimeout = bounded;
     this.parseMethod = blankTo(parseMethod, "auto");
     this.language = blankTo(language, "ch");
+  }
+
+  @Override
+  public java.util.Optional<cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity>
+      currentPipeline(String filename) {
+    String format = TextDocumentParserAdapter.extension(filename).replaceFirst("^\\.", "");
+    JsonNode response =
+        client.get().uri("/pipeline?format={format}", format).retrieve().body(JsonNode.class);
+    if (response == null || !response.path("components").isObject())
+      throw new IllegalStateException(
+          "PARSER_IDENTITY_UNAVAILABLE: actual current parser declaration is missing");
+    var components = new java.util.TreeMap<String, String>();
+    response
+        .path("components")
+        .fields()
+        .forEachRemaining(
+            e -> {
+              if (!e.getValue().isTextual())
+                throw new IllegalStateException(
+                    "PARSER_PROFILE_INVALID: parser identity component is not text");
+              components.put(e.getKey(), e.getValue().textValue());
+            });
+    var identity = new cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity(components);
+    if (!identity.sha256().equals(response.path("sha256").asText())
+        || !"mineru-hybrid-engine".equals(components.get("parser.name"))
+        || !("." + format).equals(components.get("parser.format"))
+        || !expectedVersion.equals(components.get("parser.version"))
+        || !backend.equals(components.get("config.backend"))
+        || !effort.equals(components.get("config.effort"))
+        || !parseMethod.equals(components.get("config.parse_method"))
+        || !language.equals(components.get("config.language")))
+      throw new IllegalStateException(
+          "PARSER_PROFILE_INVALID: actual declared pipeline differs from configured parser contract");
+    return java.util.Optional.of(
+        identity.with(
+            "raw.adapter.sha256",
+            cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity.classSha256(
+                MinerUPipelineAdapter.class)));
   }
 
   @Override
@@ -60,18 +160,45 @@ public final class MinerUPipelineAdapter implements ParserPort {
   @Override
   public ParsedDocument parse(
       String filename, InputStream source, String resumeTaskId, Consumer<String> taskIdSink) {
+    return parse(filename, source, resumeTaskId, taskIdSink, null);
+  }
+
+  @Override
+  public ParsedDocument parse(
+      String filename,
+      InputStream source,
+      String resumeTaskId,
+      Consumer<String> taskIdSink,
+      cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity expectedPipeline) {
+    return parse(filename, source, resumeTaskId, taskIdSink, expectedPipeline, null);
+  }
+
+  @Override
+  public ParsedDocument parse(
+      String filename,
+      InputStream source,
+      String resumeTaskId,
+      Consumer<String> taskIdSink,
+      cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity expectedPipeline,
+      String expectedSourceSha256) {
     Consumer<String> sink = taskIdSink == null ? ignored -> {} : taskIdSink;
     String taskId = resumeTaskId == null ? "" : resumeTaskId.trim();
+    long startedNanos = System.nanoTime();
     if (taskId.isEmpty()) {
       taskId = submit(filename, source, sink);
     }
-
-    long startedNanos = System.nanoTime();
     boolean resubmittedMissingTask = false;
     while (true) {
       if (System.nanoTime() - startedNanos >= taskTimeout.toNanos()) {
-        throw new IllegalStateException(
-            "mineru task " + taskId + " timed out after " + taskTimeout.toSeconds() + " seconds");
+        IllegalStateException timeout =
+            new IllegalStateException(
+                "mineru task "
+                    + taskId
+                    + " timed out after "
+                    + taskTimeout.toSeconds()
+                    + " seconds");
+        cancel(taskId, timeout);
+        throw timeout;
       }
       TaskStatus status;
       try {
@@ -92,7 +219,30 @@ public final class MinerUPipelineAdapter implements ParserPort {
       }
       if (status == null) throw new IllegalStateException("mineru status returned empty response");
       String state = blankTo(status.status(), "").toLowerCase();
-      if (List.of("completed", "succeeded", "success").contains(state)) return result(taskId);
+      if (List.of("completed", "succeeded", "success").contains(state)) {
+        ParsedDocument parsed;
+        try {
+          parsed = result(taskId, expectedPipeline, expectedSourceSha256);
+        } catch (IllegalStateException rejected) {
+          // Keep the external completed-task ledger, but never poll the same uncertified
+          // completed output on every bounded retry.
+          if (expectedPipeline != null
+              && (rejected.getMessage().startsWith("PARSER_CHECKPOINT_UNVERIFIED")
+                  || rejected.getMessage().startsWith("PARSER_IDENTITY_CHANGED"))) {
+            sink.accept("");
+            throw new cn.lgs.knowledgebase.application.raw.ParserCheckpointPolicy.ResultStale(
+                rejected);
+          }
+          throw rejected;
+        }
+        if (System.nanoTime() - startedNanos >= taskTimeout.toNanos()) {
+          IllegalStateException timeout =
+              new IllegalStateException("mineru result arrived after stage deadline");
+          cancel(taskId, timeout);
+          throw timeout;
+        }
+        return parsed;
+      }
       if (List.of("failed", "error", "cancelled", "canceled").contains(state)) {
         sink.accept("");
         throw new IllegalStateException(
@@ -101,8 +251,11 @@ public final class MinerUPipelineAdapter implements ParserPort {
       try {
         Thread.sleep(pollInterval.toMillis());
       } catch (InterruptedException e) {
+        IllegalStateException interrupted =
+            new IllegalStateException("mineru polling interrupted", e);
+        cancel(taskId, interrupted);
         Thread.currentThread().interrupt();
-        throw new IllegalStateException("mineru polling interrupted", e);
+        throw interrupted;
       }
     }
   }
@@ -110,12 +263,14 @@ public final class MinerUPipelineAdapter implements ParserPort {
   private String submit(String filename, InputStream source, Consumer<String> sink) {
     MultipartBodyBuilder body = new MultipartBodyBuilder();
     body.part("files", new NamedInputStreamResource(source, filename));
-    body.part("backend", "pipeline");
+    body.part("backend", backend);
+    body.part("effort", effort);
     body.part("parse_method", parseMethod);
     body.part("lang_list", language);
     body.part("return_md", "true");
     body.part("return_middle_json", "true");
     body.part("return_content_list", "true");
+    body.part("return_images", "true");
 
     TaskStatus submitted =
         client
@@ -133,10 +288,22 @@ public final class MinerUPipelineAdapter implements ParserPort {
     return taskId;
   }
 
-  private ParsedDocument result(String taskId) {
+  private ParsedDocument result(
+      String taskId,
+      cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity expectedPipeline,
+      String expectedSourceSha256) {
     JsonNode envelope =
         client.get().uri("/tasks/{id}/result", taskId).retrieve().body(JsonNode.class);
     if (envelope == null) throw new IllegalStateException("mineru result is empty");
+    if (!expectedVersion.equals(envelope.path("version").asText()))
+      throw new IllegalStateException(
+          "MinerU parser version differs from frozen baseline " + expectedVersion);
+    if (!envelope.path("backend").isMissingNode()
+        && !backend.equals(envelope.path("backend").asText()))
+      throw new IllegalStateException("MinerU result backend differs from requested profile");
+    if (envelope.has("quality") && !"PASS".equals(envelope.path("quality").path("status").asText()))
+      throw new IllegalStateException(
+          "MinerU quality review required: " + envelope.path("quality"));
     JsonNode results = envelope.path("results");
     if (!results.isObject() || results.size() != 1)
       throw new IllegalStateException("mineru expected exactly one result file");
@@ -145,14 +312,144 @@ public final class MinerUPipelineAdapter implements ParserPort {
     String middleJson = normalizeJsonField(file.get("middle_json"));
     String contentList = normalizeJsonField(file.get("content_list"));
     Map<Integer, List<Double>> pageSizes = pageSizes(middleJson);
-    List<ParsedBlock> blocks = parsedBlocks(contentList, pageSizes);
+    boolean office = "office".equals(envelope.path("effective_backend").asText());
+    Map<String, Object> profile =
+        envelope.has("parser_profile")
+            ? toMap(envelope.path("parser_profile"))
+            : Map.of(
+                "parserVersion",
+                expectedVersion,
+                "backend",
+                backend,
+                "effort",
+                effort,
+                "parseMethod",
+                parseMethod,
+                "language",
+                language,
+                "modelRevision",
+                "UNVERIFIED_UPSTREAM");
+    if (profile.containsKey("backend") && !backend.equals(profile.get("backend"))
+        || profile.containsKey("effort") && !effort.equals(profile.get("effort"))
+        || profile.containsKey("parseMethod") && !parseMethod.equals(profile.get("parseMethod"))
+        || profile.containsKey("language") && !language.equals(profile.get("language")))
+      throw new IllegalStateException("MinerU parser receipt differs from submitted profile");
+    if (expectedPipeline != null) {
+      var base = new java.util.TreeMap<String, String>(expectedPipeline.components());
+      base.keySet().removeIf(k -> k.startsWith("raw."));
+      JsonNode actual = envelope.path("parser_profile").path("pipeline");
+      if (!actual.path("components").isObject())
+        throw new IllegalStateException(
+            "PARSER_CHECKPOINT_UNVERIFIED: retained parser task lacks complete pipeline identity");
+      var observed = new java.util.TreeMap<String, String>();
+      actual
+          .path("components")
+          .fields()
+          .forEachRemaining(
+              e -> {
+                if (!e.getValue().isTextual())
+                  throw new IllegalStateException(
+                      "PARSER_PROFILE_INVALID: parser receipt component is not text");
+                observed.put(e.getKey(), e.getValue().textValue());
+              });
+      var receiptPipeline =
+          new cn.lgs.knowledgebase.application.raw.ParserPipelineIdentity(observed);
+      if (!receiptPipeline.components().equals(base)
+          || !receiptPipeline.sha256().equals(actual.path("sha256").asText()))
+        throw new IllegalStateException(
+            "PARSER_IDENTITY_CHANGED: completed parser task belongs to another actual pipeline");
+    }
+    if (expectedSourceSha256 != null && !expectedSourceSha256.equals(profile.get("sourceSha256")))
+      throw new IllegalStateException(
+          "PARSER_IDENTITY_CHANGED: completed external result belongs to another original");
+    Map<String, String> images = persistImages(taskId, file.path("images"));
+    Map<String, Object> receipt = new LinkedHashMap<>(profile);
+    receipt.put("imageObjects", images);
+    List<ParsedBlock> blocks = parsedBlocks(contentList, pageSizes, office, receipt, images);
+    if (blocks.stream().noneMatch(block -> !block.text().isBlank() || !block.tableBody().isBlank()))
+      throw new IllegalStateException(
+          "MinerU parsed no retrievable text/table; quality review required");
     return new ParsedDocument(
         markdown,
         middleJson,
         contentList,
-        "mineru-pipeline",
+        "office".equals(envelope.path("effective_backend").asText())
+            ? "mineru-office"
+            : "mineru-" + backend,
         envelope.path("version").asText(""),
         blocks);
+  }
+
+  private Map<String, String> persistImages(String taskId, JsonNode manifest) {
+    if (manifest.isMissingNode() || manifest.isNull() || manifest.size() == 0) return Map.of();
+    if (!manifest.isObject()) throw new IllegalStateException("Invalid MinerU image manifest");
+    if (objects == null)
+      throw new IllegalStateException(
+          "IMAGE_STORAGE_UNAVAILABLE: parser images require the object store");
+    Map<String, String> imageObjects = new LinkedHashMap<>();
+    manifest
+        .fields()
+        .forEachRemaining(
+            entry -> {
+              String name = entry.getKey(), relative = entry.getValue().path("path").asText();
+              if (!name.equals("images/" + relative)
+                  || !relative.matches("[A-Za-z0-9._/-]+")
+                  || relative.contains("..")
+                  || relative.startsWith("/"))
+                throw new IllegalStateException("Unsafe MinerU image path");
+              byte[] bytes =
+                  client
+                      .get()
+                      .uri("/tasks/{id}/images/{name}", taskId, relative)
+                      .retrieve()
+                      .body(byte[].class);
+              String expected = entry.getValue().path("sha256").asText();
+              String actual;
+              try {
+                actual =
+                    java.util.HexFormat.of()
+                        .formatHex(
+                            java.security.MessageDigest.getInstance("SHA-256")
+                                .digest(bytes == null ? new byte[0] : bytes));
+              } catch (java.security.NoSuchAlgorithmException impossible) {
+                throw new IllegalStateException(impossible);
+              }
+              if (!expected.matches("[0-9a-f]{64}")
+                  || !expected.equals(actual)
+                  || bytes == null
+                  || bytes.length != entry.getValue().path("size").asLong(-1))
+                throw new IllegalStateException(
+                    "MinerU image bytes differ from immutable result manifest");
+              String suffix =
+                  relative
+                      .substring(relative.lastIndexOf('.') + 1)
+                      .toLowerCase(java.util.Locale.ROOT);
+              if (!List.of("jpg", "jpeg", "png", "webp").contains(suffix))
+                throw new IllegalStateException("Unsupported parser image type");
+              String key = "parsed/mineru/" + taskId + "/images/" + actual + "." + suffix;
+              objects.put(
+                  key,
+                  new java.io.ByteArrayInputStream(bytes),
+                  bytes.length,
+                  "image/" + (suffix.equals("jpg") ? "jpeg" : suffix));
+              imageObjects.put(name, key);
+            });
+    return Map.copyOf(imageObjects);
+  }
+
+  private void cancel(String taskId, RuntimeException failure) {
+    // The project's isolated service implements DELETE. Upstream 3.4.5 does not; a failed
+    // cancellation remains visible instead of being reported as released compute resources.
+    try {
+      JsonNode cancellation =
+          client.delete().uri("/tasks/{id}", taskId).retrieve().body(JsonNode.class);
+      if (cancellation == null || !cancellation.path("resource_release_confirmed").asBoolean(false))
+        throw new IllegalStateException(
+            "Remote parser did not confirm release of its owned execution resource");
+    } catch (RuntimeException cleanup) {
+      failure.addSuppressed(
+          new IllegalStateException("MinerU remote cancellation unconfirmed", cleanup));
+    }
   }
 
   private String normalizeJsonField(JsonNode node) {
@@ -180,16 +477,22 @@ public final class MinerUPipelineAdapter implements ParserPort {
           sizes.put(page.path("page_idx").asInt(-1), List.copyOf(size));
         }
       }
-    } catch (IOException ignored) {
-      return Map.of();
+    } catch (IOException invalid) {
+      throw new IllegalStateException("Invalid MinerU middle JSON", invalid);
     }
     return sizes;
   }
 
-  private List<ParsedBlock> parsedBlocks(String contentList, Map<Integer, List<Double>> pageSizes) {
+  private List<ParsedBlock> parsedBlocks(
+      String contentList,
+      Map<Integer, List<Double>> pageSizes,
+      boolean office,
+      Map<String, Object> receipt,
+      Map<String, String> images) {
     try {
       JsonNode root = mapper.readTree(contentList);
-      if (!root.isArray()) return List.of();
+      if (!root.isArray())
+        throw new IllegalStateException("MinerU content-list v1 must be an array");
       List<ParsedBlock> blocks = new ArrayList<>(root.size());
       for (JsonNode block : root) {
         int page = block.path("page_idx").asInt(-1);
@@ -207,20 +510,35 @@ public final class MinerUPipelineAdapter implements ParserPort {
           text = String.join(" ", captions);
         }
         List<Double> bbox = doubles(block.path("bbox"));
+        if (!bbox.isEmpty()
+            && (bbox.size() != 4
+                || bbox.stream().anyMatch(v -> !Double.isFinite(v) || v < 0 || v > 1000)
+                || bbox.get(0) > bbox.get(2)
+                || bbox.get(1) > bbox.get(3)))
+          throw new IllegalStateException(
+              "Invalid normalized_1000 MinerU bbox; quality review required");
         String table = block.path("table_body").asText("");
         if (table.isBlank()) table = block.path("table_html").asText("");
+        Map<String, Object> raw = toMap(block);
+        raw.put("_evokb_parser_receipt", receipt);
+        if (office) {
+          raw.put("source_office_element_page_idx", page);
+          raw.put("position_space", "office-element-order");
+        }
+        String originalImage = block.path("img_path").asText("");
+        String storedImage = images.getOrDefault(originalImage, originalImage);
         blocks.add(
             new ParsedBlock(
                 block.path("type").asText(""),
                 text,
                 block.path("text_level").asInt(0),
-                page < 0 ? null : page,
-                bbox,
-                pageSizes.getOrDefault(page, List.of()),
-                block.path("img_path").asText(""),
+                office || page < 0 ? null : page,
+                office ? List.of() : bbox,
+                office ? List.of() : pageSizes.getOrDefault(page, List.of()),
+                storedImage,
                 table,
                 table,
-                toMap(block)));
+                Map.copyOf(raw)));
       }
       return List.copyOf(blocks);
     } catch (IOException e) {

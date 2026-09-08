@@ -19,7 +19,7 @@ import org.springframework.jdbc.core.RowMapper;
 public final class JdbcIdentityRepository
     implements UserRepository, SessionRepository, RuntimeConfigRepository {
   private static final String USER_COLUMNS =
-      "user_id,username,display_name,role,status,last_login_at,created_at,updated_at";
+      "user_id,username,display_name,role,status,last_login_at,created_at,updated_at,security_clearance";
   private static final String UPLOAD_SETTING = "user_upload_enabled";
   private final JdbcTemplate jdbc;
 
@@ -34,7 +34,8 @@ public final class JdbcIdentityRepository
 
   @Override
   public long countLocked() {
-    return scalar("SELECT COUNT(*) FROM enterprise_user FOR UPDATE");
+    lockAdministration();
+    return count();
   }
 
   @Override
@@ -44,8 +45,13 @@ public final class JdbcIdentityRepository
 
   @Override
   public long countActiveAdminsLocked() {
-    return scalar(
-        "SELECT COUNT(*) FROM enterprise_user WHERE role='ADMIN' AND status='ACTIVE' FOR UPDATE");
+    lockAdministration();
+    return countActiveAdmins();
+  }
+
+  private void lockAdministration() {
+    jdbc.queryForObject(
+        "SELECT singleton FROM identity_coordination WHERE singleton=1 FOR UPDATE", Integer.class);
   }
 
   @Override
@@ -93,7 +99,7 @@ public final class JdbcIdentityRepository
   public void save(User user, String passwordHash) {
     try {
       jdbc.update(
-          "INSERT INTO enterprise_user(user_id,username,display_name,password_hash,role,status,last_login_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO enterprise_user(user_id,username,display_name,password_hash,role,status,last_login_at,created_at,updated_at,security_clearance) VALUES(?,?,?,?,?,?,?,?,?,?)",
           user.id(),
           user.username(),
           user.displayName(),
@@ -102,7 +108,8 @@ public final class JdbcIdentityRepository
           user.status().name(),
           timestamp(user.lastLoginAt()),
           timestamp(user.createdAt()),
-          timestamp(user.updatedAt()));
+          timestamp(user.updatedAt()),
+          user.securityClearance());
     } catch (DuplicateKeyException e) {
       throw new IllegalStateException("username already exists", e);
     }
@@ -112,12 +119,13 @@ public final class JdbcIdentityRepository
   public void update(User user) {
     int rows =
         jdbc.update(
-            "UPDATE enterprise_user SET display_name=?,role=?,status=?,last_login_at=?,updated_at=? WHERE user_id=?",
+            "UPDATE enterprise_user SET display_name=?,role=?,status=?,last_login_at=?,updated_at=?,security_clearance=? WHERE user_id=?",
             user.displayName(),
             user.role().name(),
             user.status().name(),
             timestamp(user.lastLoginAt()),
             timestamp(user.updatedAt()),
+            user.securityClearance(),
             user.id());
     if (rows == 0) throw new IllegalStateException("user not found: " + user.id());
   }
@@ -211,7 +219,7 @@ public final class JdbcIdentityRepository
   @Override
   public void saveAccessPolicy(AccessPolicy policy) {
     jdbc.update(
-        "INSERT INTO enterprise_setting(setting_key,setting_value) VALUES(?,?) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value),updated_at=CURRENT_TIMESTAMP(6)",
+        "INSERT INTO enterprise_setting(setting_key,setting_value) VALUES(?,?) ON CONFLICT (setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=CURRENT_TIMESTAMP(6)",
         UPLOAD_SETTING,
         policy.userUploadEnabled() ? "true" : "false");
   }
@@ -231,7 +239,8 @@ public final class JdbcIdentityRepository
             UserStatus.valueOf(rs.getString(5)),
             instant(rs.getTimestamp(6)),
             instant(rs.getTimestamp(7)),
-            instant(rs.getTimestamp(8)));
+            instant(rs.getTimestamp(8)),
+            rs.getInt(9));
   }
 
   private static Timestamp timestamp(Instant value) {

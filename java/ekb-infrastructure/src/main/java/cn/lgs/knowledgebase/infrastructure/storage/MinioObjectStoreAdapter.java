@@ -1,5 +1,6 @@
 package cn.lgs.knowledgebase.infrastructure.storage;
 
+import cn.lgs.knowledgebase.application.port.ExternalCallBudget;
 import cn.lgs.knowledgebase.application.port.Ports.ObjectInfo;
 import cn.lgs.knowledgebase.application.port.Ports.ObjectStore;
 import cn.lgs.knowledgebase.application.port.Ports.StoredObject;
@@ -13,14 +14,20 @@ import io.minio.RemoveObjectArgs;
 import io.minio.StatObjectArgs;
 import io.minio.StatObjectResponse;
 import io.minio.http.Method;
+import java.io.FilterInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import okhttp3.OkHttpClient;
 
 public final class MinioObjectStoreAdapter implements ObjectStore {
   private final MinioClient client;
   private final MinioClient presignClient;
   private final String bucket;
+  private final OkHttpClient http;
+  private final Function<OkHttpClient, MinioClient> scopedClient;
 
   public MinioObjectStoreAdapter(
       String endpoint, String accessKey, String secretKey, String bucket) {
@@ -47,12 +54,21 @@ public final class MinioObjectStoreAdapter implements ObjectStore {
     String access = require(accessKey, "MinIO access key");
     String secret = require(secretKey, "MinIO secret key");
     String normalizedRegion = region == null || region.isBlank() ? "us-east-1" : region.trim();
-    this.client =
-        MinioClient.builder()
-            .endpoint(normalized)
-            .credentials(access, secret)
-            .region(normalizedRegion)
-            .build();
+    // The pinned 8.5.17 SDK uses these same five-minute per-I/O defaults.
+    // newBuilder shares the pool/dispatcher; per-attempt call deadlines never mutate a shared
+    // client.
+    long normalTimeout = Duration.ofMinutes(5).toMillis();
+    this.http =
+        io.minio.http.HttpUtils.newDefaultHttpClient(normalTimeout, normalTimeout, normalTimeout);
+    this.scopedClient =
+        transport ->
+            MinioClient.builder()
+                .endpoint(normalized)
+                .credentials(access, secret)
+                .region(normalizedRegion)
+                .httpClient(transport)
+                .build();
+    this.client = scopedClient.apply(http);
     this.presignClient =
         normalizedPublic.equals(normalized)
             ? this.client
@@ -68,15 +84,18 @@ public final class MinioObjectStoreAdapter implements ObjectStore {
   @Override
   public void put(String key, InputStream source, long size, String contentType) {
     try {
-      client.putObject(
-          PutObjectArgs.builder().bucket(bucket).object(require(key, "object key")).stream(
-                  source, size, size < 0 ? 10 * 1024 * 1024 : -1)
-              .contentType(
-                  contentType == null || contentType.isBlank()
-                      ? "application/octet-stream"
-                      : contentType)
-              .build());
+      requestClient()
+          .putObject(
+              PutObjectArgs.builder().bucket(bucket).object(require(key, "object key")).stream(
+                      source, size, size < 0 ? 10 * 1024 * 1024 : -1)
+                  .contentType(
+                      contentType == null || contentType.isBlank()
+                          ? "application/octet-stream"
+                          : contentType)
+                  .build());
+      ExternalCallBudget.check();
     } catch (Exception e) {
+      ExternalCallBudget.check();
       throw new IllegalStateException("minio put failed: " + key, e);
     }
   }
@@ -85,11 +104,25 @@ public final class MinioObjectStoreAdapter implements ObjectStore {
   public StoredObject get(String key) {
     try {
       StatObjectResponse stat =
-          client.statObject(StatObjectArgs.builder().bucket(bucket).object(key).build());
+          requestClient().statObject(StatObjectArgs.builder().bucket(bucket).object(key).build());
       InputStream stream =
-          client.getObject(GetObjectArgs.builder().bucket(bucket).object(key).build());
-      return new StoredObject(stream, stat.size(), stat.contentType());
+          requestClient().getObject(GetObjectArgs.builder().bucket(bucket).object(key).build());
+      Runnable check = ExternalCallBudget.capturedCheck();
+      try {
+        check.run();
+      } catch (RuntimeException failure) {
+        try {
+          stream.close();
+        } catch (IOException close) {
+          failure.addSuppressed(close);
+        }
+        throw failure;
+      }
+      // OkHttp's callTimeout remains armed until the complete response body is consumed/closed.
+      // Headers alone must not turn a stalled body into an unbounded object read.
+      return new StoredObject(checkedStream(stream, check), stat.size(), stat.contentType());
     } catch (Exception e) {
+      ExternalCallBudget.check();
       throw new IllegalStateException("minio get failed: " + key, e);
     }
   }
@@ -98,9 +131,11 @@ public final class MinioObjectStoreAdapter implements ObjectStore {
   public ObjectInfo stat(String key) {
     try {
       StatObjectResponse stat =
-          client.statObject(StatObjectArgs.builder().bucket(bucket).object(key).build());
+          requestClient().statObject(StatObjectArgs.builder().bucket(bucket).object(key).build());
+      ExternalCallBudget.check();
       return new ObjectInfo(key, stat.size(), stat.contentType(), stat.etag());
     } catch (Exception e) {
+      ExternalCallBudget.check();
       throw new IllegalStateException("minio stat failed: " + key, e);
     }
   }
@@ -124,11 +159,52 @@ public final class MinioObjectStoreAdapter implements ObjectStore {
   @Override
   public void delete(String key) {
     try {
-      client.removeObject(
-          RemoveObjectArgs.builder().bucket(bucket).object(require(key, "object key")).build());
+      requestClient()
+          .removeObject(
+              RemoveObjectArgs.builder().bucket(bucket).object(require(key, "object key")).build());
+      ExternalCallBudget.check();
     } catch (Exception e) {
+      ExternalCallBudget.check();
       throw new IllegalStateException("minio delete failed: " + key, e);
     }
+  }
+
+  private MinioClient requestClient() {
+    if (!ExternalCallBudget.active()) return client;
+    Duration remaining = ExternalCallBudget.limit(Duration.ofMinutes(5));
+    // The transport takes whole milliseconds. Rounding down can cancel a stalled
+    // body before the stage deadline and surface a generic I/O error.
+    long timeoutMillis = remaining.plusNanos(999_999).toMillis();
+    return scopedClient.apply(
+        http.newBuilder().callTimeout(timeoutMillis, TimeUnit.MILLISECONDS).build());
+  }
+
+  private static InputStream checkedStream(InputStream stream, Runnable check) {
+    return new FilterInputStream(stream) {
+      @Override
+      public int read() throws IOException {
+        try {
+          int value = in.read();
+          if (value == -1) check.run();
+          return value;
+        } catch (IOException failure) {
+          check.run();
+          throw failure;
+        }
+      }
+
+      @Override
+      public int read(byte[] buffer, int offset, int length) throws IOException {
+        try {
+          int count = in.read(buffer, offset, length);
+          if (count == -1) check.run();
+          return count;
+        } catch (IOException failure) {
+          check.run();
+          throw failure;
+        }
+      }
+    };
   }
 
   private void ensureBucket() {

@@ -28,13 +28,34 @@ public final class WikiKeywordProjectionService {
   public interface Repository {
     List<WikiKeywordClaim> loadClaims(String wikiId, long wikiVersion);
 
+    /** Exact complete input snapshot of this Wiki revision; missing proof fails closed. */
+    default List<String> loadBuildInputVersions(String wikiId, long wikiVersion) {
+      return List.of();
+    }
+
     List<Entity> findCanonicalEntitiesByName(String canonicalName);
 
     Relation saveRelation(Relation relation, String wikiId, long wikiVersion, String claimId);
   }
 
   public record WikiKeywordClaim(
-      String claimId, String wikiId, long wikiVersion, String claimText, List<String> evidenceIds) {
+      String claimId,
+      String wikiId,
+      long wikiVersion,
+      String claimText,
+      List<String> evidenceIds,
+      GroundingConstraintAudit.Audit groundingAudit,
+      String supportingText,
+      boolean sourceFactsAudited) {
+    public WikiKeywordClaim(
+        String claimId,
+        String wikiId,
+        long wikiVersion,
+        String claimText,
+        List<String> evidenceIds) {
+      this(claimId, wikiId, wikiVersion, claimText, evidenceIds, null, "", false);
+    }
+
     public WikiKeywordClaim {
       evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
     }
@@ -69,11 +90,24 @@ public final class WikiKeywordProjectionService {
     if (normalizedWikiId.isEmpty() || wikiVersion <= 0)
       throw new IllegalArgumentException("wiki ID and version are required");
     List<WikiKeywordClaim> claims = repository.loadClaims(normalizedWikiId, wikiVersion);
+    var inputs = repository.loadBuildInputVersions(normalizedWikiId, wikiVersion);
     Map<String, String> skipped = new LinkedHashMap<>();
     Map<String, Entity> entities = new LinkedHashMap<>();
     Map<String, Relation> relations = new LinkedHashMap<>();
 
     for (WikiKeywordClaim claim : claims) {
+      if (!claim.sourceFactsAudited()
+          || !GroundingConstraintAudit.current(
+              claim.claimText(), claim.supportingText(), claim.groundingAudit())) {
+        skipped.put(
+            claim.claimId(),
+            "claim requires current grounding audit; regenerate Wiki through normal compilation");
+        continue;
+      }
+      if (inputs.isEmpty()) {
+        skipped.put(claim.claimId(), "complete Wiki build inputs are unavailable; regenerate Wiki");
+        continue;
+      }
       Parsed parsed = parse(claim.claimText());
       if (parsed.reason() != null) {
         skipped.put(claim.claimId(), parsed.reason());
@@ -140,8 +174,7 @@ public final class WikiKeywordProjectionService {
     entityList.sort(Comparator.comparing(Entity::canonicalId));
     List<Relation> relationList = new ArrayList<>(relations.values());
     relationList.sort(Comparator.comparing(Relation::id));
-    if (!entityList.isEmpty()) graph.upsertEntities(entityList);
-    if (!relationList.isEmpty()) graph.upsertRelations(relationList);
+    if (!relationList.isEmpty()) graph.publish(entityList, relationList, inputs);
     return new ProjectionResult(
         normalizedWikiId,
         wikiVersion,

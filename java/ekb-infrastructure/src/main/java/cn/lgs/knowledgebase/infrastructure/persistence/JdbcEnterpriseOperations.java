@@ -9,7 +9,6 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -20,67 +19,95 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
   private final JdbcTemplate jdbc;
   private final TransactionTemplate tx;
   private final ObjectMapper mapper;
+  private final JdbcPublishedGraphReader graphReader;
+  private final String knowledgeBaseId;
 
   public JdbcEnterpriseOperations(JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper) {
+    this(jdbc, tx, mapper, "enterprise");
+  }
+
+  public JdbcEnterpriseOperations(
+      JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper, String knowledgeBaseId) {
     this.jdbc = jdbc;
     this.tx = tx;
     this.mapper = mapper;
+    this.graphReader = new JdbcPublishedGraphReader(jdbc, knowledgeBaseId);
+    this.knowledgeBaseId = knowledgeBaseId;
   }
 
   @Override
   public OverviewView overview() {
-    return jdbc.queryForObject(
-        """
-                SELECT
-                  (SELECT COUNT(*) FROM document WHERE status='ACTIVE'),
-                  (SELECT COUNT(*) FROM document_version),
-                  (SELECT COUNT(*) FROM document_version WHERE lifecycle='ACTIVE'),
-                  (SELECT COUNT(*) FROM document_version WHERE lifecycle='PENDING'),
-                  (SELECT COUNT(*) FROM document_version WHERE lifecycle='FAILED'),
-                  (SELECT COUNT(*) FROM raw_block),
-                  (SELECT COUNT(*) FROM evidence WHERE active=TRUE),
-                  (SELECT COUNT(*) FROM summary WHERE lifecycle='ACTIVE'),
-                  (SELECT COUNT(*) FROM summary WHERE lifecycle='STALE'),
-                  (SELECT COUNT(*) FROM summary WHERE lifecycle='ACTIVE' AND grounding_status='PASS'),
-                  (SELECT COUNT(*) FROM summary WHERE lifecycle='ACTIVE' AND coverage_status='PASS'),
-                  (SELECT COUNT(*) FROM wiki WHERE lifecycle='ACTIVE'),
-                  (SELECT COUNT(*) FROM wiki WHERE lifecycle='STALE'),
-                  (SELECT COUNT(DISTINCT rf.relation_id) FROM relation_fact rf JOIN relation_evidence_support rs ON rs.relation_id=rf.relation_id AND rs.active=TRUE WHERE rf.lifecycle='ACTIVE'),
-                  (SELECT COUNT(*) FROM relation_evidence_support WHERE active=TRUE),
-                  (SELECT COUNT(*) FROM effective_version_hit),
-                  (SELECT COUNT(DISTINCT version_id) FROM distill_recommendation WHERE status='RECOMMENDED'),
-                  ((SELECT COUNT(*) FROM compile_task WHERE status='PENDING') + (SELECT COUNT(*) FROM ingestion_file WHERE status IN ('STAGED','QUEUED'))),
-                  ((SELECT COUNT(*) FROM compile_task WHERE status='RUNNING') + (SELECT COUNT(*) FROM ingestion_file WHERE status='RUNNING')),
-                  ((SELECT COUNT(*) FROM compile_task WHERE status='FAILED') + (SELECT COUNT(*) FROM ingestion_file WHERE status='FAILED'))
-                """,
-        (rs, n) ->
-            new OverviewView(
-                rs.getInt(1),
-                rs.getInt(2),
-                rs.getInt(3),
-                rs.getInt(4),
-                rs.getInt(5),
-                rs.getInt(6),
-                rs.getInt(7),
-                rs.getInt(8),
-                rs.getInt(9),
-                rs.getInt(10),
-                rs.getInt(11),
-                rs.getInt(12),
-                rs.getInt(13),
-                rs.getInt(14),
-                rs.getInt(15),
-                rs.getInt(16),
-                rs.getInt(17),
-                rs.getInt(18),
-                rs.getInt(19),
-                rs.getInt(20)));
+    return overview(10);
+  }
+
+  @Override
+  public OverviewView overview(int clearance) {
+    var row =
+        jdbc.queryForObject(
+            "SELECT COUNT(DISTINCT a.document_id), COUNT(*), (SELECT COUNT(*) FROM raw_block b JOIN kb_source_authority a ON a.version_id=b.version_id WHERE a.security_level<=?), (SELECT COUNT(*) FROM evidence e JOIN kb_source_authority a ON a.version_id=e.version_id WHERE e.active=TRUE AND a.security_level<=?) FROM kb_source_authority a WHERE a.security_level<=?",
+            (rs, n) -> new int[] {rs.getInt(1), rs.getInt(2), rs.getInt(3), rs.getInt(4)},
+            clearance,
+            clearance,
+            clearance);
+    int summaries =
+        jdbc.queryForObject(
+            "SELECT COUNT(*) FROM summary s JOIN kb_source_authority a ON a.version_id=s.version_id WHERE s.lifecycle='ACTIVE' AND a.security_level<=?",
+            Integer.class,
+            clearance);
+    int wikis =
+        jdbc.queryForObject(
+            "SELECT COUNT(*) FROM wiki WHERE " + wikiAuthority("wiki", clearance), Integer.class);
+    int[] summaryMetrics =
+        jdbc.queryForObject(
+            "SELECT COUNT(*) FILTER (WHERE s.lifecycle='STALE'),COUNT(*) FILTER (WHERE s.lifecycle='ACTIVE' AND s.grounding_status='PASS'),COUNT(*) FILTER (WHERE s.lifecycle='ACTIVE' AND s.coverage_status='PASS') FROM summary s JOIN kb_source_authority a ON a.version_id=s.version_id WHERE a.security_level<=?",
+            (rs, n) -> new int[] {rs.getInt(1), rs.getInt(2), rs.getInt(3)},
+            clearance);
+    int[] tasks =
+        jdbc.queryForObject(
+            "SELECT COUNT(*) FILTER (WHERE ct.status IN ('PENDING','RETRY_WAIT')),COUNT(*) FILTER (WHERE ct.status='RUNNING'),COUNT(*) FILTER (WHERE ct.status='FAILED') FROM compile_task ct WHERE "
+                + SourceAccessSql.compilationTask("ct", clearance),
+            (rs, n) -> new int[] {rs.getInt(1), rs.getInt(2), rs.getInt(3)});
+    int downloads =
+        jdbc.queryForObject(
+            "SELECT COUNT(*) FROM source_usage_contribution c JOIN kb_source_authority a ON a.version_id=c.version_id WHERE a.security_level<=? AND c.created_at>=clock_timestamp()-INTERVAL '30 days'",
+            Integer.class,
+            clearance);
+    return new OverviewView(
+        row[0],
+        row[1],
+        row[1],
+        0,
+        0,
+        row[2],
+        row[3],
+        summaries,
+        summaryMetrics[0],
+        summaryMetrics[1],
+        summaryMetrics[2],
+        wikis,
+        0,
+        0,
+        0,
+        downloads,
+        0,
+        tasks[0],
+        tasks[1],
+        tasks[2]);
   }
 
   @Override
   public Page<DocumentVersionView> documents(PageQuery q) {
+    return documents(q, 10);
+  }
+
+  @Override
+  public Page<DocumentVersionView> documents(PageQuery q, int clearance) {
     PageQuery query = q == null ? emptyQuery() : q;
-    SqlWhere where = new SqlWhere("d.status<>'DELETED'");
+    SqlWhere where =
+        new SqlWhere(
+            "EXISTS (SELECT 1 FROM kb_source_authority a WHERE a.version_id=v.version_id AND a.security_level <= "
+                + clearance
+                + ")");
     if (text(query.query())) {
       String like = "%" + query.query().trim() + "%";
       where.add(
@@ -113,7 +140,8 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                        (SELECT COUNT(*) FROM summary sx WHERE sx.version_id=v.version_id AND sx.coverage_status='PASS'),
                        COALESCE((SELECT dr.status FROM distill_recommendation dr WHERE dr.version_id=v.version_id ORDER BY (dr.status='RECOMMENDED') DESC,dr.created_at DESC LIMIT 1),''),
                        COALESCE((SELECT dr.reason FROM distill_recommendation dr WHERE dr.version_id=v.version_id ORDER BY (dr.status='RECOMMENDED') DESC,dr.created_at DESC LIMIT 1),''),
-                       COALESCE((SELECT COUNT(*) FROM effective_version_hit evh WHERE evh.version_id=v.version_id),0)
+                       COALESCE((SELECT COUNT(*) FROM source_usage_contribution evh WHERE evh.version_id=v.version_id AND evh.created_at>=clock_timestamp()-INTERVAL '30 days'),0),
+                       m.security_level
                 """
             + from
             + " ORDER BY d.updated_at DESC,v.version_no DESC LIMIT ? OFFSET ?";
@@ -141,7 +169,8 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                     rs.getInt(16),
                     rs.getString(17),
                     rs.getString(18),
-                    rs.getInt(19)),
+                    rs.getInt(19),
+                    rs.getObject(20) == null ? null : rs.getInt(20)),
             args.toArray());
     return page(items, total, query);
   }
@@ -167,7 +196,10 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                   found.get());
               int metadataRows =
                   jdbc.update(
-                      "UPDATE document_metadata SET source_department=?,material_category=?,manual_tags=?,manual_document_type_override=?,document_date=? WHERE version_id=?",
+                      "UPDATE document_metadata SET security_level=COALESCE(?::smallint,security_level),acl_version=acl_version+CASE WHEN ?::smallint IS NOT NULL AND ?::smallint<>security_level THEN 1 ELSE 0 END,source_department=?,material_category=?,manual_tags=?,manual_document_type_override=?,document_date=? WHERE version_id=?",
+                      update.securityLevel(),
+                      update.securityLevel(),
+                      update.securityLevel(),
                       nullable(update.sourceDepartment()),
                       nullable(update.materialCategory()),
                       json(update.manualTags()),
@@ -176,13 +208,14 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                       update.versionId());
               if (metadataRows == 0) {
                 jdbc.update(
-                    "INSERT INTO document_metadata(version_id,source_department,material_category,manual_tags,manual_document_type_override,document_date) VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO document_metadata(version_id,source_department,material_category,manual_tags,manual_document_type_override,document_date,security_level) VALUES(?,?,?,?,?,?,COALESCE(?::smallint,10))",
                     update.versionId(),
                     nullable(update.sourceDepartment()),
                     nullable(update.materialCategory()),
                     json(update.manualTags()),
                     nullable(update.documentType()),
-                    update.documentDate());
+                    update.documentDate(),
+                    update.securityLevel());
               }
               return found.get();
             });
@@ -192,12 +225,19 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
 
   @Override
   public Optional<DocumentDetailView> documentDetail(String versionId, int blockLimit) {
+    return documentDetail(versionId, blockLimit, 10);
+  }
+
+  @Override
+  public Optional<DocumentDetailView> documentDetail(
+      String versionId, int blockLimit, int clearance) {
     String id = trim(versionId);
     if (id.isEmpty()) return Optional.empty();
     Optional<String[]> identity =
         jdbc
             .query(
-                "SELECT document_id,version_id FROM document_version WHERE version_id=?",
+                "SELECT document_id,version_id FROM kb_source_authority WHERE version_id=? AND security_level <= "
+                    + clearance,
                 (rs, rowNum) -> new String[] {rs.getString(1), rs.getString(2)},
                 id)
             .stream()
@@ -214,15 +254,24 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                   (SELECT COUNT(*) FROM summary WHERE version_id=? AND grounding_status='PASS'),
                   (SELECT COUNT(*) FROM summary WHERE version_id=? AND coverage_status='PASS'),
                   (SELECT COUNT(*) FROM source_entity WHERE version_id=?),
-                  (SELECT COUNT(*) FROM entity_mapping em JOIN source_entity se ON se.source_entity_id=em.source_entity_id WHERE se.version_id=? AND em.status='APPLIED'),
-                  (SELECT COUNT(DISTINCT rf.relation_id) FROM relation_fact rf JOIN relation_evidence_support rs ON rs.relation_id=rf.relation_id AND rs.active=TRUE JOIN summary s ON s.summary_id=rs.summary_id WHERE s.version_id=? AND rf.lifecycle='ACTIVE'),
-                  (SELECT COUNT(*) FROM relation_evidence_support rs JOIN summary s ON s.summary_id=rs.summary_id WHERE s.version_id=? AND rs.active=TRUE),
-                  (SELECT COUNT(DISTINCT wcf.claim_id) FROM wiki_claim_fact wcf JOIN summary_fact sf ON sf.fact_id=wcf.fact_id JOIN summary s ON s.summary_id=sf.summary_id WHERE s.version_id=?),
-                  (SELECT COUNT(DISTINCT we.evidence_id) FROM wiki_evidence we JOIN wiki_claim_fact wcf ON wcf.claim_id=we.claim_id JOIN summary_fact sf ON sf.fact_id=wcf.fact_id JOIN summary s ON s.summary_id=sf.summary_id WHERE s.version_id=?),
-                  (SELECT COUNT(*) FROM compile_task WHERE version_id=? AND status='PENDING'),
-                  (SELECT COUNT(*) FROM compile_task WHERE version_id=? AND status='RUNNING'),
-                  (SELECT COUNT(*) FROM compile_task WHERE version_id=? AND status='FAILED')
-                """,
+                  (SELECT COUNT(*) FROM entity_mapping em JOIN source_entity se ON se.source_entity_id=em.source_entity_id WHERE se.version_id=? AND em.status='APPLIED' AND EXISTS(SELECT 1 FROM kb_graph_relation rf WHERE (rf.source_entity_id=em.canonical_entity_id OR rf.target_entity_id=em.canonical_entity_id) AND %s)),
+                  (SELECT COUNT(DISTINCT rf.relation_id) FROM kb_graph_relation rf JOIN kb_graph_evidence rs ON rs.kb_id=rf.kb_id AND rs.relation_id=rf.relation_id AND rs.revision_id=rf.revision_id JOIN evidence e ON e.evidence_id=rs.evidence_id WHERE e.version_id=? AND %s),
+                  (SELECT COUNT(*) FROM kb_graph_relation rf JOIN kb_graph_evidence rs ON rs.kb_id=rf.kb_id AND rs.relation_id=rf.relation_id AND rs.revision_id=rf.revision_id JOIN evidence e ON e.evidence_id=rs.evidence_id WHERE e.version_id=? AND %s),
+                  (SELECT COUNT(DISTINCT wcf.claim_id) FROM wiki_claim_fact wcf JOIN wiki_claim wc ON wc.claim_id=wcf.claim_id JOIN wiki w ON w.wiki_id=wc.wiki_id AND w.wiki_version=wc.wiki_version JOIN summary_fact sf ON sf.fact_id=wcf.fact_id JOIN summary s ON s.summary_id=sf.summary_id WHERE s.version_id=? AND %s),
+                  (SELECT COUNT(DISTINCT we.evidence_id) FROM wiki_evidence we JOIN wiki_claim wc ON wc.claim_id=we.claim_id JOIN wiki w ON w.wiki_id=wc.wiki_id AND w.wiki_version=wc.wiki_version JOIN wiki_claim_fact wcf ON wcf.claim_id=we.claim_id JOIN summary_fact sf ON sf.fact_id=wcf.fact_id JOIN summary s ON s.summary_id=sf.summary_id WHERE s.version_id=? AND %s),
+                  (SELECT COUNT(*) FROM compile_task ct WHERE ct.version_id=? AND ct.status IN ('PENDING','RETRY_WAIT') AND %s),
+                  (SELECT COUNT(*) FROM compile_task ct WHERE ct.version_id=? AND ct.status='RUNNING' AND %s),
+                  (SELECT COUNT(*) FROM compile_task ct WHERE ct.version_id=? AND ct.status='FAILED' AND %s)
+                """
+                .formatted(
+                    SourceAccessSql.publishedGraph("rf", clearance, knowledgeBaseId),
+                    SourceAccessSql.publishedGraph("rf", clearance, knowledgeBaseId),
+                    SourceAccessSql.publishedGraph("rf", clearance, knowledgeBaseId),
+                    SourceAccessSql.wiki("w", clearance),
+                    SourceAccessSql.wiki("w", clearance),
+                    SourceAccessSql.compilationTask("ct", clearance),
+                    SourceAccessSql.compilationTask("ct", clearance),
+                    SourceAccessSql.compilationTask("ct", clearance)),
             (rs, rowNum) ->
                 new DocumentKnowledgeStatus(
                     rs.getInt(1),
@@ -278,8 +327,13 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
 
   @Override
   public Page<WikiView> wikis(PageQuery q) {
+    return wikis(q, 10);
+  }
+
+  @Override
+  public Page<WikiView> wikis(PageQuery q, int clearance) {
     PageQuery query = q == null ? emptyQuery() : q;
-    SqlWhere where = new SqlWhere("1=1");
+    SqlWhere where = new SqlWhere(wikiAuthority("wiki", clearance));
     if (text(query.query())) {
       String like = "%" + query.query().trim() + "%";
       where.add("(title LIKE ? OR wiki_type LIKE ?)", like, like);
@@ -310,10 +364,17 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
 
   @Override
   public Optional<WikiView> wiki(String wikiId, Long version) {
+    return wiki(wikiId, version, 10);
+  }
+
+  @Override
+  public Optional<WikiView> wiki(String wikiId, Long version, int clearance) {
     String id = trim(wikiId);
     if (id.isEmpty()) return Optional.empty();
     String sql =
-        "SELECT wiki_id,wiki_version,wiki_type,COALESCE(canonical_subject_id,''),title,lifecycle FROM wiki WHERE wiki_id=?"
+        "SELECT wiki_id,wiki_version,wiki_type,COALESCE(canonical_subject_id,''),title,lifecycle FROM wiki WHERE "
+            + wikiAuthority("wiki", clearance)
+            + " AND wiki_id=?"
             + (version == null || version <= 0
                 ? " ORDER BY wiki_version DESC LIMIT 1"
                 : " AND wiki_version=? LIMIT 1");
@@ -337,6 +398,175 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
             args)
         .stream()
         .findFirst();
+  }
+
+  private static String wikiAuthority(String alias, int clearance) {
+    return SourceAccessSql.wiki(alias, clearance);
+  }
+
+  @Override
+  public Page<KnowledgeEntryView> knowledgeEntries(EntryQuery query, int clearance) {
+    EntryQuery q = query == null ? new EntryQuery(1, 30, null, null) : query;
+    String stage = upperExceptAll(q.stage());
+    if (stage != null && !stage.isBlank() && !List.of("CONCEPT", "WIKI").contains(stage))
+      throw new IllegalArgumentException("unknown knowledge entry stage");
+    SqlWhere where = new SqlWhere(entryAuthority(clearance));
+    where.add("e.knowledge_base_id=?", knowledgeBaseId);
+    where.eq("e.stage", stage);
+    if (text(q.query())) {
+      String like = "%" + q.query().trim() + "%";
+      where.add(
+          "(e.preferred_label ILIKE ? OR e.entry_type ILIKE ? OR e.aliases::text ILIKE ?)",
+          like,
+          like,
+          like);
+    }
+    long total =
+        count("SELECT COUNT(*) FROM kb_knowledge_entry e WHERE " + where.sql(), where.args());
+    List<Object> args = new ArrayList<>(where.args());
+    args.add(q.normalizedPageSize());
+    args.add(q.offset());
+    List<KnowledgeEntryView> items =
+        jdbc.query(
+            entrySelect(false)
+                + " WHERE "
+                + where.sql()
+                + " ORDER BY e.updated_at DESC,e.entry_id LIMIT ? OFFSET ?",
+            (rs, n) -> entryView(rs),
+            args.toArray());
+    return new Page<>(items, total, q.normalizedPage(), q.normalizedPageSize());
+  }
+
+  @Override
+  public Optional<KnowledgeEntryView> knowledgeEntry(String entryId, int clearance) {
+    String id = trim(entryId);
+    if (id.isEmpty()) return Optional.empty();
+    // Prose and complete provenance are read under one statement snapshot. A second unguarded
+    // source query could return old prose after an ACL change between the two reads.
+    return jdbc
+        .query(
+            entrySelect(true)
+                + " WHERE e.knowledge_base_id=? AND e.entry_id=? AND "
+                + entryAuthority(clearance),
+            (rs, n) -> entryView(rs),
+            knowledgeBaseId,
+            id)
+        .stream()
+        .findFirst();
+  }
+
+  private KnowledgeEntryView entryView(java.sql.ResultSet rs) throws java.sql.SQLException {
+    try {
+      return new KnowledgeEntryView(
+          rs.getString(1),
+          rs.getLong(2),
+          rs.getString(3),
+          rs.getString(4),
+          stringList(rs.getString(5)),
+          rs.getString(6),
+          rs.getString(7),
+          rs.getString(8),
+          map(rs.getString(9)),
+          rs.getTimestamp(10).toInstant(),
+          rs.getInt(11),
+          entrySources(rs.getString(12)));
+    } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+      throw new IllegalStateException("cannot parse persisted entry provenance", e);
+    }
+  }
+
+  private List<EntrySourceView> entrySources(String json)
+      throws com.fasterxml.jackson.core.JsonProcessingException {
+    var sources = new ArrayList<EntrySourceView>();
+    for (var source : mapper.readTree(json)) {
+      var facts = entryFacts(source.path("facts"));
+      sources.add(
+          new EntrySourceView(
+              source.path("documentId").asText(),
+              source.path("versionId").asText(),
+              source.path("versionNo").asLong(),
+              source.path("logicalName").asText(),
+              source.path("summaryId").asText(),
+              source.path("conceptId").asText(),
+              facts,
+              entryFacts(source.path("scopeFacts"))));
+    }
+    return List.copyOf(sources);
+  }
+
+  private List<EntryFactView> entryFacts(com.fasterxml.jackson.databind.JsonNode values) {
+    var facts = new ArrayList<EntryFactView>();
+    for (var fact : values) {
+      var evidence = new ArrayList<String>();
+      fact.path("evidenceIds").forEach(id -> evidence.add(id.asText()));
+      facts.add(
+          new EntryFactView(
+              fact.path("factId").asText(), fact.path("factText").asText(), evidence));
+    }
+    return List.copyOf(facts);
+  }
+
+  private static String entrySelect(boolean detail) {
+    String sources =
+        detail
+            ? """
+      COALESCE((SELECT jsonb_agg(jsonb_build_object(
+        'documentId',s.document_id,'versionId',s.source_version_id,'versionNo',v.version_no,
+        'logicalName',d.logical_name,'summaryId',s.summary_id,'conceptId',s.concept_id,
+        'scopeFacts',COALESCE((SELECT jsonb_agg(jsonb_build_object('factId',f.fact_id,'factText',f.fact_text,
+          'evidenceIds',COALESCE((SELECT jsonb_agg(DISTINCT ev.evidence_id ORDER BY ev.evidence_id)
+            FROM summary_evidence se JOIN evidence ev ON ev.evidence_id=se.evidence_id
+            WHERE se.fact_id=f.fact_id AND ev.active AND ev.version_id=s.source_version_id),'[]'::jsonb)) ORDER BY f.fact_id)
+          FROM summary_fact f WHERE f.summary_id=s.summary_id AND f.grounding_status='PASS'
+          AND jsonb_exists(s.scope_fact_ids,f.fact_id)),'[]'::jsonb),
+        'facts',COALESCE((SELECT jsonb_agg(jsonb_build_object('factId',f.fact_id,'factText',f.fact_text,
+          'evidenceIds',COALESCE((SELECT jsonb_agg(DISTINCT ev.evidence_id ORDER BY ev.evidence_id)
+            FROM summary_evidence se JOIN evidence ev ON ev.evidence_id=se.evidence_id
+            WHERE se.fact_id=f.fact_id AND ev.active AND ev.version_id=s.source_version_id),'[]'::jsonb)) ORDER BY f.fact_id)
+          FROM summary_fact f WHERE f.summary_id=s.summary_id AND f.grounding_status='PASS'
+          AND jsonb_exists(s.fact_ids,f.fact_id)),'[]'::jsonb)) ORDER BY d.logical_name,s.source_version_id,s.summary_id,s.concept_id)
+        FROM kb_entry_source s JOIN document d ON d.document_id=s.document_id
+        JOIN document_version v ON v.version_id=s.source_version_id
+        WHERE s.knowledge_base_id=e.knowledge_base_id AND s.entry_id=e.entry_id),'[]'::jsonb)::text
+      """
+            : "'[]'::text";
+    return "SELECT e.entry_id,e.revision,e.entry_type,e.preferred_label,e.aliases::text,e.description,e.stage,e.lifecycle,e.scope_json::text,e.updated_at,"
+        + "(SELECT count(DISTINCT s.source_version_id) FROM kb_entry_source s WHERE s.knowledge_base_id=e.knowledge_base_id AND s.entry_id=e.entry_id),"
+        + sources
+        + " FROM kb_knowledge_entry e";
+  }
+
+  private static String entryAuthority(int clearance) {
+    if (clearance < 10 || clearance > 127) throw new IllegalArgumentException("invalid clearance");
+    return """
+      e.lifecycle='ACTIVE'
+      AND EXISTS(SELECT 1 FROM kb_entry_source s WHERE s.knowledge_base_id=e.knowledge_base_id AND s.entry_id=e.entry_id)
+      AND EXISTS(SELECT 1 FROM kb_entry_build_input b WHERE b.knowledge_base_id=e.knowledge_base_id AND b.entry_id=e.entry_id AND b.entry_revision=e.revision)
+      AND NOT EXISTS(SELECT 1 FROM kb_entry_build_input b
+        LEFT JOIN kb_source_authority a ON a.version_id=b.source_version_id
+        LEFT JOIN summary sm ON sm.summary_id=b.summary_id AND sm.version_id=b.source_version_id
+        WHERE b.knowledge_base_id=e.knowledge_base_id AND b.entry_id=e.entry_id AND b.entry_revision=e.revision
+        AND (a.version_id IS NULL OR a.security_level>%1$d OR a.acl_version IS DISTINCT FROM b.acl_version
+          OR sm.summary_id IS NULL OR sm.lifecycle IS DISTINCT FROM 'ACTIVE'
+          OR sm.grounding_status IS DISTINCT FROM 'PASS' OR sm.coverage_status IS DISTINCT FROM 'PASS'))
+      AND NOT EXISTS(SELECT 1 FROM kb_entry_source s
+        LEFT JOIN kb_source_authority a ON a.version_id=s.source_version_id
+        LEFT JOIN summary sm ON sm.summary_id=s.summary_id AND sm.version_id=s.source_version_id
+        WHERE s.knowledge_base_id=e.knowledge_base_id AND s.entry_id=e.entry_id
+        AND (a.version_id IS NULL OR a.document_id IS DISTINCT FROM s.document_id
+          OR a.security_level>%1$d OR a.acl_version IS DISTINCT FROM s.acl_version
+          OR sm.summary_id IS NULL OR sm.lifecycle IS DISTINCT FROM 'ACTIVE'
+          OR sm.grounding_status IS DISTINCT FROM 'PASS' OR sm.coverage_status IS DISTINCT FROM 'PASS'
+          OR jsonb_array_length(s.fact_ids)=0
+          OR EXISTS(SELECT 1 FROM jsonb_array_elements_text(s.fact_ids || s.scope_fact_ids) fact_id
+            WHERE NOT EXISTS(SELECT 1 FROM summary_fact f
+              WHERE f.fact_id=fact_id.value AND f.summary_id=s.summary_id AND f.grounding_status='PASS'
+              AND EXISTS(SELECT 1 FROM summary_evidence se JOIN evidence ev ON ev.evidence_id=se.evidence_id
+                WHERE se.fact_id=f.fact_id AND ev.active AND ev.version_id=s.source_version_id)))))
+      AND NOT EXISTS(SELECT 1 FROM kb_entry_pending_source p WHERE p.knowledge_base_id=e.knowledge_base_id
+        AND p.entry_id=e.entry_id AND p.associated_at IS NULL)
+      """
+        .formatted(clearance);
   }
 
   private List<ClaimView> claims(String wikiId, long version) {
@@ -382,9 +612,16 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
 
   @Override
   public Optional<EvidenceDetail> evidence(String evidenceId) {
+    return evidence(evidenceId, 10);
+  }
+
+  @Override
+  public Optional<EvidenceDetail> evidence(String evidenceId, int clearance) {
     return jdbc
         .query(
-            "SELECT e.evidence_id,e.document_id,e.version_id,e.block_id,e.object_key,e.raw_location,rb.raw_content,e.content_hash,e.active FROM evidence e JOIN raw_block rb ON rb.block_id=e.block_id WHERE e.evidence_id=?",
+            "SELECT e.evidence_id,e.document_id,e.version_id,e.block_id,e.object_key,e.raw_location,rb.raw_content,e.content_hash,e.active,v.original_filename FROM evidence e JOIN raw_block rb ON rb.block_id=e.block_id JOIN document_version v ON v.version_id=e.version_id WHERE e.active=TRUE AND EXISTS (SELECT 1 FROM kb_source_authority a WHERE a.version_id=e.version_id AND a.security_level <= "
+                + clearance
+                + ") AND e.evidence_id=?",
             (rs, n) ->
                 new EvidenceDetail(
                     rs.getString(1),
@@ -395,7 +632,8 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                     map(rs.getString(6)),
                     rs.getString(7),
                     rs.getString(8),
-                    rs.getBoolean(9)),
+                    rs.getBoolean(9),
+                    rs.getString(10)),
             evidenceId)
         .stream()
         .findFirst();
@@ -403,8 +641,17 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
 
   @Override
   public Page<EvidenceListView> evidences(PageQuery q) {
+    return evidences(q, 10);
+  }
+
+  @Override
+  public Page<EvidenceListView> evidences(PageQuery q, int clearance) {
     PageQuery query = q == null ? emptyQuery() : q;
-    SqlWhere where = new SqlWhere("d.status<>'DELETED'");
+    SqlWhere where =
+        new SqlWhere(
+            "e.active=TRUE AND EXISTS (SELECT 1 FROM kb_source_authority a WHERE a.version_id=v.version_id AND a.security_level <= "
+                + clearance
+                + ")");
     if (query.active() != null) where.add("e.active=?", query.active());
     if (text(query.query())) {
       String like = "%" + query.query().trim() + "%";
@@ -447,18 +694,31 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
 
   @Override
   public Page<TaskView> tasks(PageQuery q, String actorId, boolean admin, String source) {
+    return tasks(q, actorId, admin, source, 10);
+  }
+
+  @Override
+  public Page<TaskView> tasks(
+      PageQuery q, String actorId, boolean admin, String source, int clearance) {
     PageQuery query = q == null ? emptyQuery() : q;
     String union;
     List<Object> unionArgs = new ArrayList<>();
     if (admin) {
       union =
-          "(SELECT ct.task_id,'COMPILE' source,'' batch_id,'' file_id,COALESCE(ct.version_id,'') version_id,COALESCE(d.logical_name,'') logical_name,ct.task_type,ct.status,ct.status progress_stage,ct.attempt,COALESCE(ct.error_code,'') error_code,COALESCE(ct.error_message,'') error_message,ct.started_at,ct.finished_at,ct.created_at FROM compile_task ct LEFT JOIN document_version v ON v.version_id=ct.version_id LEFT JOIN document d ON d.document_id=v.document_id UNION ALL SELECT f.file_id,'INGEST',f.batch_id,f.file_id,COALESCE(f.version_id,''),f.logical_name,'INGEST',f.status,f.progress_stage,f.attempt,f.error_code,COALESCE(f.error_message,''),f.started_at,f.finished_at,f.created_at FROM ingestion_file f) u";
+          "(SELECT ct.task_id,'COMPILE' source,'' batch_id,'' file_id,COALESCE(ct.version_id,'') version_id,COALESCE(d.logical_name,'') logical_name,ct.task_type,ct.status,ct.status progress_stage,ct.attempt,COALESCE(ct.error_code,'') error_code,COALESCE(ct.error_message,'') error_message,ct.started_at,ct.finished_at,ct.created_at,ct.next_attempt_at FROM compile_task ct LEFT JOIN document_version v ON v.version_id=ct.version_id LEFT JOIN document d ON d.document_id=v.document_id WHERE "
+              + SourceAccessSql.compilationTask("ct", clearance)
+              + " UNION ALL SELECT f.file_id,'INGEST',f.batch_id,f.file_id,COALESCE(f.version_id,''),f.logical_name,'INGEST',f.status,f.progress_stage,f.attempt,f.error_code,COALESCE(f.error_message,''),f.started_at,f.finished_at,f.created_at,f.next_attempt_at FROM ingestion_file f JOIN ingestion_batch b ON b.batch_id=f.batch_id WHERE f.version_id IS NOT NULL OR b.created_by=?) u";
+      unionArgs.add(actorId);
     } else {
       union =
-          "(SELECT f.file_id task_id,'INGEST' source,f.batch_id,f.file_id,COALESCE(f.version_id,'') version_id,f.logical_name,'INGEST' task_type,f.status,f.progress_stage,f.attempt,f.error_code,COALESCE(f.error_message,'') error_message,f.started_at,f.finished_at,f.created_at FROM ingestion_file f JOIN ingestion_batch b ON b.batch_id=f.batch_id WHERE b.created_by=?) u";
+          "(SELECT f.file_id task_id,'INGEST' source,f.batch_id,f.file_id,COALESCE(f.version_id,'') version_id,f.logical_name,'INGEST' task_type,f.status,f.progress_stage,f.attempt,f.error_code,COALESCE(f.error_message,'') error_message,f.started_at,f.finished_at,f.created_at,f.next_attempt_at FROM ingestion_file f JOIN ingestion_batch b ON b.batch_id=f.batch_id WHERE b.created_by=?) u";
       unionArgs.add(actorId);
     }
-    SqlWhere where = new SqlWhere("1=1");
+    SqlWhere where =
+        new SqlWhere(
+            "(NULLIF(u.version_id,'') IS NULL OR "
+                + SourceAccessSql.version("u.version_id", clearance)
+                + ")");
     where.eq("u.status", upperExceptAll(query.status()));
     where.eq("u.source", upperExceptAll(source));
     if (text(query.query())) {
@@ -478,7 +738,7 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
     List<Object> args = withPage(baseArgs, query);
     List<TaskView> items =
         jdbc.query(
-            "SELECT task_id,source,batch_id,file_id,version_id,logical_name,task_type,status,progress_stage,attempt,error_code,error_message,started_at,finished_at,created_at FROM "
+            "SELECT task_id,source,batch_id,file_id,version_id,logical_name,task_type,status,progress_stage,attempt,error_code,error_message,started_at,finished_at,created_at,next_attempt_at FROM "
                 + union
                 + " WHERE "
                 + where.sql()
@@ -499,51 +759,79 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                     rs.getString(12),
                     instant(rs.getTimestamp(13)),
                     instant(rs.getTimestamp(14)),
-                    instant(rs.getTimestamp(15))),
+                    instant(rs.getTimestamp(15)),
+                    instant(rs.getTimestamp(16))),
             args.toArray());
     return page(items, total, query);
   }
 
   @Override
   public QualityView quality(int limit) {
+    return quality(limit, 10);
+  }
+
+  @Override
+  public QualityView quality(int limit, int clearance) {
     int max = limit <= 0 ? 100 : Math.min(limit, 300);
+    String summaryAccess = SourceAccessSql.version("s.version_id", clearance);
+    String wikiAccess = SourceAccessSql.wiki("w", clearance);
+    String relationAccess = SourceAccessSql.publishedGraph("rf", clearance, knowledgeBaseId);
+    String entityAccess = SourceAccessSql.version("se.version_id", clearance);
+    String taskAccess = SourceAccessSql.compilationTask("ct", clearance);
     int[] counts =
-        jdbc.queryForObject(
-            """
-                SELECT
-                  (SELECT COUNT(*) FROM summary WHERE grounding_status='FAIL'),
-                  (SELECT COUNT(*) FROM summary WHERE coverage_status='FAIL'),
-                  (SELECT COUNT(*) FROM wiki_claim WHERE grounding_status='FAIL'),
-                  (SELECT COUNT(*) FROM wiki_claim WHERE temporal_status='CONFLICT'),
-                  (SELECT COUNT(*) FROM relation_fact WHERE lifecycle='ACTIVE' AND conflict_status<>'NONE'),
-                  (SELECT COUNT(*) FROM source_entity se LEFT JOIN entity_mapping em ON em.source_entity_id=se.source_entity_id WHERE em.source_entity_id IS NULL OR em.status<>'APPLIED'),
-                  (SELECT COUNT(*) FROM compile_task WHERE status='FAILED' AND task_type IN ('SUMMARY','GRAPH','WIKI'))
-                """,
-            (rs, rowNum) ->
-                new int[] {
-                  rs.getInt(1),
-                  rs.getInt(2),
-                  rs.getInt(3),
-                  rs.getInt(4),
-                  rs.getInt(5),
-                  rs.getInt(6),
-                  rs.getInt(7)
-                });
+        new int[] {
+          (int)
+              count(
+                  "SELECT COUNT(*) FROM summary s WHERE s.grounding_status='FAIL' AND "
+                      + summaryAccess,
+                  List.of()),
+          (int)
+              count(
+                  "SELECT COUNT(*) FROM summary s WHERE s.coverage_status='FAIL' AND "
+                      + summaryAccess,
+                  List.of()),
+          (int)
+              count(
+                  "SELECT COUNT(*) FROM wiki_claim wc JOIN wiki w ON w.wiki_id=wc.wiki_id AND w.wiki_version=wc.wiki_version WHERE wc.grounding_status='FAIL' AND "
+                      + wikiAccess,
+                  List.of()),
+          (int)
+              count(
+                  "SELECT COUNT(*) FROM wiki_claim wc JOIN wiki w ON w.wiki_id=wc.wiki_id AND w.wiki_version=wc.wiki_version WHERE wc.temporal_status='CONFLICT' AND "
+                      + wikiAccess,
+                  List.of()),
+          (int)
+              count(
+                  "SELECT COUNT(*) FROM kb_graph_relation rf WHERE rf.conflict_status<>'NONE' AND "
+                      + relationAccess,
+                  List.of()),
+          (int)
+              count(
+                  "SELECT COUNT(*) FROM source_entity se LEFT JOIN entity_mapping em ON em.source_entity_id=se.source_entity_id WHERE (em.source_entity_id IS NULL OR em.status<>'APPLIED') AND "
+                      + entityAccess,
+                  List.of()),
+          (int)
+              count(
+                  "SELECT COUNT(*) FROM compile_task ct WHERE ct.status='FAILED' AND ct.task_type IN ('SUMMARY','GRAPH','WIKI') AND "
+                      + taskAccess,
+                  List.of())
+        };
     List<QualityIssueView> issues = new ArrayList<>();
     issues.addAll(
         jdbc.query(
             """
                 SELECT d.logical_name,s.version_id,s.summary_id,s.grounding_status,s.coverage_status,
-                       GROUP_CONCAT(DISTINCT se.evidence_id ORDER BY se.evidence_id SEPARATOR ','),s.created_at
+                       string_agg(DISTINCT se.evidence_id, ',' ORDER BY se.evidence_id),s.created_at
                 FROM summary s
                 JOIN document_version v ON v.version_id=s.version_id
                 JOIN document d ON d.document_id=v.document_id
                 LEFT JOIN summary_fact sf ON sf.summary_id=s.summary_id
                 LEFT JOIN summary_evidence se ON se.fact_id=sf.fact_id
-                WHERE s.grounding_status='FAIL' OR s.coverage_status='FAIL'
+                WHERE (s.grounding_status='FAIL' OR s.coverage_status='FAIL') AND %s
                 GROUP BY d.logical_name,s.version_id,s.summary_id,s.grounding_status,s.coverage_status,s.created_at
                 ORDER BY s.created_at DESC LIMIT ?
-                """,
+                """
+                .formatted(summaryAccess),
             (rs, rowNum) ->
                 new QualityIssueView(
                     "SUMMARY_QUALITY",
@@ -560,17 +848,18 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
           jdbc.query(
               """
                   SELECT w.title,COALESCE(MIN(s.version_id),''),wc.claim_id,wc.grounding_status,wc.temporal_status,
-                         GROUP_CONCAT(DISTINCT we.evidence_id ORDER BY we.evidence_id SEPARATOR ','),wc.created_at
+                         string_agg(DISTINCT we.evidence_id, ',' ORDER BY we.evidence_id),wc.created_at
                   FROM wiki_claim wc
                   JOIN wiki w ON w.wiki_id=wc.wiki_id AND w.wiki_version=wc.wiki_version
                   LEFT JOIN wiki_evidence we ON we.claim_id=wc.claim_id
                   LEFT JOIN wiki_claim_fact wcf ON wcf.claim_id=wc.claim_id
                   LEFT JOIN summary_fact sf ON sf.fact_id=wcf.fact_id
                   LEFT JOIN summary s ON s.summary_id=sf.summary_id
-                  WHERE wc.grounding_status='FAIL' OR wc.temporal_status='CONFLICT'
+                  WHERE (wc.grounding_status='FAIL' OR wc.temporal_status='CONFLICT') AND %s
                   GROUP BY w.title,wc.claim_id,wc.grounding_status,wc.temporal_status,wc.created_at
                   ORDER BY wc.created_at DESC LIMIT ?
-                  """,
+                  """
+                  .formatted(wikiAccess),
               (rs, rowNum) ->
                   new QualityIssueView(
                       "WIKI_CLAIM",
@@ -588,17 +877,18 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
           jdbc.query(
               """
                   SELECT CONCAT(se.canonical_name,' —',rf.relation_type,'→ ',te.canonical_name),
-                         COALESCE(MIN(s.version_id),''),rf.relation_id,rf.conflict_status,
-                         GROUP_CONCAT(DISTINCT rs.evidence_id ORDER BY rs.evidence_id SEPARATOR ','),rf.created_at
-                  FROM relation_fact rf
-                  JOIN canonical_entity se ON se.canonical_entity_id=rf.source_entity_id
-                  JOIN canonical_entity te ON te.canonical_entity_id=rf.target_entity_id
-                  LEFT JOIN relation_evidence_support rs ON rs.relation_id=rf.relation_id AND rs.active=TRUE
-                  LEFT JOIN summary s ON s.summary_id=rs.summary_id
-                  WHERE rf.lifecycle='ACTIVE' AND rf.conflict_status<>'NONE'
+                         COALESCE(MIN(e.version_id),''),rf.relation_id,rf.conflict_status,
+                         string_agg(DISTINCT rs.evidence_id, ',' ORDER BY rs.evidence_id),rf.created_at
+                  FROM kb_graph_relation rf
+                  JOIN kb_graph_entity se ON se.kb_id=rf.kb_id AND se.entity_id=rf.source_entity_id
+                  JOIN kb_graph_entity te ON te.kb_id=rf.kb_id AND te.entity_id=rf.target_entity_id
+                  JOIN kb_graph_evidence rs ON rs.kb_id=rf.kb_id AND rs.relation_id=rf.relation_id AND rs.revision_id=rf.revision_id
+                  JOIN evidence e ON e.evidence_id=rs.evidence_id
+                  WHERE rf.conflict_status<>'NONE' AND %s
                   GROUP BY se.canonical_name,rf.relation_type,te.canonical_name,rf.relation_id,rf.conflict_status,rf.created_at
                   ORDER BY rf.created_at DESC LIMIT ?
-                  """,
+                  """
+                  .formatted(relationAccess),
               (rs, rowNum) ->
                   new QualityIssueView(
                       "RELATION_CONFLICT",
@@ -620,9 +910,10 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                   JOIN document_version v ON v.version_id=se.version_id
                   JOIN document d ON d.document_id=v.document_id
                   LEFT JOIN entity_mapping em ON em.source_entity_id=se.source_entity_id
-                  WHERE em.source_entity_id IS NULL OR em.status<>'APPLIED'
+                  WHERE (em.source_entity_id IS NULL OR em.status<>'APPLIED') AND %s
                   ORDER BY se.created_at DESC LIMIT ?
-                  """,
+                  """
+                  .formatted(entityAccess),
               (rs, rowNum) ->
                   new QualityIssueView(
                       "ENTITY_RESOLUTION",
@@ -643,9 +934,10 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                   FROM compile_task ct
                   LEFT JOIN document_version v ON v.version_id=ct.version_id
                   LEFT JOIN document d ON d.document_id=v.document_id
-                  WHERE ct.status='FAILED' AND ct.task_type IN ('SUMMARY','GRAPH','WIKI')
+                  WHERE ct.status='FAILED' AND ct.task_type IN ('SUMMARY','GRAPH','WIKI') AND %s
                   ORDER BY ct.created_at DESC LIMIT ?
-                  """,
+                  """
+                  .formatted(taskAccess),
               (rs, rowNum) ->
                   new QualityIssueView(
                       "GENERATION_TASK",
@@ -670,21 +962,48 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
 
   @Override
   public Facets facets() {
+    return facets(10);
+  }
+
+  @Override
+  public Facets facets(int clearance) {
     return new Facets(
         distinct(
-            "SELECT DISTINCT company FROM document_metadata WHERE company<>'' ORDER BY company LIMIT 500"),
+            "SELECT DISTINCT company FROM document_metadata m WHERE EXISTS (SELECT 1 FROM kb_source_authority a WHERE a.version_id=m.version_id AND a.security_level <= "
+                + clearance
+                + ") AND company<>'' ORDER BY company LIMIT 500"),
         distinct(
-            "SELECT DISTINCT source_department FROM document_metadata WHERE source_department<>'' ORDER BY source_department LIMIT 500"),
+            "SELECT DISTINCT source_department FROM document_metadata m WHERE EXISTS (SELECT 1 FROM kb_source_authority a WHERE a.version_id=m.version_id AND a.security_level <= "
+                + clearance
+                + ") AND source_department<>'' ORDER BY source_department LIMIT 500"),
         distinct(
-            "SELECT DISTINCT COALESCE(manual_document_type_override,auto_document_type,'') value FROM document_metadata WHERE COALESCE(manual_document_type_override,auto_document_type,'')<>'' ORDER BY value LIMIT 500"),
+            "SELECT DISTINCT COALESCE(manual_document_type_override,auto_document_type,'') value FROM document_metadata m WHERE EXISTS (SELECT 1 FROM kb_source_authority a WHERE a.version_id=m.version_id AND a.security_level <= "
+                + clearance
+                + ") AND COALESCE(manual_document_type_override,auto_document_type,'')<>'' ORDER BY value LIMIT 500"),
         distinct(
-            "SELECT DISTINCT material_category FROM document_metadata WHERE material_category<>'' ORDER BY material_category LIMIT 500"));
+            "SELECT DISTINCT material_category FROM document_metadata m WHERE EXISTS (SELECT 1 FROM kb_source_authority a WHERE a.version_id=m.version_id AND a.security_level <= "
+                + clearance
+                + ") AND material_category<>'' ORDER BY material_category LIMIT 500"));
   }
 
   @Override
   public Page<AuditEventView> audit(PageQuery q) {
+    return audit(q, "", 10);
+  }
+
+  @Override
+  public Page<AuditEventView> audit(PageQuery q, String actorId, int clearance) {
     PageQuery query = q == null ? emptyQuery() : q;
-    SqlWhere where = new SqlWhere("1=1");
+    SqlWhere where =
+        new SqlWhere(
+            "((actor_user_id=? AND COALESCE(target_id,'')='') OR target_type IN ('auth','user','settings','model_configuration') OR (target_type='document_version' AND "
+                + SourceAccessSql.version("audit_event.target_id", clearance)
+                + ") OR (target_type='evidence' AND EXISTS(SELECT 1 FROM evidence e WHERE e.evidence_id=audit_event.target_id AND e.active=TRUE AND "
+                + SourceAccessSql.version("e.version_id", clearance)
+                + ")) OR (target_type='compile_task' AND EXISTS(SELECT 1 FROM compile_task audit_task WHERE audit_task.task_id=audit_event.target_id AND "
+                + SourceAccessSql.compilationReceipt("audit_task", "audit_event", clearance)
+                + ")))");
+    where.add("1=1", actorId);
     if (text(query.query())) {
       String like = "%" + query.query().trim() + "%";
       where.add(
@@ -730,106 +1049,22 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
   @Override
   public List<GraphRelationView> graph(
       String query, int depth, int limit, String relationType, Instant validAt) {
-    if (!text(query)) return List.of();
-    int max = Math.min(limit <= 0 ? 10 : limit, 100);
-    int hops = Math.max(1, Math.min(depth <= 0 ? 2 : depth, 2));
-    String like = "%" + query.trim() + "%";
-    StringBuilder firstWhere =
-        new StringBuilder(
-            "rf.lifecycle='ACTIVE' AND (se.canonical_name LIKE ? OR te.canonical_name LIKE ? OR rf.relation_type LIKE ?)");
-    List<Object> firstArgs = new ArrayList<>(List.of(like, like, like));
-    if (text(relationType)) {
-      firstWhere.append(" AND rf.relation_type=?");
-      firstArgs.add(relationType.trim());
-    }
-    if (validAt != null) {
-      firstWhere.append(
-          " AND (rf.valid_from IS NULL OR rf.valid_from<=?) AND (rf.valid_to IS NULL OR rf.valid_to>?)");
-      firstArgs.add(Timestamp.from(validAt));
-      firstArgs.add(Timestamp.from(validAt));
-    }
-    firstArgs.add(max);
-    List<GraphRelationView> first =
-        jdbc.query(
-            "SELECT rf.relation_id,rf.source_entity_id,se.canonical_name,se.entity_type,rf.target_entity_id,te.canonical_name,te.entity_type,rf.relation_type,rf.valid_from,rf.valid_to,rf.conflict_status,"
-                + "GROUP_CONCAT(DISTINCT rs.evidence_id ORDER BY rs.evidence_id SEPARATOR ',') evidence_ids,MAX(rs.confidence) score "
-                + "FROM relation_fact rf JOIN canonical_entity se ON se.canonical_entity_id=rf.source_entity_id JOIN canonical_entity te ON te.canonical_entity_id=rf.target_entity_id "
-                + "JOIN relation_evidence_support rs ON rs.relation_id=rf.relation_id AND rs.active=TRUE JOIN evidence ev ON ev.evidence_id=rs.evidence_id AND ev.active=TRUE WHERE "
-                + firstWhere
-                + " GROUP BY rf.relation_id,rf.source_entity_id,se.canonical_name,se.entity_type,rf.target_entity_id,te.canonical_name,te.entity_type,rf.relation_type,rf.valid_from,rf.valid_to,rf.conflict_status "
-                + "ORDER BY score DESC,rf.relation_id LIMIT ?",
-            (rs, n) -> graphRelation(rs),
-            firstArgs.toArray());
-    if (hops == 1 || first.size() >= max || first.isEmpty()) return List.copyOf(first);
-    LinkedHashSet<String> entityIds = new LinkedHashSet<>();
-    LinkedHashSet<String> relationIds = new LinkedHashSet<>();
-    first.forEach(
-        r -> {
-          entityIds.add(r.sourceEntityId());
-          entityIds.add(r.targetEntityId());
-          relationIds.add(r.relationId());
-        });
-    String entityMarks = String.join(",", Collections.nCopies(entityIds.size(), "?"));
-    String relationMarks = String.join(",", Collections.nCopies(relationIds.size(), "?"));
-    StringBuilder secondWhere =
-        new StringBuilder(
-            "rf.lifecycle='ACTIVE' AND (rf.source_entity_id IN ("
-                + entityMarks
-                + ") OR rf.target_entity_id IN ("
-                + entityMarks
-                + ")) AND rf.relation_id NOT IN ("
-                + relationMarks
-                + ")");
-    List<Object> secondArgs = new ArrayList<>();
-    secondArgs.addAll(entityIds);
-    secondArgs.addAll(entityIds);
-    secondArgs.addAll(relationIds);
-    if (text(relationType)) {
-      secondWhere.append(" AND rf.relation_type=?");
-      secondArgs.add(relationType.trim());
-    }
-    if (validAt != null) {
-      secondWhere.append(
-          " AND (rf.valid_from IS NULL OR rf.valid_from<=?) AND (rf.valid_to IS NULL OR rf.valid_to>?)");
-      secondArgs.add(Timestamp.from(validAt));
-      secondArgs.add(Timestamp.from(validAt));
-    }
-    secondArgs.add(max - first.size());
-    List<GraphRelationView> second =
-        jdbc.query(
-            "SELECT rf.relation_id,rf.source_entity_id,se.canonical_name,se.entity_type,rf.target_entity_id,te.canonical_name,te.entity_type,rf.relation_type,rf.valid_from,rf.valid_to,rf.conflict_status,"
-                + "GROUP_CONCAT(DISTINCT rs.evidence_id ORDER BY rs.evidence_id SEPARATOR ',') evidence_ids,MAX(rs.confidence) score "
-                + "FROM relation_fact rf JOIN canonical_entity se ON se.canonical_entity_id=rf.source_entity_id JOIN canonical_entity te ON te.canonical_entity_id=rf.target_entity_id "
-                + "JOIN relation_evidence_support rs ON rs.relation_id=rf.relation_id AND rs.active=TRUE JOIN evidence ev ON ev.evidence_id=rs.evidence_id AND ev.active=TRUE WHERE "
-                + secondWhere
-                + " GROUP BY rf.relation_id,rf.source_entity_id,se.canonical_name,se.entity_type,rf.target_entity_id,te.canonical_name,te.entity_type,rf.relation_type,rf.valid_from,rf.valid_to,rf.conflict_status "
-                + "ORDER BY score DESC,rf.relation_id LIMIT ?",
-            (rs, n) -> graphRelation(rs),
-            secondArgs.toArray());
-    List<GraphRelationView> out = new ArrayList<>(first);
-    out.addAll(second);
-    return List.copyOf(out);
+    return graph(query, depth, limit, relationType, validAt, 10);
   }
 
-  private GraphRelationView graphRelation(java.sql.ResultSet rs) throws java.sql.SQLException {
-    return new GraphRelationView(
-        rs.getString(1),
-        rs.getString(2),
-        rs.getString(3),
-        rs.getString(4),
-        rs.getString(5),
-        rs.getString(6),
-        rs.getString(7),
-        rs.getString(8),
-        instant(rs.getTimestamp(9)),
-        instant(rs.getTimestamp(10)),
-        rs.getString(11),
-        split(rs.getString(12)),
-        rs.getDouble(13));
+  @Override
+  public List<GraphRelationView> graph(
+      String query, int depth, int limit, String relationType, Instant validAt, int clearance) {
+    return graphReader.browse(query, depth, limit, relationType, validAt, clearance);
   }
 
   @Override
   public List<EvidenceSourceRef> evidenceSources(List<String> evidenceIds) {
+    return evidenceSources(evidenceIds, 10);
+  }
+
+  @Override
+  public List<EvidenceSourceRef> evidenceSources(List<String> evidenceIds, int clearance) {
     if (evidenceIds == null || evidenceIds.isEmpty()) return List.of();
     List<String> ids =
         evidenceIds.stream()
@@ -842,7 +1077,9 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
     Map<String, EvidenceSourceRef> found = new LinkedHashMap<>();
     List<EvidenceSourceRef> rows =
         jdbc.query(
-            "SELECT e.evidence_id,e.document_id,e.version_id,v.original_filename,e.object_key,e.raw_location FROM evidence e JOIN document_version v ON v.version_id=e.version_id WHERE e.active=TRUE AND e.evidence_id IN ("
+            "SELECT e.evidence_id,e.document_id,e.version_id,v.original_filename,e.object_key,e.raw_location FROM evidence e JOIN document_version v ON v.version_id=e.version_id WHERE e.active=TRUE AND EXISTS (SELECT 1 FROM kb_source_authority a WHERE a.version_id=e.version_id AND a.security_level <= "
+                + clearance
+                + ") AND e.evidence_id IN ("
                 + placeholders
                 + ")",
             (rs, rowNum) ->
@@ -869,7 +1106,8 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                    (SELECT COUNT(*) FROM summary sx WHERE sx.version_id=v.version_id AND sx.coverage_status='PASS'),
                    COALESCE((SELECT dr.status FROM distill_recommendation dr WHERE dr.version_id=v.version_id ORDER BY (dr.status='RECOMMENDED') DESC,dr.created_at DESC LIMIT 1),''),
                    COALESCE((SELECT dr.reason FROM distill_recommendation dr WHERE dr.version_id=v.version_id ORDER BY (dr.status='RECOMMENDED') DESC,dr.created_at DESC LIMIT 1),''),
-                   COALESCE((SELECT COUNT(*) FROM effective_version_hit evh WHERE evh.version_id=v.version_id),0)
+                   COALESCE((SELECT COUNT(*) FROM source_usage_contribution evh WHERE evh.version_id=v.version_id AND evh.created_at>=clock_timestamp()-INTERVAL '30 days'),0),
+                   m.security_level
             FROM document d JOIN document_version v ON v.document_id=d.document_id
             LEFT JOIN document_metadata m ON m.version_id=v.version_id
             WHERE v.version_id=? AND d.status<>'DELETED'
@@ -897,7 +1135,8 @@ public final class JdbcEnterpriseOperations implements EnterpriseOperations.Repo
                     rs.getInt(16),
                     rs.getString(17),
                     rs.getString(18),
-                    rs.getInt(19)),
+                    rs.getInt(19),
+                    rs.getObject(20) == null ? null : rs.getInt(20)),
             versionId)
         .stream()
         .findFirst();

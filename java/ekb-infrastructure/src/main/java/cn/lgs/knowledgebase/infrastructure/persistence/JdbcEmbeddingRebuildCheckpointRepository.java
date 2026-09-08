@@ -18,7 +18,6 @@ public final class JdbcEmbeddingRebuildCheckpointRepository
   public JdbcEmbeddingRebuildCheckpointRepository(JdbcTemplate jdbc) {
     if (jdbc == null) throw new IllegalArgumentException("jdbc is required");
     this.jdbc = jdbc;
-    ensureSchema();
   }
 
   @Override
@@ -43,7 +42,7 @@ public final class JdbcEmbeddingRebuildCheckpointRepository
     for (EmbeddingRebuildCheckpoint checkpoint : checkpoints) {
       if (checkpoint == null) throw new IllegalArgumentException("checkpoint cannot be null");
       jdbc.update(
-          "INSERT INTO embedding_rebuild_checkpoint(version_id,chunk_id,content_hash,evidence_fingerprint,evidence_ids,strategy_key,updated_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE content_hash=VALUES(content_hash),evidence_fingerprint=VALUES(evidence_fingerprint),evidence_ids=VALUES(evidence_ids),strategy_key=VALUES(strategy_key),updated_at=CURRENT_TIMESTAMP(6)",
+          "INSERT INTO embedding_rebuild_checkpoint(version_id,chunk_id,content_hash,evidence_fingerprint,evidence_ids,strategy_key,updated_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP(6)) ON CONFLICT (version_id,chunk_id) DO UPDATE SET content_hash=EXCLUDED.content_hash,evidence_fingerprint=EXCLUDED.evidence_fingerprint,evidence_ids=EXCLUDED.evidence_ids,strategy_key=EXCLUDED.strategy_key,updated_at=CURRENT_TIMESTAMP(6)",
           checkpoint.versionId(),
           checkpoint.chunkId(),
           checkpoint.contentHash(),
@@ -51,21 +50,6 @@ public final class JdbcEmbeddingRebuildCheckpointRepository
           checkpoint.evidenceIds(),
           checkpoint.strategyKey());
     }
-  }
-
-  private void ensureSchema() {
-    jdbc.execute(
-        "CREATE TABLE IF NOT EXISTS embedding_rebuild_checkpoint ("
-            + "version_id CHAR(36) CHARACTER SET ascii NOT NULL,"
-            + "chunk_id VARCHAR(255) CHARACTER SET ascii NOT NULL,"
-            + "content_hash CHAR(64) CHARACTER SET ascii NOT NULL,"
-            + "evidence_fingerprint CHAR(64) CHARACTER SET ascii NOT NULL,"
-            + "evidence_ids TEXT NOT NULL,"
-            + "strategy_key VARCHAR(128) CHARACTER SET ascii NOT NULL,"
-            + "updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),"
-            + "PRIMARY KEY(version_id,chunk_id),"
-            + "KEY idx_embedding_checkpoint_version (version_id,updated_at)"
-            + ") ENGINE=InnoDB");
   }
 
   private static String requireText(String value, String name) {

@@ -65,9 +65,53 @@ public final class EnterpriseOperations {
       int coveredSummaries,
       String recommendation,
       String recommendationReason,
-      int effectiveHits) {
+      int effectiveHits,
+      Integer securityLevel) {
     public DocumentVersionView {
       manualTags = manualTags == null ? List.of() : List.copyOf(manualTags);
+    }
+
+    public DocumentVersionView(
+        String documentId,
+        String logicalName,
+        String versionId,
+        long versionNo,
+        String lifecycle,
+        String originalFilename,
+        String sourceDepartment,
+        String materialCategory,
+        String company,
+        String documentType,
+        LocalDate documentDate,
+        List<String> manualTags,
+        Instant parsedAt,
+        int summaryCount,
+        int groundedSummaries,
+        int coveredSummaries,
+        String recommendation,
+        String recommendationReason,
+        int effectiveHits) {
+      this(
+          documentId,
+          logicalName,
+          versionId,
+          versionNo,
+          lifecycle,
+          originalFilename,
+          sourceDepartment,
+          materialCategory,
+          company,
+          documentType,
+          documentDate,
+          manualTags,
+          parsedAt,
+          summaryCount,
+          groundedSummaries,
+          coveredSummaries,
+          recommendation,
+          recommendationReason,
+          effectiveHits,
+          null);
     }
   }
 
@@ -78,7 +122,27 @@ public final class EnterpriseOperations {
       String materialCategory,
       String documentType,
       LocalDate documentDate,
-      List<String> manualTags) {
+      List<String> manualTags,
+      Integer securityLevel) {
+    public DocumentMetadataUpdate(
+        String versionId,
+        String logicalName,
+        String sourceDepartment,
+        String materialCategory,
+        String documentType,
+        LocalDate documentDate,
+        List<String> manualTags) {
+      this(
+          versionId,
+          logicalName,
+          sourceDepartment,
+          materialCategory,
+          documentType,
+          documentDate,
+          manualTags,
+          null);
+    }
+
     public DocumentMetadataUpdate {
       manualTags = manualTags == null ? List.of() : List.copyOf(manualTags);
     }
@@ -108,6 +172,72 @@ public final class EnterpriseOperations {
       List<ClaimView> claims) {
     public WikiView {
       claims = claims == null ? List.of() : List.copyOf(claims);
+    }
+  }
+
+  public record EntryQuery(int page, int pageSize, String query, String stage) {
+    public int normalizedPage() {
+      return page <= 0 ? 1 : page;
+    }
+
+    public int normalizedPageSize() {
+      return pageSize <= 0 ? 30 : Math.min(pageSize, 100);
+    }
+
+    public int offset() {
+      return (normalizedPage() - 1) * normalizedPageSize();
+    }
+  }
+
+  public record EntryFactView(String factId, String factText, List<String> evidenceIds) {
+    public EntryFactView {
+      evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
+    }
+  }
+
+  public record EntrySourceView(
+      String documentId,
+      String versionId,
+      long versionNo,
+      String logicalName,
+      String summaryId,
+      String conceptId,
+      List<EntryFactView> facts,
+      List<EntryFactView> scopeFacts) {
+    public EntrySourceView {
+      facts = facts == null ? List.of() : List.copyOf(facts);
+      scopeFacts = scopeFacts == null ? List.of() : List.copyOf(scopeFacts);
+    }
+
+    public EntrySourceView(
+        String documentId,
+        String versionId,
+        long versionNo,
+        String logicalName,
+        String summaryId,
+        String conceptId,
+        List<EntryFactView> facts) {
+      this(documentId, versionId, versionNo, logicalName, summaryId, conceptId, facts, List.of());
+    }
+  }
+
+  public record KnowledgeEntryView(
+      String entryId,
+      long revision,
+      String entryType,
+      String label,
+      List<String> aliases,
+      String description,
+      String stage,
+      String lifecycle,
+      Map<String, Object> scope,
+      Instant updatedAt,
+      int sourceCount,
+      List<EntrySourceView> sources) {
+    public KnowledgeEntryView {
+      aliases = aliases == null ? List.of() : List.copyOf(aliases);
+      scope = scope == null ? Map.of() : Map.copyOf(scope);
+      sources = sources == null ? List.of() : List.copyOf(sources);
     }
   }
 
@@ -148,7 +278,8 @@ public final class EnterpriseOperations {
       String errorMessage,
       Instant startedAt,
       Instant finishedAt,
-      Instant createdAt) {}
+      Instant createdAt,
+      Instant nextAttemptAt) {}
 
   public record EvidenceListView(
       String evidenceId,
@@ -177,7 +308,8 @@ public final class EnterpriseOperations {
       Map<String, Object> rawLocation,
       String rawContent,
       String contentHash,
-      boolean active) {
+      boolean active,
+      String sourceFilename) {
     public EvidenceDetail {
       rawLocation = rawLocation == null ? Map.of() : Map.copyOf(rawLocation);
     }
@@ -312,32 +444,95 @@ public final class EnterpriseOperations {
   public interface Repository {
     OverviewView overview();
 
+    default OverviewView overview(int clearance) {
+      return overview();
+    }
+
     Page<DocumentVersionView> documents(PageQuery query);
+
+    default Page<DocumentVersionView> documents(PageQuery query, int clearance) {
+      return documents(query);
+    }
 
     Optional<DocumentVersionView> updateDocumentMetadata(DocumentMetadataUpdate update);
 
     Optional<DocumentDetailView> documentDetail(String versionId, int blockLimit);
 
+    default Optional<DocumentDetailView> documentDetail(
+        String versionId, int blockLimit, int clearance) {
+      return documentDetail(versionId, blockLimit);
+    }
+
     Page<WikiView> wikis(PageQuery query);
+
+    default Page<WikiView> wikis(PageQuery query, int clearance) {
+      return wikis(query);
+    }
 
     Optional<WikiView> wiki(String wikiId, Long version);
 
+    default Optional<WikiView> wiki(String wikiId, Long version, int clearance) {
+      return wiki(wikiId, version);
+    }
+
+    default Page<KnowledgeEntryView> knowledgeEntries(EntryQuery query, int clearance) {
+      return new Page<>(List.of(), 0, query.normalizedPage(), query.normalizedPageSize());
+    }
+
+    default Optional<KnowledgeEntryView> knowledgeEntry(String entryId, int clearance) {
+      return Optional.empty();
+    }
+
     Optional<EvidenceDetail> evidence(String evidenceId);
+
+    default Optional<EvidenceDetail> evidence(String evidenceId, int clearance) {
+      return evidence(evidenceId);
+    }
 
     Page<EvidenceListView> evidences(PageQuery query);
 
+    default Page<EvidenceListView> evidences(PageQuery query, int clearance) {
+      return evidences(query);
+    }
+
     Page<TaskView> tasks(PageQuery query, String actorId, boolean admin, String source);
+
+    default Page<TaskView> tasks(
+        PageQuery query, String actorId, boolean admin, String source, int clearance) {
+      return tasks(query, actorId, admin, source);
+    }
 
     QualityView quality(int limit);
 
+    default QualityView quality(int limit, int clearance) {
+      return quality(limit);
+    }
+
     Facets facets();
 
+    default Facets facets(int clearance) {
+      return facets();
+    }
+
     Page<AuditEventView> audit(PageQuery query);
+
+    default Page<AuditEventView> audit(PageQuery query, String actorId, int clearance) {
+      return audit(query);
+    }
 
     List<GraphRelationView> graph(
         String query, int depth, int limit, String relationType, Instant validAt);
 
+    default List<GraphRelationView> graph(
+        String query, int depth, int limit, String relationType, Instant validAt, int clearance) {
+      return graph(query, depth, limit, relationType, validAt);
+    }
+
     List<EvidenceSourceRef> evidenceSources(List<String> evidenceIds);
+
+    default List<EvidenceSourceRef> evidenceSources(List<String> evidenceIds, int clearance) {
+      return evidenceSources(evidenceIds);
+    }
   }
 
   public record EvidenceSourceRef(

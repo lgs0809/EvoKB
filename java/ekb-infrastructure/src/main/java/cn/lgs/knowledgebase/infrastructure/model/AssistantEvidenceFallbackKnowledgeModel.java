@@ -4,6 +4,8 @@ import cn.lgs.knowledgebase.application.compilation.ConceptCompilationService.Co
 import cn.lgs.knowledgebase.application.compilation.ConceptCompilationService.ConceptProposalSet;
 import cn.lgs.knowledgebase.application.compilation.GraphCompilationService.Extraction;
 import cn.lgs.knowledgebase.application.compilation.GraphCompilationService.FactDecision;
+import cn.lgs.knowledgebase.application.compilation.GroundingConstraintAudit;
+import cn.lgs.knowledgebase.application.compilation.GroundingJudgeProtocol;
 import cn.lgs.knowledgebase.application.compilation.SummaryCompilationService.Classification;
 import cn.lgs.knowledgebase.application.compilation.SummaryCompilationService.CoverageDecision;
 import cn.lgs.knowledgebase.application.compilation.SummaryCompilationService.FactProposal;
@@ -178,20 +180,32 @@ public final class AssistantEvidenceFallbackKnowledgeModel implements KnowledgeM
 
   private Object summaryJudge(String userPrompt, Class<?> outputType) {
     if (sameType(outputType, CoverageDecision.class)) return new CoverageDecision(List.of());
-    if (sameType(outputType, SupportDecision.class))
+    if (sameType(outputType, GroundingJudgeProtocol.Decision.class)
+        || sameType(outputType, GroundingJudgeProtocol.Batch.class))
+      return fixedCandidateJudge(userPrompt, outputType, "FACT", "EVIDENCE:", false);
+    List<GroundingInput> inputs = groundingInputs(userPrompt, "FACT", "EVIDENCE:");
+    if (sameType(outputType, SupportDecision.class)) {
+      GroundingInput input = inputs.size() == 1 ? inputs.get(0) : new GroundingInput("", "", "");
+      var checks = copyChecks(input, false);
       return new SupportDecision(
-          true, "assistant evidence-only fallback: fact copied from raw evidence");
+          !checks.isEmpty(),
+          fallbackReason(!checks.isEmpty()),
+          checks.isEmpty() ? unknownChecks(input) : checks);
+    }
     if (!sameType(outputType, SupportDecisionSet.class))
       throw new IllegalStateException("unsupported SUMMARY_JUDGE output " + outputType.getName());
-    List<SupportDecisionItem> decisions = new ArrayList<>();
-    Matcher matcher = CANDIDATE.matcher(userPrompt == null ? "" : userPrompt);
-    while (matcher.find())
-      decisions.add(
-          new SupportDecisionItem(
-              text(matcher.group(1)),
-              true,
-              "assistant evidence-only fallback: candidate is checked against its raw evidence"));
-    return new SupportDecisionSet(List.copyOf(uniqueSupport(decisions)));
+    return new SupportDecisionSet(
+        inputs.stream()
+            .map(
+                input -> {
+                  var checks = copyChecks(input, false);
+                  return new SupportDecisionItem(
+                      input.id(),
+                      !checks.isEmpty(),
+                      fallbackReason(!checks.isEmpty()),
+                      checks.isEmpty() ? unknownChecks(input) : checks);
+                })
+            .toList());
   }
 
   private ConceptProposalSet concepts(String userPrompt) {
@@ -251,34 +265,130 @@ public final class AssistantEvidenceFallbackKnowledgeModel implements KnowledgeM
   }
 
   private Object wikiJudge(String userPrompt, Class<?> outputType) {
+    if (sameType(outputType, GroundingJudgeProtocol.Decision.class)
+        || sameType(outputType, GroundingJudgeProtocol.Batch.class))
+      return fixedCandidateJudge(userPrompt, outputType, "CLAIM", "SUPPORTING FACTS:", true);
+    List<GroundingInput> inputs = groundingInputs(userPrompt, "CLAIM", "SUPPORTING FACTS:");
     if (sameType(
         outputType,
-        cn.lgs.knowledgebase.application.compilation.WikiCompilationService.SupportDecision.class))
+        cn.lgs.knowledgebase.application.compilation.WikiCompilationService.SupportDecision
+            .class)) {
+      GroundingInput input = inputs.size() == 1 ? inputs.get(0) : new GroundingInput("", "", "");
+      var checks = copyChecks(input, true);
       return new cn.lgs.knowledgebase.application.compilation.WikiCompilationService
-          .SupportDecision(true, "assistant evidence-only fallback: claim equals supporting fact");
+          .SupportDecision(
+          !checks.isEmpty(),
+          fallbackReason(!checks.isEmpty()),
+          checks.isEmpty() ? unknownChecks(input) : checks);
+    }
     if (!sameType(
         outputType,
         cn.lgs.knowledgebase.application.compilation.WikiCompilationService.SupportDecisionSet
             .class))
       throw new IllegalStateException("unsupported WIKI_JUDGE output " + outputType.getName());
-    List<cn.lgs.knowledgebase.application.compilation.WikiCompilationService.SupportDecisionItem>
-        decisions = new ArrayList<>();
-    Matcher matcher = CANDIDATE.matcher(userPrompt == null ? "" : userPrompt);
-    while (matcher.find())
-      decisions.add(
-          new cn.lgs.knowledgebase.application.compilation.WikiCompilationService
-              .SupportDecisionItem(
-              text(matcher.group(1)),
-              true,
-              "assistant evidence-only fallback: claim equals supporting fact"));
     return new cn.lgs.knowledgebase.application.compilation.WikiCompilationService
-        .SupportDecisionSet(List.copyOf(uniqueWikiSupport(decisions)));
+        .SupportDecisionSet(
+        inputs.stream()
+            .map(
+                input -> {
+                  var checks = copyChecks(input, true);
+                  return new cn.lgs.knowledgebase.application.compilation.WikiCompilationService
+                      .SupportDecisionItem(
+                      input.id(),
+                      !checks.isEmpty(),
+                      fallbackReason(!checks.isEmpty()),
+                      checks.isEmpty() ? unknownChecks(input) : checks);
+                })
+            .toList());
   }
 
-  private static List<SupportDecisionItem> uniqueSupport(List<SupportDecisionItem> input) {
-    Map<String, SupportDecisionItem> unique = new LinkedHashMap<>();
-    for (SupportDecisionItem item : input) unique.putIfAbsent(item.candidateId(), item);
-    return List.copyOf(unique.values());
+  private record GroundingInput(String id, String claim, String source) {}
+
+  private static List<GroundingInput> groundingInputs(
+      String prompt, String label, String evidenceMarker) {
+    String input = prompt == null ? "" : prompt;
+    List<String> sections =
+        input.startsWith("CANDIDATES:")
+            ? List.of(input.substring("CANDIDATES:\n".length()).split("\n===\n", -1))
+            : List.of(input);
+    List<GroundingInput> result = new ArrayList<>();
+    for (String section : sections) {
+      if (section.isBlank()) continue;
+      Matcher id = CANDIDATE.matcher(section);
+      String candidateId = id.find() ? text(id.group(1)) : "";
+      int beginning =
+          section.indexOf(label + (label.equals("FACT") && candidateId.isEmpty() ? ": " : "="));
+      int evidence = section.indexOf("\n" + evidenceMarker, beginning);
+      if (beginning < 0 || evidence < 0)
+        throw new IllegalStateException(
+            "assistant fallback cannot locate complete grounding input");
+      int prefix = label.length() + (label.equals("FACT") && candidateId.isEmpty() ? 2 : 1);
+      result.add(
+          new GroundingInput(
+              candidateId,
+              text(section.substring(beginning + prefix, evidence)),
+              text(section.substring(evidence + 1 + evidenceMarker.length()))));
+    }
+    return List.copyOf(result);
+  }
+
+  private Object fixedCandidateJudge(
+      String prompt, Class<?> outputType, String claimMarker, String evidenceMarker, boolean wiki) {
+    var inputs = groundingInputs(prompt, claimMarker, evidenceMarker);
+    var items =
+        inputs.stream()
+            .map(
+                input -> {
+                  var copied = copyChecks(input, wiki);
+                  var checks =
+                      (copied.isEmpty() ? unknownChecks(input) : copied)
+                          .stream()
+                              .map(
+                                  check ->
+                                      new GroundingJudgeProtocol.Constraint(
+                                          check.dimension(),
+                                          check.finding(),
+                                          check.evidenceQuotes(),
+                                          check.reason()))
+                              .toList();
+                  return new GroundingJudgeProtocol.Item(
+                      input.id(), !copied.isEmpty(), fallbackReason(!copied.isEmpty()), checks);
+                })
+            .toList();
+    if (sameType(outputType, GroundingJudgeProtocol.Batch.class))
+      return new GroundingJudgeProtocol.Batch(items);
+    if (items.size() != 1) throw new IllegalStateException("one fixed candidate required");
+    var item = items.get(0);
+    return new GroundingJudgeProtocol.Decision(item.supported(), item.reason(), item.checks());
+  }
+
+  private static List<GroundingConstraintAudit.Check> copyChecks(
+      GroundingInput input, boolean wiki) {
+    String source = input.source();
+    // Strip only the known rendering prefix, keeping the entire remainder. Never certify a
+    // substring or split away a limiting clause, even when a multi-source response is unavailable.
+    if (wiki) source = source.replaceFirst("^\\[[^\\]\r\n]+\\] ", "");
+    else if (source.startsWith("---\n")) source = source.substring(4);
+    return GroundingConstraintAudit.exactCopyChecks(input.claim(), List.of(source));
+  }
+
+  private static List<GroundingConstraintAudit.Check> unknownChecks(GroundingInput input) {
+    return java.util.Arrays.stream(GroundingConstraintAudit.Dimension.values())
+        .map(
+            dimension ->
+                new GroundingConstraintAudit.Check(
+                    dimension,
+                    GroundingConstraintAudit.Finding.UNKNOWN,
+                    input.claim(),
+                    List.of(),
+                    "Extractive fallback cannot establish a rewritten proposition"))
+        .toList();
+  }
+
+  private static String fallbackReason(boolean same) {
+    return same
+        ? "assistant evidence-only fallback: complete source copied identically"
+        : "assistant evidence-only fallback: semantic support cannot be established";
   }
 
   private static List<FactDecision> uniqueGraphDecisions(List<FactDecision> input) {
@@ -296,22 +406,6 @@ public final class AssistantEvidenceFallbackKnowledgeModel implements KnowledgeM
         unique = new LinkedHashMap<>();
     for (cn.lgs.knowledgebase.application.compilation.WikiCompilationService.FactDecision item :
         input) unique.putIfAbsent(item.factId(), item);
-    return List.copyOf(unique.values());
-  }
-
-  private static List<
-          cn.lgs.knowledgebase.application.compilation.WikiCompilationService.SupportDecisionItem>
-      uniqueWikiSupport(
-          List<
-                  cn.lgs.knowledgebase.application.compilation.WikiCompilationService
-                      .SupportDecisionItem>
-              input) {
-    Map<
-            String,
-            cn.lgs.knowledgebase.application.compilation.WikiCompilationService.SupportDecisionItem>
-        unique = new LinkedHashMap<>();
-    for (cn.lgs.knowledgebase.application.compilation.WikiCompilationService.SupportDecisionItem
-        item : input) unique.putIfAbsent(item.candidateId(), item);
     return List.copyOf(unique.values());
   }
 

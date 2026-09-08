@@ -12,7 +12,12 @@ public final class QueryDomain {
     WAITING_USER,
     ANSWERED,
     INSUFFICIENT,
-    FAILED
+    FAILED;
+
+    /** Persisted transitions have one predecessor; terminal records cannot be resurrected. */
+    public SessionStatus requiredPreviousStatus() {
+      return this == RUNNING ? WAITING_USER : RUNNING;
+    }
   }
 
   public enum TurnRole {
@@ -143,6 +148,23 @@ public final class QueryDomain {
       role = role == null ? TurnRole.SYSTEM_EVENT : role;
       content = content == null ? "" : content;
       createdAt = createdAt == null ? Instant.now() : createdAt;
+    }
+  }
+
+  public record RetrievalReservation(
+      String reservationId,
+      String sessionId,
+      int roundNo,
+      List<String> inputQueries,
+      Instant startedAt) {
+    public RetrievalReservation {
+      if (reservationId == null || reservationId.isBlank())
+        throw new IllegalArgumentException("retrieval reservation id is required");
+      if (sessionId == null || sessionId.isBlank())
+        throw new IllegalArgumentException("retrieval reservation session id is required");
+      if (roundNo <= 0) throw new IllegalArgumentException("retrieval round must be positive");
+      inputQueries = inputQueries == null ? List.of() : List.copyOf(inputQueries);
+      startedAt = startedAt == null ? Instant.now() : startedAt;
     }
   }
 
