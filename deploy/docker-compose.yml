@@ -1,0 +1,217 @@
+# Current local EvoKB deployment. External model and MinerU services are explicit inputs.
+# Distinct project/volume names preserve the legacy and target acceptance deployments.
+name: evokb-local
+
+services:
+  postgres:
+    image: postgres:16.14
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${EKB_POSTGRES_DATABASE:-evokb}
+      POSTGRES_USER: ${EKB_POSTGRES_USER:-evokb}
+      POSTGRES_PASSWORD: ${EKB_POSTGRES_PASSWORD:?configure the local PostgreSQL password}
+    ports:
+      - "127.0.0.1:${EKB_POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 512m
+    cpus: 1
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${EKB_REDIS_PORT:-16379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 256m
+    cpus: 1
+
+  minio:
+    image: pgsty/minio:RELEASE.2026-03-25T00-00-00Z
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${EKB_MINIO_ROOT_USER:?configure the local MinIO user}
+      MINIO_ROOT_PASSWORD: ${EKB_MINIO_ROOT_PASSWORD:?configure the local MinIO password}
+      MINIO_API_CORS_ALLOW_ORIGIN: ${EKB_MINIO_BROWSER_ORIGINS:-http://127.0.0.1:18080,http://localhost:18080}
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:${EKB_MINIO_PORT:-19000}:9000"
+      - "127.0.0.1:${EKB_MINIO_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 512m
+    cpus: 1
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    restart: unless-stopped
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "1073741824"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - -advertise-client-urls=http://etcd:2379
+      - -listen-client-urls
+      - http://0.0.0.0:2379
+      - --data-dir
+      - /etcd
+    volumes:
+      - etcd-data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    mem_limit: 256m
+    cpus: 1
+
+  milvus:
+    image: milvusdb/milvus:v2.6.22@sha256:a8ac051e59eb084d41bd317ec51aac28553d664e91c43a806ccd6a1538abc1df
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${EKB_MINIO_ROOT_USER:?configure the local MinIO user}
+      MINIO_SECRET_ACCESS_KEY: ${EKB_MINIO_ROOT_PASSWORD:?configure the local MinIO password}
+      MINIO_BUCKET_NAME: ${EKB_MILVUS_BUCKET:-evokb-milvus}
+      MQ_TYPE: woodpecker
+    volumes:
+      - milvus-data:/var/lib/milvus
+    ports:
+      - "127.0.0.1:${EKB_MILVUS_PORT:-19530}:19530"
+      - "127.0.0.1:${EKB_MILVUS_HEALTH_PORT:-19091}:9091"
+    depends_on:
+      etcd: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9091/healthz"]
+      interval: 10s
+      start_period: 90s
+      timeout: 5s
+      retries: 30
+    mem_limit: 2048m
+    cpus: 2
+
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ${EKB_APP_IMAGE:-evokb:local}
+    restart: unless-stopped
+    environment:
+      # Listen on the private container network; published host ports remain loopback.
+      EKB_SERVER_HOST: 0.0.0.0
+      EKB_SERVER_PORT: 18080
+      EKB_JDBC_URL: jdbc:postgresql://postgres:5432/${EKB_POSTGRES_DATABASE:-evokb}?stringtype=unspecified
+      EKB_DB_USER: ${EKB_POSTGRES_USER:-evokb}
+      EKB_DB_PASSWORD: ${EKB_POSTGRES_PASSWORD:?configure the local PostgreSQL password}
+      EKB_DB_POOL_SIZE: ${EKB_DB_POOL_SIZE:-6}
+      EKB_REDIS_HOST: redis
+      EKB_REDIS_PORT: 6379
+      EKB_REDIS_DATABASE: 0
+      EKB_RAW_STREAM: ${EKB_RAW_STREAM:-evokb:local:raw:v1}
+      EKB_RAW_STREAM_GROUP: ${EKB_RAW_STREAM_GROUP:-raw-ingestion}
+      EKB_MINIO_ENDPOINT: http://minio:9000
+      EKB_MINIO_PUBLIC_ENDPOINT: ${EKB_MINIO_PUBLIC_ENDPOINT:-http://127.0.0.1:19000}
+      EKB_MINIO_ACCESS_KEY: ${EKB_MINIO_ROOT_USER:?configure the local MinIO user}
+      EKB_MINIO_SECRET_KEY: ${EKB_MINIO_ROOT_PASSWORD:?configure the local MinIO password}
+      EKB_MINIO_BUCKET: ${EKB_MINIO_BUCKET:-enterprise-kb}
+      EKB_MINIO_REGION: ${EKB_MINIO_REGION:-us-east-1}
+      EKB_MILVUS_URL: http://milvus:19530
+      EKB_MILVUS_COLLECTION: ${EKB_MILVUS_COLLECTION:-knowledge_chunks}
+      EKB_MILVUS_TOKEN: ${EKB_MILVUS_TOKEN:-}
+      EKB_KNOWLEDGE_BASE_ID: ${EKB_KNOWLEDGE_BASE_ID:-enterprise}
+      # Existing external MinerU 3.4.5 and approved model endpoints; no model containers/downloads.
+      EKB_MINERU_URL: ${EKB_MINERU_URL:-}
+      EKB_MINERU_VERSION: "3.4.5"
+      EKB_MINERU_BACKEND: hybrid-engine
+      EKB_MINERU_EFFORT: medium
+      EKB_MINERU_PARSE_METHOD: auto
+      EKB_MINERU_LANGUAGE: ${EKB_MINERU_LANGUAGE:-ch}
+      EKB_MINERU_POLL_MS: ${EKB_MINERU_POLL_MS:-500}
+      EKB_MINERU_TASK_TIMEOUT_SECONDS: 600
+      EKB_MINERU_MAX_FILE_BYTES: 268435456
+      EKB_CHAT_BASE_URL: ${EKB_CHAT_BASE_URL:-}
+      EKB_CHAT_API_KEY: ${EKB_CHAT_API_KEY:-}
+      EKB_CHAT_PROXY_HOST: ${EKB_CHAT_PROXY_HOST:-}
+      EKB_CHAT_PROXY_PORT: ${EKB_CHAT_PROXY_PORT:-}
+      EKB_SMALL_MODEL: gpt-5.6-luna
+      EKB_LARGE_MODEL: gpt-5.6-terra
+      EKB_CHAT_TIMEOUT_SECONDS: ${EKB_CHAT_TIMEOUT_SECONDS:-120}
+      EKB_ASSISTANT_FALLBACK: disabled
+      EKB_QUERY_CONTEXT_CHARS: ${EKB_QUERY_CONTEXT_CHARS:-24000}
+      EKB_EMBEDDING_BASE_URL: ${EKB_EMBEDDING_BASE_URL:-}
+      EKB_EMBEDDING_API_KEY: ${EKB_EMBEDDING_API_KEY:-}
+      EKB_EMBEDDING_MODEL: Qwen/Qwen3-VL-Embedding-2B
+      EKB_EMBED_DIMS: 1024
+      EKB_EMBED_BATCH_SIZE: ${EKB_EMBED_BATCH_SIZE:-16}
+      EKB_EMBED_TIMEOUT_SECONDS: ${EKB_EMBED_TIMEOUT_SECONDS:-120}
+      EKB_EMBED_MAX_CONCURRENCY: ${EKB_EMBED_MAX_CONCURRENCY:-1}
+      EKB_EMBED_TOKENIZER_MANIFEST: ${EKB_EMBED_TOKENIZER_MANIFEST:-}
+      EKB_RERANK_BASE_URL: ${EKB_RERANK_BASE_URL:-}
+      EKB_RERANK_API_KEY: ${EKB_RERANK_API_KEY:-}
+      EKB_RERANK_MODEL: Qwen/Qwen3-VL-Reranker-2B
+      EKB_RERANK_TIMEOUT_SECONDS: ${EKB_RERANK_TIMEOUT_SECONDS:-30}
+      EKB_RERANK_MAX_CONCURRENCY: ${EKB_RERANK_MAX_CONCURRENCY:-1}
+      EKB_RERANK_MAX_CHARS: ${EKB_RERANK_MAX_CHARS:-400}
+      EKB_RERANK_MAX_CANDIDATES: ${EKB_RERANK_MAX_CANDIDATES:-20}
+      EKB_WEB_DIR: /app/web
+      EKB_SESSION_TTL_HOURS: ${EKB_SESSION_TTL_HOURS:-12}
+      EKB_SESSION_COOKIE_SECURE: ${EKB_SESSION_COOKIE_SECURE:-false}
+      EKB_TRUST_PROXY_HEADERS: false
+      EKB_MAX_UPLOAD_BYTES: 268435456
+      EKB_MAX_BATCH_UPLOAD_MIB: ${EKB_MAX_BATCH_UPLOAD_MIB:-4096}
+      EKB_MAX_BATCH_EXPANDED_MIB: ${EKB_MAX_BATCH_EXPANDED_MIB:-16384}
+      EKB_MAX_BATCH_FILES: ${EKB_MAX_BATCH_FILES:-2000}
+      EKB_INGEST_POLL_MS: ${EKB_INGEST_POLL_MS:-1000}
+      EKB_INGEST_CLAIM_LIMIT: ${EKB_INGEST_CLAIM_LIMIT:-1}
+      EKB_INGEST_WORKERS: ${EKB_INGEST_WORKERS:-3}
+      EKB_STAGING_ROOT: /var/lib/enterprise-kb/staging
+      JAVA_TOOL_OPTIONS: -Xms128m -Xmx512m -XX:ActiveProcessorCount=2
+    ports:
+      - "127.0.0.1:${EKB_SERVER_PORT:-18080}:18080"
+    volumes:
+      - server-staging:/var/lib/enterprise-kb/staging
+      # Only the six frozen tokenizer assets and their manifest belong here, not model weights.
+      - ${EKB_TOKENIZER_ASSETS_DIR:-./tokenizer}:/app/tokenizer:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      milvus: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/18080'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    mem_limit: 1024m
+    cpus: 2
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  etcd-data:
+  milvus-data:
+  server-staging:

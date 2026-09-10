@@ -1,0 +1,187 @@
+# Keep the legacy Compose project ID so existing volumes remain attached after the EvoKB rename.
+name: enterprise-knowledge-base
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${EKB_MYSQL_DATABASE:-enterprise_kb}
+      MYSQL_USER: ${EKB_MYSQL_USER:-ekb}
+      MYSQL_PASSWORD: ${EKB_MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${EKB_MYSQL_ROOT_PASSWORD}
+    ports:
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_MYSQL_PORT:-23316}:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  minio:
+    image: pgsty/minio:RELEASE.2026-03-25T00-00-00Z
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${EKB_MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${EKB_MINIO_ROOT_PASSWORD}
+      MINIO_API_CORS_ALLOW_ORIGIN: ${EKB_MINIO_BROWSER_ORIGINS:-http://127.0.0.1:18481,http://localhost:18481}
+    command: server /data --console-address ":9001"
+    ports:
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_MINIO_PORT:-19000}:9000"
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_MINIO_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  opensearch:
+    image: opensearchproject/opensearch:2.19.3
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: ${EKB_OPENSEARCH_JAVA_OPTS:--Xms512m -Xmx512m}
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_OPENSEARCH_PORT:-19200}:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  neo4j:
+    image: neo4j:5.26.12-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${EKB_NEO4J_AUTH}
+      NEO4J_server_memory_heap_initial__size: ${EKB_NEO4J_HEAP_INITIAL:-256m}
+      NEO4J_server_memory_heap_max__size: ${EKB_NEO4J_HEAP_MAX:-512m}
+      NEO4J_server_memory_pagecache_size: ${EKB_NEO4J_PAGECACHE:-256m}
+    ports:
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_NEO4J_HTTP_PORT:-17474}:7474"
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_NEO4J_BOLT_PORT:-17687}:7687"
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: evokb:latest
+    restart: unless-stopped
+    environment:
+      EKB_JDBC_URL: jdbc:mysql://mysql:3306/${EKB_MYSQL_DATABASE:-enterprise_kb}?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
+      EKB_MYSQL_USER: ${EKB_MYSQL_USER:-ekb}
+      EKB_MYSQL_PASSWORD: ${EKB_MYSQL_PASSWORD}
+      EKB_MYSQL_POOL_SIZE: ${EKB_MYSQL_POOL_SIZE:-20}
+      EKB_MINIO_ENDPOINT: http://minio:9000
+      EKB_MINIO_PUBLIC_ENDPOINT: ${EKB_MINIO_PUBLIC_ENDPOINT:-http://127.0.0.1:19000}
+      EKB_MINIO_REGION: ${EKB_MINIO_REGION:-us-east-1}
+      EKB_MINIO_ACCESS_KEY: ${EKB_MINIO_ROOT_USER}
+      EKB_MINIO_SECRET_KEY: ${EKB_MINIO_ROOT_PASSWORD}
+      EKB_MINIO_BUCKET: ${EKB_MINIO_BUCKET:-enterprise-kb}
+      EKB_OPENSEARCH_URL: http://opensearch:9200
+      EKB_RAW_INDEX: ${EKB_RAW_INDEX:-ekb_raw_v1}
+      EKB_DERIVED_INDEX: ${EKB_DERIVED_INDEX:-ekb_derived_v1}
+      EKB_NEO4J_URL: http://neo4j:7474
+      EKB_NEO4J_AUTH: ${EKB_NEO4J_AUTH}
+      EKB_NEO4J_DATABASE: ${EKB_NEO4J_DATABASE:-neo4j}
+      EKB_MINERU_URL: ${EKB_MINERU_URL}
+      EKB_MINERU_POLL_MS: ${EKB_MINERU_POLL_MS:-500}
+      EKB_MINERU_TASK_TIMEOUT_SECONDS: ${EKB_MINERU_TASK_TIMEOUT_SECONDS:-14400}
+      EKB_MINERU_PARSE_METHOD: ${EKB_MINERU_PARSE_METHOD:-auto}
+      EKB_MINERU_LANGUAGE: ${EKB_MINERU_LANGUAGE:-ch}
+      EKB_CHAT_BASE_URL: ${EKB_CHAT_BASE_URL:-}
+      EKB_CHAT_API_KEY: ${EKB_CHAT_API_KEY:-}
+      # Optional host proxy for providers that reject direct Linux-container TLS handshakes.
+      # Leave blank in deployments without a proxy; the application then connects directly.
+      EKB_CHAT_PROXY_HOST: ${EKB_CHAT_PROXY_HOST:-}
+      EKB_CHAT_PROXY_PORT: ${EKB_CHAT_PROXY_PORT:-}
+      EKB_SMALL_MODEL: ${EKB_SMALL_MODEL:-}
+      EKB_LARGE_MODEL: ${EKB_LARGE_MODEL:-}
+      EKB_CHAT_TIMEOUT_SECONDS: ${EKB_CHAT_TIMEOUT_SECONDS:-120}
+      # Optional extractive fallback for compilation only; disabled unless explicitly enabled.
+      EKB_ASSISTANT_FALLBACK: ${EKB_ASSISTANT_FALLBACK:-disabled}
+      EKB_QUERY_CONTEXT_CHARS: ${EKB_QUERY_CONTEXT_CHARS:-24000}
+      EKB_EMBEDDING_BASE_URL: ${EKB_EMBEDDING_BASE_URL:-}
+      EKB_EMBEDDING_API_KEY: ${EKB_EMBEDDING_API_KEY:-}
+      EKB_EMBEDDING_MODEL: ${EKB_EMBEDDING_MODEL:-}
+      EKB_EMBED_DIMS: ${EKB_EMBED_DIMS:-1024}
+      EKB_EMBED_BATCH_SIZE: ${EKB_EMBED_BATCH_SIZE:-16}
+      EKB_EMBED_TIMEOUT_SECONDS: ${EKB_EMBED_TIMEOUT_SECONDS:-120}
+      EKB_EMBED_MAX_CONCURRENCY: ${EKB_EMBED_MAX_CONCURRENCY:-1}
+      EKB_RERANK_BASE_URL: ${EKB_RERANK_BASE_URL:-}
+      EKB_RERANK_API_KEY: ${EKB_RERANK_API_KEY:-}
+      EKB_RERANK_MODEL: ${EKB_RERANK_MODEL:-}
+      EKB_RERANK_TIMEOUT_SECONDS: ${EKB_RERANK_TIMEOUT_SECONDS:-30}
+      EKB_RERANK_MAX_CONCURRENCY: ${EKB_RERANK_MAX_CONCURRENCY:-1}
+      EKB_RERANK_MAX_CHARS: ${EKB_RERANK_MAX_CHARS:-400}
+      EKB_RERANK_MAX_CANDIDATES: ${EKB_RERANK_MAX_CANDIDATES:-20}
+      EKB_SERVER_PORT: 18080
+      EKB_WEB_DIR: /app/web
+      EKB_SESSION_TTL_HOURS: ${EKB_SESSION_TTL_HOURS:-12}
+      EKB_SESSION_COOKIE_SECURE: ${EKB_SESSION_COOKIE_SECURE:-false}
+      EKB_TRUST_PROXY_HEADERS: ${EKB_TRUST_PROXY_HEADERS:-false}
+      EKB_MAX_UPLOAD_BYTES: ${EKB_MAX_UPLOAD_BYTES:-536870912}
+      EKB_MAX_BATCH_UPLOAD_MIB: ${EKB_MAX_BATCH_UPLOAD_MIB:-4096}
+      EKB_MAX_BATCH_EXPANDED_MIB: ${EKB_MAX_BATCH_EXPANDED_MIB:-16384}
+      EKB_MAX_BATCH_FILES: ${EKB_MAX_BATCH_FILES:-2000}
+      EKB_INGEST_POLL_MS: ${EKB_INGEST_POLL_MS:-1000}
+      EKB_INGEST_CLAIM_LIMIT: ${EKB_INGEST_CLAIM_LIMIT:-1}
+      EKB_STAGING_ROOT: /var/lib/enterprise-kb/staging
+      EKB_GENERATION_EFFECTIVE_HIT_THRESHOLD: ${EKB_GENERATION_EFFECTIVE_HIT_THRESHOLD:-3}
+    ports:
+      - "${EKB_BIND_ADDRESS:-127.0.0.1}:${EKB_SERVER_PORT:-18080}:18080"
+    volumes:
+      - server-staging:/var/lib/enterprise-kb/staging
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/18080'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  mysql-data:
+  minio-data:
+  opensearch-data:
+  neo4j-data:
+  server-staging:
