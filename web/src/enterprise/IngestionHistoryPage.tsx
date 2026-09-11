@@ -7,11 +7,15 @@ import {
   type EnterpriseIngestionFile,
 } from '../lib/api';
 import { BatchUploadDialog } from './BatchUploadDialog';
+import { DocumentReparseDialog, reparseResultMessage, type DocumentReparseResult } from './DocumentReparseDialog';
+import { IngestionFailure } from './IngestionFailure';
+import { usePageRefresh } from './PageRefresh';
 import { EmptyState, Icon, LoadingBlock, PrimaryButton, SectionTitle, StatusBadge, formatDate } from './ui';
 import type { EnterpriseSection } from './EnterpriseShell';
 
-export function IngestionHistoryPage({ isAdmin, canUpload, onNavigate, onError }: {
+export function IngestionHistoryPage({ isAdmin, securityClearance, canUpload, onNavigate, onError }: {
   isAdmin: boolean;
+  securityClearance: number;
   canUpload: boolean;
   onNavigate: (section: EnterpriseSection) => void;
   onError: (message: string) => void;
@@ -27,6 +31,8 @@ export function IngestionHistoryPage({ isAdmin, canUpload, onNavigate, onError }
   const [retrying, setRetrying] = useState('');
   const [uploadOpen, setUploadOpen] = useState(false);
   const [resumeBatchId, setResumeBatchId] = useState('');
+  const [reparseTarget, setReparseTarget] = useState<EnterpriseIngestionFile | null>(null);
+  const [reparseResult, setReparseResult] = useState<DocumentReparseResult | null>(null);
   const pageSize = 20;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
 
@@ -45,11 +51,11 @@ export function IngestionHistoryPage({ isAdmin, canUpload, onNavigate, onError }
     }
   };
 
-  const openBatch = async (batch: EnterpriseIngestionBatch) => {
-    setSelected(batch);
+  const openBatch = async (batch: EnterpriseIngestionBatch | string) => {
+    if (typeof batch !== 'string') setSelected(batch);
     setDetailLoading(true);
     try {
-      setSelected(await fetchEnterpriseBatch(batch.batch_id));
+      setSelected(await fetchEnterpriseBatch(typeof batch === 'string' ? batch : batch.batch_id));
       onError('');
     } catch (err) {
       onError(String(err instanceof Error ? err.message : err));
@@ -73,14 +79,43 @@ export function IngestionHistoryPage({ isAdmin, canUpload, onNavigate, onError }
   };
 
   useEffect(() => { void load(1, 'ALL'); }, []);
+  usePageRefresh(async () => {
+    await load(page, status);
+    if (selected) await openBatch(selected);
+  });
+
+  const processing = batches.some(batch => batch.queued_count > 0 || batch.running_count > 0);
+  useEffect(() => {
+    if (!processing) return;
+    let cancelled = false;
+    let pending = false;
+    const timer = window.setInterval(async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const data = await fetchEnterpriseBatches({ page, page_size: pageSize, q: query.trim() || undefined, status });
+        const detail = selected ? await fetchEnterpriseBatch(selected.batch_id) : null;
+        if (cancelled) return;
+        setBatches(data.batches || []);
+        setTotal(data.total || 0);
+        if (detail) setSelected(detail);
+      } catch (err) {
+        if (!cancelled) onError(String(err instanceof Error ? err.message : err));
+      } finally {
+        pending = false;
+      }
+    }, 2000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [processing, page, status, query, selected?.batch_id]);
 
   return <div class="space-y-6">
+    {reparseResult && <div role="status" aria-label="重新解析状态" class="rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-200">{reparseResultMessage(reparseResult)}<button class="ml-3 underline" onClick={() => void openBatch(reparseResult.batch_id)}>查看处理记录</button></div>}
     <section class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
       <SectionTitle title={isAdmin ? '入库记录' : '上传记录'} action={canUpload ? <PrimaryButton onClick={() => setUploadOpen(true)} icon="upload">上传资料</PrimaryButton> : undefined} />
       <div class="mt-5 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div class="relative min-w-0 flex-1 lg:max-w-xl">
           <Icon name="search" size={16} class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-          <input value={query} onInput={event => setQuery((event.target as HTMLInputElement).value)} onKeyDown={event => { if (event.key === 'Enter') void load(1); }} placeholder="搜索批次或文件" class="w-full rounded-xl border border-slate-200 bg-slate-50 py-2.5 pl-9 pr-3 text-sm outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950" />
+          <input aria-label="搜索入库记录" value={query} onInput={event => setQuery((event.target as HTMLInputElement).value)} onKeyDown={event => { if (event.key === 'Enter') void load(1); }} placeholder="搜索批次或文件" class="w-full rounded-xl border border-slate-200 bg-slate-50 py-2.5 pl-9 pr-3 text-sm outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950" />
         </div>
         <div class="flex gap-2 overflow-x-auto">{['ALL', 'STAGED', 'QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED'].map(item => <button key={item} onClick={() => { setStatus(item); void load(1, item); }} class={`whitespace-nowrap rounded-xl px-3 py-2 text-xs font-semibold transition ${status === item ? 'bg-blue-600 text-white shadow-sm shadow-blue-600/15 dark:bg-blue-500' : 'bg-slate-100 text-slate-500 hover:bg-blue-50 hover:text-blue-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-blue-950/30 dark:hover:text-blue-300'}`}>{batchStatusLabel(item)}</button>)}</div>
       </div>
@@ -102,19 +137,23 @@ export function IngestionHistoryPage({ isAdmin, canUpload, onNavigate, onError }
       </div>
 
       <aside class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-        {!selected ? <EmptyState icon="documents" title="选择一条记录" description="查看这次入库中的文件和处理状态。" /> : detailLoading ? <LoadingBlock rows={6} /> : <BatchDetail batch={selected} isAdmin={isAdmin} retrying={retrying} onRetry={retry} onNavigate={onNavigate} onResume={() => setResumeBatchId(selected.batch_id)} />}
+        {!selected ? <EmptyState icon="documents" title="选择一条记录" description="查看这次入库中的文件和处理状态。" /> : detailLoading ? <LoadingBlock rows={6} /> : <BatchDetail batch={selected} isAdmin={isAdmin} retrying={retrying} onRetry={retry} onReparse={file => { setReparseResult(null); setReparseTarget(file); }} onNavigate={onNavigate} onResume={() => setResumeBatchId(selected.batch_id)} />}
       </aside>
     </section>
-    {uploadOpen && <BatchUploadDialog onClose={() => setUploadOpen(false)} onChanged={() => { setUploadOpen(false); void load(1, 'ALL'); }} onError={onError} />}
-    {resumeBatchId && <BatchUploadDialog initialBatchId={resumeBatchId} onClose={() => setResumeBatchId('')} onChanged={() => { setResumeBatchId(''); void load(page, status); if (selected) void openBatch(selected); }} onError={onError} />}
+    {uploadOpen && <BatchUploadDialog isAdmin={isAdmin} securityClearance={securityClearance} onClose={() => setUploadOpen(false)} onChanged={() => { void load(1, 'ALL'); }} onError={onError} />}
+    {resumeBatchId && <BatchUploadDialog isAdmin={isAdmin} securityClearance={securityClearance} initialBatchId={resumeBatchId} onClose={() => setResumeBatchId('')} onChanged={() => { void load(page, status); if (selected) void openBatch(selected); }} onError={onError} />}
+    {isAdmin && reparseTarget?.version_id && <DocumentReparseDialog versionId={reparseTarget.version_id}
+      logicalName={reparseTarget.logical_name || reparseTarget.original_filename} onClose={() => setReparseTarget(null)}
+      onError={onError} onSubmitted={result => { setReparseTarget(null); setReparseResult(result); }}/>}
   </div>;
 }
 
-function BatchDetail({ batch, isAdmin, retrying, onRetry, onNavigate, onResume }: {
+function BatchDetail({ batch, isAdmin, retrying, onRetry, onReparse, onNavigate, onResume }: {
   batch: EnterpriseIngestionBatch;
   isAdmin: boolean;
   retrying: string;
   onRetry: (file: EnterpriseIngestionFile) => Promise<void>;
+  onReparse: (file: EnterpriseIngestionFile) => void;
   onNavigate: (section: EnterpriseSection) => void;
   onResume: () => void;
 }) {
@@ -124,8 +163,8 @@ function BatchDetail({ batch, isAdmin, retrying, onRetry, onNavigate, onResume }
     <div class="max-h-[58vh] space-y-2 overflow-y-auto pr-1">{(batch.files || []).map(file => <div key={file.file_id} class="rounded-xl border border-slate-100 p-3 dark:border-slate-800">
       <div class="flex items-start justify-between gap-3"><div class="min-w-0 flex-1"><div class="truncate text-sm font-semibold text-slate-700 dark:text-slate-200">{file.logical_name || file.original_filename}</div><div class="mt-1 truncate text-xs text-slate-400">{file.original_filename}</div></div><StatusBadge value={file.status} /></div>
       <div class="mt-2 text-xs font-medium text-blue-600 dark:text-blue-400">{ingestionStageLabel(file.progress_stage || file.status)}</div>
-      {file.error_message && <div class="mt-2 rounded-lg bg-rose-50 px-2.5 py-2 text-xs leading-5 text-rose-600 dark:bg-rose-950/30 dark:text-rose-300">{file.error_message}</div>}
-      <div class="mt-3 flex items-center justify-between gap-2"><span class="text-[11px] text-slate-400">{file.version_id ? '已进入资料管理' : `第 ${file.attempt} 次处理`}</span>{file.status === 'FAILED' && <button onClick={() => void onRetry(file)} disabled={retrying === file.file_id} class="rounded-lg border border-rose-200 px-2.5 py-1.5 text-xs font-semibold text-rose-600 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-900">{retrying === file.file_id ? '排队中…' : '重新处理'}</button>}</div>
+      <IngestionFailure file={file} isAdmin={isAdmin} />
+      <div class="mt-3 flex flex-wrap items-center justify-between gap-2"><span class="text-[11px] text-slate-400">{file.version_id ? `${file.status === 'SUCCEEDED' ? '已进入资料管理' : '资料版本已保留'} · ` : ''}第 {file.attempt} 次处理</span><div class="flex flex-wrap gap-2">{file.status === 'FAILED' && isAdmin && file.version_id && <button onClick={() => onReparse(file)} class="rounded-lg border border-blue-200 px-2.5 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-50 dark:border-blue-900 dark:text-blue-300">以当前配置重新解析</button>}{file.status === 'FAILED' && file.error_code !== 'PARSER_IDENTITY_CHANGED' && <button onClick={() => void onRetry(file)} disabled={retrying === file.file_id} class="rounded-lg border border-rose-200 px-2.5 py-1.5 text-xs font-semibold text-rose-600 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-900">{retrying === file.file_id ? '排队中…' : '重新处理'}</button>}</div></div>
     </div>)}{(!batch.files || batch.files.length === 0) && <div class="py-8 text-center text-sm text-slate-400">暂无文件明细</div>}</div>
   </div>;
 }

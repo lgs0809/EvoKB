@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import {
   fetchEnterpriseFacets,
   packageEnterpriseSources,
+  downloadEnterprisePackage,
   searchEnterpriseKnowledge,
   type EnterpriseEvidence,
   type EnterpriseFacets,
@@ -10,6 +11,7 @@ import {
   type EnterpriseSearchResponse,
 } from '../lib/api';
 import { KnowledgeScope } from './KnowledgeScope';
+import { KnowledgeExcerpt } from './KnowledgeMarkdown';
 import { EmptyState, Icon, PrimaryButton, SecondaryButton, SectionTitle } from './ui';
 
 export function SearchPage({ onOpenEvidence, onError }: {
@@ -101,9 +103,9 @@ export function SearchPage({ onOpenEvidence, onError }: {
       <aside class="space-y-4 xl:sticky xl:top-28 xl:self-start">
         <div class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
           <div class="font-semibold">参考资料 <span class="ml-1 text-xs font-normal text-slate-400">{evidence.length} 条</span></div>
-          <div class="mt-4 space-y-2">{evidence.slice(0, 8).map(item => <button key={item.evidence_id} onClick={() => onOpenEvidence(item)} class="flex w-full items-center justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2.5 text-left text-xs hover:bg-slate-100 dark:bg-slate-950/60 dark:hover:bg-slate-800"><div class="min-w-0 flex-1"><div class="flex items-center gap-1.5 font-semibold text-slate-700 dark:text-slate-200"><Icon name="file" size={12} class="shrink-0 text-slate-400"/><span class="truncate">{item.source_filename || '未知文件'}</span></div><div class="mt-1 truncate text-slate-500 dark:text-slate-400">{item.raw_content || '查看原文'}</div></div><Icon name="chevron" size={13} class="shrink-0 text-slate-400"/></button>)}</div>
+          <div class="mt-4 space-y-2">{evidence.slice(0, 8).map(item => <button key={item.evidence_id} onClick={() => onOpenEvidence(item)} class="flex w-full items-center justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2.5 text-left text-xs hover:bg-slate-100 dark:bg-slate-950/60 dark:hover:bg-slate-800"><div class="min-w-0 flex-1"><div class="flex items-center gap-1.5 font-semibold text-slate-700 dark:text-slate-200"><Icon name="file" size={12} class="shrink-0 text-slate-400"/><span class="truncate">{item.source_filename || '未知文件'}</span></div><div class="mt-1 truncate text-slate-500 dark:text-slate-400"><KnowledgeExcerpt value={item.raw_content || '查看原文'} /></div></div><Icon name="chevron" size={13} class="shrink-0 text-slate-400"/></button>)}</div>
           {evidence.length > 0 && <div class="mt-4"><SecondaryButton onClick={() => void packageSources()} disabled={packaging} icon="download">{packaging ? '正在打包…' : '下载参考资料'}</SecondaryButton></div>}
-          {published && <div class="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300"><div class="font-semibold">资料包已生成</div><div class="mt-1">{published.manifest?.versions?.length || 0} 个资料版本</div><a href={published.download_url} target="_blank" rel="noreferrer" class="mt-2 inline-flex items-center gap-1 font-semibold underline underline-offset-2"><Icon name="download" size={13}/>下载 ZIP</a></div>}
+          {published && <div class="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300"><div class="font-semibold">资料包已生成</div><div class="mt-1">{published.manifest?.versions?.length || 0} 个资料版本</div><a href={published.download_url} onClick={event => { event.preventDefault(); void downloadEnterprisePackage(published.download_url).catch(error => onError(error instanceof Error ? error.message : String(error))); }} class="mt-2 inline-flex items-center gap-1 font-semibold underline underline-offset-2"><Icon name="download" size={13}/>下载 ZIP</a></div>}
         </div>
       </aside>
     </section>}

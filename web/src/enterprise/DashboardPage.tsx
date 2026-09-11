@@ -1,6 +1,6 @@
 import type { EnterpriseDocumentVersion, EnterpriseOverview, EnterpriseTask, EnterpriseWiki } from '../lib/api';
 import type { EnterpriseSection } from './EnterpriseShell';
-import { EmptyState, Icon, LoadingBlock, MetricCard, SectionTitle, StatusBadge, formatDate, formatNumber } from './ui';
+import { EmptyState, Icon, LoadingBlock, MetricCard, SectionTitle, StatusBadge, formatDate, formatNumber, processingTypeLabel } from './ui';
 
 export function DashboardPage({ overview, documents, wikis, tasks, onNavigate }: {
   overview: EnterpriseOverview | null;
@@ -26,12 +26,12 @@ export function DashboardPage({ overview, documents, wikis, tasks, onNavigate }:
       <MetricCard label="资料" value={formatNumber(overview.documents)} hint={`${formatNumber(overview.active_versions)} 个可用版本`} icon="documents" tone="blue" />
       <MetricCard label="知识片段" value={formatNumber(overview.raw_blocks)} hint={`${formatNumber(overview.active_evidence)} 条有效证据`} icon="layers" tone="emerald" />
       <MetricCard label="企业百科" value={formatNumber(overview.active_wikis || activeWiki)} hint={`${formatNumber(overview.stale_wikis)} 个待更新`} icon="wiki" tone="violet" />
-      <MetricCard label="关系" value={formatNumber(overview.active_relations)} hint={`${formatNumber(overview.effective_hits)} 次有效引用`} icon="graph" tone="amber" />
+      <MetricCard label="关系" value={formatNumber(overview.active_relations)} hint={`${formatNumber(overview.effective_hits)} 次有效下载`} icon="graph" tone="amber" />
     </section>
 
     <section class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:p-6">
       <SectionTitle title="需要关注" />
-      {attention.length > 0 ? <div class="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-5">{attention.map(item => <button key={item.label} onClick={() => onNavigate(item.section)} class="group rounded-2xl border border-slate-200 p-4 text-left transition hover:-translate-y-0.5 hover:border-blue-300 hover:shadow-sm dark:border-slate-800"><div class="flex items-start justify-between gap-3"><div class={`flex h-9 w-9 items-center justify-center rounded-xl ${attentionTone(item.tone)}`}><Icon name={item.tone === 'rose' ? 'warning' : item.tone === 'violet' ? 'wiki' : item.tone === 'blue' ? 'sparkles' : 'clock'} size={17}/></div><span class="text-2xl font-semibold">{formatNumber(item.count)}</span></div><div class="mt-3 text-sm font-semibold text-slate-700 dark:text-slate-200">{item.label}</div><div class="mt-1 text-xs text-slate-400">{item.detail}</div></button>)}</div> : <div class="mt-5 flex items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-300"><Icon name="check" size={18}/><span class="font-semibold">暂无待处理事项</span></div>}
+      {attention.length > 0 ? <div class="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-5">{attention.map(item => <button key={item.label} onClick={() => onNavigate(item.section)} class="group rounded-2xl border border-slate-200 p-4 text-left transition hover:-translate-y-0.5 hover:border-blue-300 hover:shadow-sm dark:border-slate-800"><div class="flex items-start justify-between gap-3"><div class={`flex h-9 w-9 items-center justify-center rounded-xl ${attentionTone(item.tone)}`}><Icon name={item.tone === 'rose' ? 'warning' : item.tone === 'violet' ? 'wiki' : item.tone === 'blue' ? 'sparkles' : 'clock'} size={17}/></div><span class="text-2xl font-semibold">{formatNumber(item.count)}</span></div><div class="mt-3 text-sm font-semibold text-slate-700 dark:text-slate-200">{item.label}</div><div class="mt-1 text-xs text-slate-400">{item.detail}</div></button>)}</div> : <div class="mt-5 flex items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-300"><Icon name="check" size={18}/><span class="font-semibold">资料版本暂无失败，摘要、百科和推荐生成暂无待办。历史任务可在处理记录查看。</span></div>}
     </section>
 
     <section class="grid gap-6 xl:grid-cols-[1.2fr_.8fr]">
@@ -49,9 +49,10 @@ export function DashboardPage({ overview, documents, wikis, tasks, onNavigate }:
 
       <div class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:p-6">
         <SectionTitle title="知识质量" />
+        <p class="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">以下核验统计记录产物生成时的结果。需要按当前规则复核时，可在资料库重新生成知识。</p>
         <div class="mt-6 space-y-5">
-          <HealthBar label="摘要事实校验" value={overview.grounded_summaries} total={overview.active_summaries} />
-          <HealthBar label="摘要完整性" value={overview.covered_summaries} total={overview.active_summaries} />
+          <HealthBar label="摘要历史依据核验" value={overview.grounded_summaries} total={overview.active_summaries} />
+          <HealthBar label="摘要历史覆盖核验" value={overview.covered_summaries} total={overview.active_summaries} />
           <HealthBar label="可用版本" value={overview.active_versions} total={Math.max(overview.versions, overview.active_versions)} />
         </div>
         <div class="mt-6 grid grid-cols-3 gap-2 border-t border-slate-100 pt-5 text-center dark:border-slate-800">
@@ -69,21 +70,21 @@ export function DashboardPage({ overview, documents, wikis, tasks, onNavigate }:
           {popular.map((doc, i) => <div key={doc.version_id} class="flex items-center gap-3 rounded-xl border border-slate-100 px-3 py-3 dark:border-slate-800">
             <div class="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-100 text-xs font-semibold text-slate-500 dark:bg-slate-800">{i + 1}</div>
             <div class="min-w-0 flex-1"><div class="truncate text-sm font-medium">{doc.logical_name}</div><div class="text-xs text-slate-400">v{doc.version_no} · {doc.document_type || doc.source_department || '企业资料'}</div></div>
-            <div class="text-right"><div class="text-sm font-semibold">{doc.effective_hits}</div><div class="text-[10px] text-slate-400">引用</div></div>
+            <div class="text-right"><div class="text-sm font-semibold">{doc.effective_hits}</div><div class="text-[10px] text-slate-400">下载</div></div>
           </div>)}
-          {popular.length === 0 && <EmptyState icon="activity" title="暂无热门资料" description="有实际引用后会在这里显示。" />}
+          {popular.length === 0 && <EmptyState icon="activity" title="暂无热门资料" description="最近30天有回答资料包下载贡献后会在这里显示。" />}
         </div>
       </div>
 
       <div class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:p-6">
-        <SectionTitle title="最近知识生成" action={<button onClick={() => onNavigate('tasks')} class="text-sm font-medium text-blue-600 dark:text-blue-400">查看全部</button>} />
+        <SectionTitle title="最近处理记录" action={<button onClick={() => onNavigate('tasks')} class="text-sm font-medium text-blue-600 dark:text-blue-400">查看全部</button>} />
         <div class="mt-5 space-y-2">
           {recentTasks.map(task => <div key={task.task_id} class="flex items-center gap-3 rounded-xl border border-slate-100 px-3 py-3 dark:border-slate-800">
             <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-100 text-slate-500 dark:bg-slate-800"><Icon name={task.status === 'FAILED' ? 'warning' : task.status === 'RUNNING' ? 'activity' : 'tasks'} size={17}/></div>
-            <div class="min-w-0 flex-1"><div class="truncate text-sm font-medium">{task.logical_name || task.task_type}</div><div class="text-xs text-slate-400">{formatDate(task.created_at)}</div></div>
+            <div class="min-w-0 flex-1"><div class="truncate text-sm font-medium">{task.logical_name || task.task_type}</div><div class="text-xs text-slate-400">{processingTypeLabel(task.task_type)} · {formatDate(task.created_at)}</div></div>
             <StatusBadge value={task.status}/>
           </div>)}
-          {recentTasks.length === 0 && <EmptyState icon="sparkles" title="暂无知识生成记录" description="生成摘要、关系或企业百科后会显示在这里。" />}
+          {recentTasks.length === 0 && <EmptyState icon="tasks" title="暂无处理记录" description="资料解析与知识生成的处理进度会显示在这里。" />}
         </div>
       </div>
     </section>

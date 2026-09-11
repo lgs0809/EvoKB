@@ -1,0 +1,6 @@
+export function classificationLabel(value?: number | null) {
+  return value == null ? '沿用原资料（新资料公开）' : ({10: '公开资料', 20: '内部资料', 30: '保密资料', 40: '严格保密资料'} as Record<number, string>)[value] || `安全等级 ${value}`;
+}
+export function ClassificationField({ value, disabled, securityClearance, onChange, inheritLabel = '沿用原资料（新资料公开）' }: { value: string; disabled: boolean; securityClearance: number; onChange: (value: string) => void; inheritLabel?: string }) {
+  return <label class="text-xs font-medium text-slate-500">访问范围<select aria-label="资料访问范围" value={value} disabled={disabled} onChange={event => onChange((event.target as HTMLSelectElement).value)} class="mt-1.5 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm dark:border-slate-700 dark:bg-slate-950"><option value="">{inheritLabel}</option>{[10, 20, 30, 40].map(level => <option key={level} value={level} disabled={level > securityClearance}>{classificationLabel(level)}{level > securityClearance ? '（超出当前权限）' : ''}</option>)}{value && !['10', '20', '30', '40'].includes(value) && <option value={value} disabled={Number(value) > securityClearance}>{classificationLabel(Number(value))}{Number(value) > securityClearance ? '（超出当前权限）' : ''}</option>}</select></label>;
+}

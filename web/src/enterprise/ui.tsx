@@ -61,12 +61,13 @@ export function StatusBadge({ value }: { value: string }) {
   const normalized = (value || 'UNKNOWN').toUpperCase();
   const labels: Record<string, string> = {
     ACTIVE: '可用', PASS: '通过', SUCCEEDED: '已完成', RECOMMENDED: '建议生成', READY: '就绪',
-    PENDING: '等待处理', RUNNING: '处理中', STALE: '需要更新', UNDER_REVIEW: '检查中', STAGED: '待确认', QUEUED: '排队中',
+    ANSWERED: '已回答', INSUFFICIENT: '证据有限', WAITING_USER: '待补充问题',
+    PENDING: '等待处理', RETRY_WAIT: '等待自动重试', RUNNING: '处理中', STALE: '需要更新', UNDER_REVIEW: '检查中', STAGED: '待确认', QUEUED: '排队中',
     FAILED: '失败', FAIL: '未通过', INACTIVE: '已停用', CANCELLED: '已取消', CONFLICT: '冲突',
     ADMIN: '管理员', USER: '普通用户', DISABLED: '已禁用', PARTIAL: '部分完成',
   };
-  const good = ['ACTIVE', 'PASS', 'SUCCEEDED', 'RECOMMENDED', 'READY'].includes(normalized);
-  const warn = ['PENDING', 'RUNNING', 'STALE', 'UNDER_REVIEW', 'STAGED', 'QUEUED', 'PARTIAL'].includes(normalized);
+  const good = ['ACTIVE', 'PASS', 'SUCCEEDED', 'RECOMMENDED', 'READY', 'ANSWERED'].includes(normalized);
+  const warn = ['PENDING', 'RETRY_WAIT', 'RUNNING', 'STALE', 'UNDER_REVIEW', 'STAGED', 'QUEUED', 'PARTIAL', 'INSUFFICIENT', 'WAITING_USER'].includes(normalized);
   const bad = ['FAILED', 'FAIL', 'INACTIVE', 'CANCELLED', 'CONFLICT', 'DISABLED'].includes(normalized);
   const tone = good
     ? 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/70 dark:bg-emerald-950/60 dark:text-emerald-300'
@@ -75,7 +76,7 @@ export function StatusBadge({ value }: { value: string }) {
       : bad
         ? 'border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/70 dark:bg-rose-950/60 dark:text-rose-300'
         : 'border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300';
-  return <span class={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold tracking-wide ${tone}`}><span class="h-1.5 w-1.5 rounded-full bg-current opacity-70" />{labels[normalized] || normalized}</span>;
+  return <span class={`inline-flex max-w-full items-center gap-1 rounded-full border [overflow-wrap:anywhere] px-2.5 py-1 text-[11px] font-semibold tracking-wide ${tone}`}><span class="h-1.5 w-1.5 shrink-0 rounded-full bg-current opacity-70" />{labels[normalized] || normalized}</span>;
 }
 
 export function MetricCard({ label, value, hint, icon, tone = 'blue' }: { label: string; value: string | number; hint?: string; icon: IconName; tone?: 'blue' | 'emerald' | 'amber' | 'violet' }) {
@@ -85,11 +86,11 @@ export function MetricCard({ label, value, hint, icon, tone = 'blue' }: { label:
     amber: 'bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300',
     violet: 'bg-violet-50 text-violet-700 dark:bg-violet-950/50 dark:text-violet-300',
   }[tone];
-  return <div class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm shadow-slate-200/30 dark:border-slate-800 dark:bg-slate-900 dark:shadow-none"><div class="flex items-start justify-between gap-4"><div><div class="text-sm font-medium text-slate-500 dark:text-slate-400">{label}</div><div class="mt-2 text-3xl font-semibold tracking-tight text-slate-950 dark:text-white">{value}</div>{hint && <div class="mt-1 text-xs text-slate-400">{hint}</div>}</div><div class={`rounded-xl p-2.5 ${colors}`}><Icon name={icon} size={20} /></div></div></div>;
+  return <div class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm shadow-slate-200/30 dark:border-slate-800 dark:bg-slate-900 dark:shadow-none"><div class="flex items-start justify-between gap-4"><div class="min-w-0"><div class="text-sm font-medium text-slate-500 dark:text-slate-400">{label}</div><div class="mt-2 text-3xl font-semibold tracking-tight text-slate-950 dark:text-white">{value}</div>{hint && <div class="mt-1 text-xs text-slate-400">{hint}</div>}</div><div class={`rounded-xl p-2.5 ${colors}`}><Icon name={icon} size={20} /></div></div></div>;
 }
 
 export function SectionTitle({ eyebrow, title, description, action }: { eyebrow?: string; title: string; description?: string; action?: ComponentChildren }) {
-  return <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between"><div>{eyebrow && <div class="mb-1 text-xs font-semibold tracking-[0.14em] text-blue-600 dark:text-blue-400">{eyebrow}</div>}<h2 class="text-xl font-semibold tracking-tight text-slate-950 dark:text-white">{title}</h2>{description && <p class="mt-1 max-w-3xl text-sm leading-6 text-slate-500 dark:text-slate-400">{description}</p>}</div>{action}</div>;
+  return <div class="flex flex-col gap-3 flex-wrap sm:flex-row sm:items-end sm:justify-between"><div class="min-w-0 sm:flex-1">{eyebrow && <div class="mb-1 text-xs font-semibold tracking-[0.14em] text-blue-600 dark:text-blue-400">{eyebrow}</div>}<h2 class="text-xl font-semibold tracking-tight text-slate-950 dark:text-white">{title}</h2>{description && <p class="mt-1 max-w-3xl text-sm leading-6 text-slate-500 dark:text-slate-400">{description}</p>}</div>{action}</div>;
 }
 
 export function EmptyState({ icon = 'layers', title, description, action }: { icon?: IconName; title: string; description: string; action?: ComponentChildren }) {
@@ -97,34 +98,39 @@ export function EmptyState({ icon = 'layers', title, description, action }: { ic
 }
 
 export function LoadingBlock({ rows = 4 }: { rows?: number }) {
-  return <div class="space-y-3 animate-pulse">{Array.from({ length: rows }).map((_, i) => <div key={i} class="h-16 rounded-xl bg-slate-100 dark:bg-slate-800" />)}</div>;
+  return <div role="status" aria-label="正在加载" class="space-y-3 animate-pulse">{Array.from({ length: rows }).map((_, i) => <div key={i} class="h-16 rounded-xl bg-slate-100 dark:bg-slate-800" />)}</div>;
 }
 
 export function formatNumber(value?: number) { return new Intl.NumberFormat('zh-CN').format(value || 0); }
 export function formatDate(value?: string) { if (!value) return '—'; const date = new Date(value); if (Number.isNaN(date.getTime())) return value; return new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date); }
+/** Calendar day in the viewer's timezone; explicit business dates bypass this formatter. */
+export function formatCalendarDate(value?: string) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const parts = new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(date);
+  const calendar = new Map(parts.map(part => [part.type, part.value] as const));
+  return `${calendar.get('year')}-${calendar.get('month')}-${calendar.get('day')}`;
+}
 export function shortID(value?: string, length = 8) { if (!value) return '—'; return value.length <= length ? value : value.slice(0, length); }
 export function pct(numerator: number, denominator: number) { if (!denominator) return '—'; return `${Math.round((numerator / denominator) * 100)}%`; }
 
 export function PrimaryButton({ children, onClick, disabled, icon }: { children: ComponentChildren; onClick?: () => void; disabled?: boolean; icon?: IconName }) {
-  return <button onClick={onClick} disabled={disabled} class="inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm shadow-blue-600/15 transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-blue-500 dark:hover:bg-blue-400">{icon && <Icon name={icon} size={16} />}{children}</button>;
+  return <button onClick={onClick} disabled={disabled} class="inline-flex min-h-10 max-w-full items-center justify-center gap-2 whitespace-normal rounded-xl [overflow-wrap:anywhere] bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm shadow-blue-600/15 transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-blue-500 dark:hover:bg-blue-400">{icon && <Icon name={icon} size={16} />}{children}</button>;
 }
 
 export function SecondaryButton({ children, onClick, disabled, icon }: { children: ComponentChildren; onClick?: () => void; disabled?: boolean; icon?: IconName }) {
-  return <button onClick={onClick} disabled={disabled} class="inline-flex items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50/70 px-3.5 py-2 text-sm font-medium text-blue-700 shadow-sm transition hover:border-blue-300 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-blue-900/70 dark:bg-blue-950/30 dark:text-blue-300 dark:hover:bg-blue-950/60">{icon && <Icon name={icon} size={16} />}{children}</button>;
+  return <button onClick={onClick} disabled={disabled} class="inline-flex min-h-10 max-w-full items-center justify-center gap-2 whitespace-normal rounded-xl [overflow-wrap:anywhere] border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800">{icon && <Icon name={icon} size={16} />}{children}</button>;
 }
 
-type PipelineState = 'done' | 'pending';
-
-export function Pipeline({ summaryReady }: { summaryReady: boolean; wikiReady?: boolean; graphReady?: boolean }) {
-  const steps: Array<{ label: string; state: PipelineState }> = [
-    { label: '已入库', state: 'done' },
-    { label: '可检索', state: 'done' },
-    { label: '摘要', state: summaryReady ? 'done' : 'pending' },
-  ];
-  return <div class="flex flex-wrap items-center gap-2">{steps.map((step, i) => <div class="contents" key={step.label}>
-    <div class={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium ${step.state === 'done' ? 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300' : 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300'}`}>
-      {step.state === 'done' ? <Icon name="check" size={13} /> : <Icon name="clock" size={13} />}{step.label}
-    </div>
-    {i < steps.length - 1 && <Icon name="arrow" size={14} class="text-slate-300 dark:text-slate-600" />}
-  </div>)}</div>;
+export function processingTypeLabel(value: string) {
+  const normalized = (value || '').toUpperCase();
+  if (normalized === 'INGEST') return '资料解析';
+  if (normalized.includes('SOURCE_ASSOCIATION')) return '关联资料识别';
+  if (normalized.includes('SUMMARY')) return '摘要生成';
+  if (normalized.includes('CONCEPT')) return '概念提炼';
+  if (normalized.includes('GRAPH') || normalized.includes('RELATION')) return '关系生成';
+  if (normalized.includes('WIKI')) return '百科生成';
+  if (normalized.includes('ENTITY')) return '实体归一';
+  return '知识生成';
 }

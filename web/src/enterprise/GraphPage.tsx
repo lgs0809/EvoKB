@@ -10,6 +10,7 @@ export function GraphPage({ onOpenEvidence, onError }: {
   const [relations, setRelations] = useState<EnterpriseGraphRelation[]>([]);
   const [mode, setMode] = useState<'relations' | 'graph'>('graph');
   const [loading, setLoading] = useState(false);
+  const [hasSearched, setHasSearched] = useState(false);
   const [depth, setDepth] = useState<1 | 2>(2);
   const [relationType, setRelationType] = useState('');
   const [validAt, setValidAt] = useState('');
@@ -37,9 +38,12 @@ export function GraphPage({ onOpenEvidence, onError }: {
         valid_at: validAt || undefined,
       });
       setRelations(data.relations || []);
+      setHasSearched(true);
       setSelectedRelationId(data.relations?.[0]?.relation_id || '');
       onError('');
     } catch (err) {
+      setRelations([]);
+      setSelectedRelationId('');
       onError(String(err instanceof Error ? err.message : err));
     } finally {
       setLoading(false);
@@ -75,7 +79,7 @@ export function GraphPage({ onOpenEvidence, onError }: {
       </div>
     </section>
 
-    {relations.length === 0 && !loading && <EmptyState icon="graph" title="输入名称开始查询" description="图谱只按当前查询加载局部关系，不会一次加载全图。" />}
+    {relations.length === 0 && !loading && <EmptyState icon="graph" title={hasSearched ? '未找到可用关系' : '输入名称开始查询'} description={hasSearched ? '当前名称、筛选条件与访问权限下没有已发布关系，可调整名称或筛选条件。' : '从资料中已确认的名称出发，查看有原文依据的局部关系。'} />}
 
     {relations.length > 0 && mode === 'relations' && <section class="space-y-4">
       <SectionTitle title={`${relations.length} 条关系`} />
@@ -102,8 +106,8 @@ function RelationDetail({ relation, onOpenEvidence, onExpandEntity }: { relation
   return <div class="space-y-5">
     <div><div class="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">关系详情</div><div class="mt-2 text-lg font-semibold text-slate-800 dark:text-slate-100">{humanRelation(relation.relation_type)}</div><div class="mt-1 text-xs text-slate-400">{relationPeriod(relation)}</div></div>
     <div class="grid gap-3"><EntityDetail label="起点" name={relation.source_name} type={relation.source_type} onExpand={onExpandEntity}/><EntityDetail label="终点" name={relation.target_name} type={relation.target_type} onExpand={onExpandEntity}/></div>
-    <div class="grid grid-cols-2 gap-2 text-xs"><Detail label="置信度" value={Number.isFinite(relation.score) ? relation.score.toFixed(3) : '—'}/><Detail label="冲突状态" value={relation.conflict_status || 'NONE'}/></div>
-    <div><div class="mb-2 text-xs font-semibold text-slate-500 dark:text-slate-300">原文依据</div>{relation.evidence_ids.length ? <div class="space-y-2">{relation.evidence_ids.map((id, index) => <button key={id} onClick={() => void onOpenEvidence(id)} class="flex w-full items-center justify-between rounded-xl border border-slate-200 px-3 py-2.5 text-left text-xs transition hover:border-blue-300 hover:text-blue-700 dark:border-slate-700"><span>Evidence {index + 1}</span><Icon name="arrow" size={14}/></button>)}</div> : <div class="text-xs text-slate-400">暂无可用 Evidence。</div>}</div>
+    <div class="grid grid-cols-2 gap-2 text-xs"><Detail label="置信度" value={Number.isFinite(relation.score) ? relation.score.toFixed(3) : '—'}/><Detail label="冲突状态" value={relation.conflict_status === 'NONE' ? '无冲突' : (relation.conflict_status || '未知')}/></div>
+    <div><div class="mb-2 text-xs font-semibold text-slate-500 dark:text-slate-300">原文依据</div>{relation.evidence_ids.length ? <div class="space-y-2">{relation.evidence_ids.map((id, index) => <button key={id} onClick={() => void onOpenEvidence(id)} class="flex w-full items-center justify-between rounded-xl border border-slate-200 px-3 py-2.5 text-left text-xs transition hover:border-blue-300 hover:text-blue-700 dark:border-slate-700"><span>原文依据 {index + 1}</span><Icon name="arrow" size={14}/></button>)}</div> : <div class="text-xs text-slate-400">暂无可用原文依据。</div>}</div>
   </div>;
 }
 
@@ -186,8 +190,20 @@ function relationPeriod(rel: EnterpriseGraphRelation) {
   return `${rel.valid_from ? formatTime(rel.valid_from) : '起始未知'} → ${rel.valid_to ? formatTime(rel.valid_to) : '持续有效'}`;
 }
 function formatTime(value: string) { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString(); }
-function humanRelation(value: string) { return (value || 'RELATED_TO').replaceAll('_', ' '); }
-function humanEntityType(value: string) { return (value || 'other').replaceAll('_', ' '); }
+const relationLabels: Record<string, string> = {
+  DOCUMENTS: '资料记录', PARTY_TO_CONTRACT: '合同当事方', ACTUAL_CONTROLLER_OF: '实际控制', CONTROLS: '控制',
+  SHAREHOLDER_OF: '持股', SUBSIDIARY_OF: '隶属母公司', PARENT_OF: '拥有子公司', DIRECTOR_OF: '担任董事',
+  LEGAL_REPRESENTATIVE_OF: '担任法定代表人', SIGNS_WITH: '与其签约', GUARANTEES: '提供担保', BORROWS_FROM: '向其借款',
+  INVESTS_IN: '投资', INVOLVED_IN_CASE: '涉及案件', OWNS_IP: '拥有知识产权', HOLDS_LICENSE: '持有许可',
+  PARTICIPATES_IN_PROJECT: '参与项目', APPROVES: '批准', SUPPLIES_TO: '向其供货', CUSTOMER_OF: '向其采购', RELATED_TO: '关联',
+};
+function humanRelation(value: string) { return relationLabels[value] || (value || '关联').replaceAll('_', ' '); }
+const entityLabels: Record<string, string> = {
+  DOCUMENT: '资料', COMPANY: '公司', PERSON: '人员', ORGANIZATION: '机构', GOVERNMENT_AGENCY: '政府机构',
+  CONTRACT: '合同', LEGAL_CASE: '法律案件', PROJECT: '项目', POLICY: '政策', EVENT: '事件', LICENSE: '许可',
+  INTELLECTUAL_PROPERTY: '知识产权', PRODUCT: '产品', LOCATION: '地点', COMMITTEE: '委员会', TOPIC: '专题', OTHER: '其他',
+};
+function humanEntityType(value: string) { return entityLabels[value] || (value || '其他').replaceAll('_', ' '); }
 function truncate(value: string, max: number) { return value.length > max ? `${value.slice(0, max - 1)}…` : value; }
 function clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)); }
 function nodeClass(type: string) { const value = (type || '').toLowerCase(); if (value.includes('person')) return 'bg-amber-500'; if (value.includes('contract')) return 'bg-violet-500'; if (value.includes('event') || value.includes('risk')) return 'bg-rose-500'; if (value.includes('org') || value.includes('company')) return 'bg-blue-600'; return 'bg-slate-600'; }

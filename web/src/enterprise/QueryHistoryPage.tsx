@@ -1,3 +1,4 @@
+import { DialogFrame } from './DialogFrame';
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import {
   createEnterpriseQueryGroup,
@@ -9,6 +10,7 @@ import {
   moveEnterpriseQueryRecord,
   packageEnterpriseQueryGroup,
   packageEnterpriseQueryRecord,
+  downloadEnterprisePackage,
   renameEnterpriseQueryGroup,
   renameEnterpriseQueryRecord,
   type EnterpriseQueryGroup,
@@ -69,22 +71,21 @@ export function QueryHistoryPage({ onOpenSession, onError }: {
     }
   };
 
-  const downloadPackage = (pack?: EnterpriseQueryPackage) => {
+  const downloadPackage = async (pack?: EnterpriseQueryPackage) => {
     if (!pack?.download_url) return;
-    const anchor = document.createElement('a');
-    anchor.href = pack.download_url;
-    anchor.target = '_blank';
-    anchor.rel = 'noopener';
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
+    try {
+      await downloadEnterprisePackage(pack.download_url);
+      onError('');
+    } catch (error) {
+      onError(String(error instanceof Error ? error.message : error));
+    }
   };
 
   const packageRecord = async (record: EnterpriseQueryHistoryRecord, regenerate = false) => {
     setBusy(`package-record:${record.session_id}`);
     try {
       const pack = await packageEnterpriseQueryRecord(record.session_id, regenerate);
-      downloadPackage(pack);
+      await downloadEnterprisePackage(pack.download_url || '');
       await load();
       onError('');
     } catch (error) {
@@ -98,7 +99,7 @@ export function QueryHistoryPage({ onOpenSession, onError }: {
     setBusy(`package-group:${group.group_id}`);
     try {
       const pack = await packageEnterpriseQueryGroup(group.group_id, regenerate);
-      downloadPackage(pack);
+      await downloadEnterprisePackage(pack.download_url || '');
       await load();
       onError('');
     } catch (error) {
@@ -155,7 +156,7 @@ export function QueryHistoryPage({ onOpenSession, onError }: {
         </div>
         <div class="mt-3 flex flex-wrap gap-1.5">{group.records.slice(0, 5).map(record => <button key={record.session_id} onClick={() => onOpenSession(record.session_id)} class="max-w-full truncate rounded-lg bg-slate-100 px-2.5 py-1.5 text-xs text-slate-600 hover:bg-blue-50 hover:text-blue-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-blue-950/30">{record.name}</button>)}{group.records.length > 5 && <span class="rounded-lg bg-slate-100 px-2.5 py-1.5 text-xs text-slate-400 dark:bg-slate-800">+{group.records.length - 5}</span>}</div>
         <div class="mt-4 flex flex-wrap gap-2">
-          <PackageButton pack={group.latest_package} disabled={busy === `package-group:${group.group_id}` || group.records.length === 0} onExisting={() => downloadPackage(group.latest_package)} onGenerate={regenerate => void packageGroup(group, regenerate)} />
+          <PackageButton pack={group.latest_package} disabled={busy === `package-group:${group.group_id}` || group.records.length === 0 || group.records.some(record => record.evidence_changed)} onExisting={() => downloadPackage(group.latest_package)} onGenerate={regenerate => void packageGroup(group, regenerate)} />
           <button onClick={() => dissolveGroup(group)} disabled={Boolean(busy)} class="rounded-lg border border-amber-200 px-3 py-2 text-xs font-semibold text-amber-700 hover:bg-amber-50 disabled:opacity-50 dark:border-amber-900/60 dark:text-amber-300 dark:hover:bg-amber-950/20">解散组</button>
           <button onClick={() => deleteGroup(group)} disabled={Boolean(busy)} class="rounded-lg border border-rose-200 px-3 py-2 text-xs font-semibold text-rose-600 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-900/60 dark:text-rose-300 dark:hover:bg-rose-950/20">删除组</button>
         </div>
@@ -175,7 +176,7 @@ export function QueryHistoryPage({ onOpenSession, onError }: {
         <div class="flex items-start gap-3">
           <input type="checkbox" checked={selected.has(record.session_id)} onChange={() => toggle(record.session_id)} aria-label={`选择 ${record.name}`} class="mt-1 h-4 w-4 rounded border-slate-300" />
           <div class="min-w-0 flex-1">
-            <div class="flex flex-wrap items-center gap-2"><StatusBadge value={record.status}/>{record.group_name && <span class="rounded-full bg-violet-50 px-2 py-1 text-[11px] font-semibold text-violet-600 dark:bg-violet-950/30 dark:text-violet-300">{record.group_name}</span>}<span class="text-[11px] text-slate-400">{record.citation_count} 条引用</span></div>
+            <div class="flex flex-wrap items-center gap-2">{record.evidence_changed ? <span class="rounded-full bg-amber-50 px-2 py-1 text-[11px] font-semibold text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">资料访问已变更</span> : <StatusBadge value={record.status}/>}{record.group_name && <span class="rounded-full bg-violet-50 px-2 py-1 text-[11px] font-semibold text-violet-600 dark:bg-violet-950/30 dark:text-violet-300">{record.group_name}</span>}<span class="text-[11px] text-slate-400">{record.citation_count} 条引用</span></div>
             <div class="mt-2 text-sm font-semibold text-slate-800 dark:text-slate-100">{record.name}</div>
             {record.name !== record.question && <div class="mt-1 line-clamp-2 text-xs leading-5 text-slate-400">原问题：{record.question}</div>}
             {record.answer && <div class="mt-2 line-clamp-2 text-xs leading-5 text-slate-500 dark:text-slate-400">{record.answer}</div>}
@@ -231,12 +232,12 @@ function TextDialog({ title, initialValue, placeholder, confirmText, hint, onClo
   onConfirm: (value: string) => void;
 }) {
   const [value, setValue] = useState(initialValue);
-  return <div class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm" onMouseDown={event => { if (event.currentTarget === event.target) onClose(); }}>
+  return <DialogFrame title={title} onClose={onClose}>
     <div class="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-700 dark:bg-slate-900">
       <h3 class="text-base font-semibold">{title}</h3>
       {hint && <p class="mt-2 text-xs leading-5 text-slate-400">{hint}</p>}
-      <input autoFocus value={value} onInput={event => setValue((event.target as HTMLInputElement).value)} onKeyDown={event => { if (event.key === 'Enter' && value.trim()) onConfirm(value.trim()); }} placeholder={placeholder} class="mt-4 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950" />
+      <input aria-label={title} autoFocus value={value} onInput={event => setValue((event.target as HTMLInputElement).value)} onKeyDown={event => { if (event.key === 'Enter' && value.trim()) onConfirm(value.trim()); }} placeholder={placeholder} class="mt-4 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm outline-none focus:border-blue-400 dark:border-slate-700 dark:bg-slate-950" />
       <div class="mt-5 flex justify-end gap-2"><button onClick={onClose} class="rounded-xl border border-slate-200 px-4 py-2 text-sm text-slate-500 dark:border-slate-700">取消</button><button disabled={!value.trim()} onClick={() => onConfirm(value.trim())} class="rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-40 dark:bg-blue-500">{confirmText}</button></div>
     </div>
-  </div>;
+  </DialogFrame>;
 }

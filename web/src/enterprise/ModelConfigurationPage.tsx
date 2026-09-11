@@ -1,3 +1,4 @@
+import { DialogFrame } from './DialogFrame';
 import type { ComponentChildren } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import {
@@ -115,7 +116,7 @@ export function ModelConfigurationPage({ onError }: { onError: (message: string)
         </button>)}</div>
       </aside>
 
-      {selected && form && <main class="space-y-5">
+      {selected && form && <section class="space-y-5">
         <section class="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900 sm:p-6">
           <div class="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
             <Field label="配置组名称" className="max-w-lg"><input value={form.name} onInput={event => set('name', inputValue(event))} class={inputClass} /></Field>
@@ -139,7 +140,7 @@ export function ModelConfigurationPage({ onError }: { onError: (message: string)
         </ModelCard>
 
         <ModelCard icon="embedding" title="Embedding" description="文档向量化与查询向量化。">
-          <div class="mb-4 flex gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300"><Icon name="warning" size={16} class="mt-0.5 shrink-0"/><span>更换模型或向量维度后，需要确认 OpenSearch 向量索引维度一致；维度变化时应重建派生索引。</span></div>
+          <div class="mb-4 flex gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300"><Icon name="warning" size={16} class="mt-0.5 shrink-0"/><span>更换模型或向量维度后，需要确认 Milvus 向量集合维度一致；维度变化时应重建派生索引。</span></div>
           <div class="grid gap-4 lg:grid-cols-2">
             <Field label="API Base URL" span><input value={form.embedding_base_url} onInput={event => set('embedding_base_url', inputValue(event))} class={inputClass} /></Field>
             <KeyField label="API Key" saved={selected.embedding_api_key_masked} onChange={next => set('embedding_api_key', next)} />
@@ -158,7 +159,7 @@ export function ModelConfigurationPage({ onError }: { onError: (message: string)
             <Field label="请求超时（秒）"><NumberInput value={form.rerank_timeout_seconds} onChange={next => set('rerank_timeout_seconds', next)} /></Field>
           </div>
         </ModelCard>
-      </main>}
+      </section>}
     </div>
 
     {createOpen && <TextModal
@@ -200,22 +201,22 @@ function NumberInput({ value, onChange }: { value: number; onChange: (value: num
 }
 
 function TextModal({ title, description, value, confirmText, disabled, onChange, onClose, onConfirm }: { title: string; description: string; value: string; confirmText: string; disabled?: boolean; onChange: (value: string) => void; onClose: () => void; onConfirm: () => void }) {
-  return <div class="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm" onMouseDown={event => { if (event.currentTarget === event.target) onClose(); }}>
+  return <DialogFrame title={title} onClose={onClose}>
     <div class="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-700 dark:bg-slate-900">
       <div class="flex items-start gap-3"><div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-blue-600 dark:bg-blue-950/40 dark:text-blue-300"><Icon name="models" size={18}/></div><div><h3 class="text-base font-semibold text-slate-900 dark:text-white">{title}</h3><p class="mt-1 text-xs leading-5 text-slate-400">{description}</p></div></div>
       <label class="mt-5 block text-xs font-medium text-slate-500">配置组名称<input autoFocus value={value} maxLength={128} onInput={event => onChange(inputValue(event))} onKeyDown={event => { if (event.key === 'Enter' && value.trim() && !disabled) onConfirm(); if (event.key === 'Escape') onClose(); }} class={inputClass}/></label>
       <div class="mt-5 flex justify-end gap-2"><button onClick={onClose} disabled={disabled} class="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-500 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800">取消</button><button onClick={onConfirm} disabled={disabled || !value.trim()} class="rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm shadow-blue-600/15 disabled:opacity-40 dark:bg-blue-500">{confirmText}</button></div>
     </div>
-  </div>;
+  </DialogFrame>;
 }
 
 function ConfirmModal({ title, description, confirmText, disabled, onClose, onConfirm }: { title: string; description: string; confirmText: string; disabled?: boolean; onClose: () => void; onConfirm: () => void }) {
-  return <div class="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm" onMouseDown={event => { if (event.currentTarget === event.target) onClose(); }}>
+  return <DialogFrame title={title} onClose={onClose}>
     <div class="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-700 dark:bg-slate-900">
       <div class="flex items-start gap-3"><div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300"><Icon name="trash" size={18}/></div><div><h3 class="text-base font-semibold text-slate-900 dark:text-white">{title}</h3><p class="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">{description}</p></div></div>
       <div class="mt-5 flex justify-end gap-2"><button onClick={onClose} disabled={disabled} class="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-500 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800">取消</button><button onClick={onConfirm} disabled={disabled} class="rounded-xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white shadow-sm shadow-rose-600/15 disabled:opacity-40">{confirmText}</button></div>
     </div>
-  </div>;
+  </DialogFrame>;
 }
 
 function fromProfile(value: EnterpriseModelProfile): EnterpriseModelProfileUpdate {
