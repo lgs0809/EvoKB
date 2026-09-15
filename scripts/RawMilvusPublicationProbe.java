@@ -1,0 +1,35 @@
+import cn.lgs.knowledgebase.application.port.Ports.*;
+import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.*;
+import cn.lgs.knowledgebase.infrastructure.search.*;
+import cn.lgs.knowledgebase.infrastructure.persistence.JdbcIngestionRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.milvus.v2.client.*;
+import io.milvus.v2.service.database.request.CreateDatabaseReq;
+import io.milvus.v2.service.vector.request.QueryReq;
+import java.nio.file.*;import java.time.*;import java.util.*;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.*;
+import org.springframework.transaction.support.TransactionTemplate;
+
+/** Real Milvus+PG publication protocol with explicit synthetic vectors, no model invocation. */
+public class RawMilvusPublicationProbe {
+ static List<String> ids(List<cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Candidate> rows){return rows.stream().map(x->x.id()).sorted().toList();}
+ static RawIndexDocument chunk(String id,List<Float> vector){return new RawIndexDocument(id,"付款条件 合成原文","付款条件 合成原文",List.of("付款"),List.of("synthetic-block"),1,1,"synthetic-content-hash",vector,List.of("synthetic-evidence"),new Metadata("法务","合成合同",List.of(),"合成验收",null,"合同"));}
+ public static void main(String[] args)throws Exception {
+  ObjectMapper mapper=new ObjectMapper();var checks=new LinkedHashMap<String,Object>();var report=new LinkedHashMap<String,Object>();MilvusClientV2 client=null;
+  try {
+   String database=args[1];var admin=new MilvusClientV2(ConnectConfig.builder().uri("http://127.0.0.1:19535").rpcDeadlineMs(30000).build());if(!admin.listDatabases().getDatabaseNames().contains(database))admin.createDatabase(CreateDatabaseReq.builder().databaseName(database).build());admin.close();client=new MilvusClientV2(ConnectConfig.builder().uri("http://127.0.0.1:19535").dbName(database).rpcDeadlineMs(30000).build());var db=new JdbcTemplate(new DriverManagerDataSource(System.getenv("PROBE_JDBC_URL"),"evokb_target",System.getenv("PROBE_DB_PASSWORD")));var repo=new JdbcIngestionRepository(db,new TransactionTemplate(new DataSourceTransactionManager(db.getDataSource())),mapper);var authority=new JdbcProjectionAuthority(db);var index=new MilvusKnowledgeIndexAdapter(client,"knowledge_chunks",authority);index.ensureIndex(1024);var query=new ArrayList<Float>(Collections.nCopies(1024,0f));query.set(0,1f);var weak=new ArrayList<Float>(query);weak.set(1,5f);index.indexRaw("doc-public","version-public",List.of(chunk("legacy-current",weak)));index.activateVersion("doc-public","version-public");var filters=new SearchFilters(null,null,null,List.of());checks.put("legacyCurrentInitiallyVisible",ids(index.searchVector(query,filters,1)).equals(List.of("legacy-current")));
+   var flood=new ArrayList<RawIndexDocument>();for(int i=0;i<70;i++)flood.add(chunk("unpublished-flood-"+i,query));String staleScope=UUID.randomUUID()+":e1";index.stageRaw("doc-public","version-public",staleScope,flood);
+   checks.put("legacyCurrentSurvives70BetterUnpublishedTopKRows",ids(index.searchVector(query,filters,1)).equals(List.of("legacy-current")));
+   var legacyRows=client.query(QueryReq.builder().collectionName("knowledge_chunks").filter("knowledge_type == \"RAW\" and not exists attributes[\"raw_scope\"]").outputFields(List.of("id")).limit(200).build());checks.put("actualMilvus26SupportsJsonExistsAndRetainsLegacy",legacyRows.getQueryResults().size()==1);
+   String file=UUID.randomUUID().toString(),batch=UUID.randomUUID().toString();db.update("INSERT INTO ingestion_batch(batch_id,created_by_username,source_count) VALUES(?,'native-milvus-component',1)",batch);db.update("INSERT INTO ingestion_file(file_id,batch_id,relative_path,original_filename,staging_path,sha256,logical_name) VALUES(?,?,'fixture','fixture','fixture','fixture','fixture')",file,batch);repo.queueBatch(batch,Instant.now());var claim=repo.claimRaw(file,UUID.randomUUID().toString()).orElseThrow();var exec=repo.rawExecution(claim);exec.bind("doc-public","version-public");exec.phase(cn.lgs.knowledgebase.domain.ingestion.IngestionDomain.ProgressStage.ACTIVATING);var physical=index.stageRaw("doc-public","version-public",claim.scope(),List.of(chunk("published-current",query)));exec.publish("doc-public","version-public",physical,()->index.activateRaw("doc-public","version-public",physical));
+   checks.put("normalFencedPointerMakesOnlyCurrentScopeVisible",ids(index.searchVector(query,filters,50)).equals(physical));checks.put("dbPointerMembersMatchActualMilvusProjection",db.queryForObject("SELECT count(*) FROM raw_publication WHERE version_id='version-public' AND producer_scope=?",Long.class,claim.scope())==1&&db.queryForObject("SELECT count(*) FROM raw_publication_member WHERE version_id='version-public' AND physical_id=?",Long.class,physical.get(0))==1);
+   // Simulate an external late completion: it writes its own immutable physical scope after publication.
+   var late=new ArrayList<RawIndexDocument>();for(int i=0;i<70;i++)late.add(chunk("late-old-owner-"+i,query));index.stageRaw("doc-public","version-public",staleScope,late);checks.put("lateExternalWritesCannotReplaceCurrentOrCrowdTopK",ids(index.searchVector(query,filters,1)).equals(physical));checks.put("postAuthorityRejectsEveryStalePhysicalMember",!authority.rawProjectionCurrent("unpublished-flood-0:e"+cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.sha256(staleScope).substring(0,24),List.of("version-public")));
+   db.update("UPDATE document_metadata SET acl_version=acl_version+1 WHERE version_id='version-public'");checks.put("changedAclFailsClosedBeforeDenseRecall",index.searchVector(query,filters,50).isEmpty());db.update("UPDATE document SET status='DELETED' WHERE document_id='doc-public'");checks.put("deletedSourceStaysInvisible",index.searchBm25("付款条件",filters,50).isEmpty());
+   report.put("actualMilvusRows",client.query(QueryReq.builder().collectionName("knowledge_chunks").filter("knowledge_type == \"RAW\"").outputFields(List.of("id","attributes","version_ids","is_active")).limit(200).build()).getQueryResults().size());report.put("publicationRows",db.queryForList("SELECT * FROM raw_publication"));report.put("members",db.queryForList("SELECT * FROM raw_publication_member"));
+  }catch(Throwable failure){report.put("failure",failure.toString());Path.of(args[0]+".failure.log").toFile().getParentFile().mkdirs();try(var p=new java.io.PrintWriter(args[0]+".failure.log")){failure.printStackTrace(p);}}
+  finally{if(client!=null)client.close();}
+  report.put("checks",checks);report.put("status",checks.size()==9&&checks.values().stream().allMatch(Boolean.TRUE::equals)?"PASS_ACTUAL_MILVUS_RAW_PUBLICATION":"FAIL_ACTUAL_MILVUS_RAW_PUBLICATION");report.put("boundary","Actual local Milvus2.6 + PG/raw owner/epoch publication. Synthetic1024 vectors/source fixtures are explicit. No real embedding/model quality or whole API/browser workflow claimed. All scopes/collection/schema retained, including intentionally revoked source.");mapper.writerWithDefaultPrettyPrinter().writeValue(Path.of(args[0]).toFile(),report);System.exit(report.get("status").toString().startsWith("PASS")?0:1);
+ }
+}
