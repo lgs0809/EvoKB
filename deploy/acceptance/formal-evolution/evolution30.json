@@ -1,0 +1,308 @@
+{
+  "formatVersion": 1,
+  "status": "FROZEN_CASES_ONLY_NOT_EXECUTED",
+  "cases": [
+    {
+      "caseId": "EVOLUTION-01",
+      "split": "development",
+      "scenario": "SOURCE_ZERO",
+      "title": "No completed transfer does not qualify a source",
+      "expected": {
+        "sourceContributions": 0,
+        "summaryCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-02",
+      "split": "development",
+      "scenario": "SOURCE_TWO",
+      "title": "Two independent answers remain below the source threshold",
+      "expected": {
+        "sourceContributions": 2,
+        "summaryCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-03",
+      "split": "development",
+      "scenario": "SOURCE_THREE",
+      "title": "Three independent completed transfers qualify exactly one source",
+      "expected": {
+        "sourceContributions": 3,
+        "summaryCandidates": 1
+      }
+    },
+    {
+      "caseId": "EVOLUTION-04",
+      "split": "development",
+      "scenario": "SOURCE_FOUR",
+      "title": "An above-threshold source remains one candidate",
+      "expected": {
+        "sourceContributions": 4,
+        "summaryCandidates": 1
+      }
+    },
+    {
+      "caseId": "EVOLUTION-05",
+      "split": "development",
+      "scenario": "SOURCE_REPLAY",
+      "title": "Eight replays of one immutable package remain one contribution",
+      "expected": {
+        "sourceContributions": 1,
+        "summaryCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-06",
+      "split": "development",
+      "scenario": "MANIFEST_ONLY",
+      "title": "Creating an authorized package does not count a download",
+      "expected": {
+        "sourceContributions": 0,
+        "receipts": 0,
+        "summaryCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-07",
+      "split": "development",
+      "scenario": "SHORT_TRANSFER",
+      "title": "Short byte transfer is rejected without credit",
+      "expected": {
+        "sourceContributions": 0,
+        "receipts": 0,
+        "summaryCandidates": 0,
+        "rejected": true
+      }
+    },
+    {
+      "caseId": "EVOLUTION-08",
+      "split": "development",
+      "scenario": "ROLLED_BACK_TRANSFER",
+      "title": "A native transaction rollback leaves no receipt or credit",
+      "expected": {
+        "sourceContributions": 0,
+        "receipts": 0,
+        "summaryCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-09",
+      "split": "development",
+      "scenario": "ENTRY_FOUR",
+      "title": "Four actual entry uses do not qualify Wiki",
+      "expected": {
+        "entryContributions": 4,
+        "wikiCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-10",
+      "split": "development",
+      "scenario": "ENTRY_FIVE",
+      "title": "Five actual entry uses qualify one Wiki",
+      "expected": {
+        "entryContributions": 5,
+        "wikiCandidates": 1
+      }
+    },
+    {
+      "caseId": "EVOLUTION-11",
+      "split": "development",
+      "scenario": "ENTRY_SOURCE_ONLY",
+      "title": "Source-only downloads do not broadcast entry heat",
+      "expected": {
+        "entryContributions": 0,
+        "wikiCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-12",
+      "split": "development",
+      "scenario": "ENTRY_MIXED",
+      "title": "Eight additional source downloads do not turn three entry uses into five",
+      "expected": {
+        "entryContributions": 3,
+        "wikiCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-13",
+      "split": "development",
+      "scenario": "ENTRY_EXPIRED_HEAT",
+      "title": "Entry heat older than thirty days does not qualify",
+      "expected": {
+        "entryContributions": 5,
+        "wikiCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-14",
+      "split": "development",
+      "scenario": "ENTRY_ACL_CHANGED",
+      "title": "A changed source ACL blocks Wiki qualification immediately",
+      "expected": {
+        "entryContributions": 5,
+        "wikiCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-15",
+      "split": "development",
+      "scenario": "ENTRY_DELETED_SOURCE",
+      "title": "A deleted input blocks Wiki qualification",
+      "expected": {
+        "entryContributions": 5,
+        "wikiCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-16",
+      "split": "development",
+      "scenario": "GRAPH_TWO",
+      "title": "Two source downloads do not qualify Graph",
+      "expected": {
+        "graphCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-17",
+      "split": "development",
+      "scenario": "GRAPH_THREE",
+      "title": "Three source downloads qualify a grounded contract Graph",
+      "expected": {
+        "graphCandidates": 1
+      }
+    },
+    {
+      "caseId": "EVOLUTION-18",
+      "split": "development",
+      "scenario": "GRAPH_SOURCE_SCOPED",
+      "title": "An ungrounded source-scoped topic does not qualify Graph",
+      "expected": {
+        "graphCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-19",
+      "split": "development",
+      "scenario": "GRAPH_TOPIC_TYPE",
+      "title": "A general topic is not an eligible business Graph target",
+      "expected": {
+        "graphCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-20",
+      "split": "holdout",
+      "scenario": "GRAPH_ACL_CHANGED",
+      "title": "A changed build input blocks grounded Graph qualification",
+      "expected": {
+        "graphCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-21",
+      "split": "holdout",
+      "scenario": "SUMMARY_ALREADY_ACTIVE",
+      "title": "Already processed current source is not rebuilt from old heat",
+      "expected": {
+        "summaryCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-22",
+      "split": "holdout",
+      "scenario": "SOURCE_NEW_VERSION",
+      "title": "A new source version does not inherit its old version heat",
+      "expected": {
+        "newVersionContributions": 0,
+        "summaryCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-23",
+      "split": "holdout",
+      "scenario": "ENTRY_ALREADY_WIKI",
+      "title": "A current Wiki is not promoted again for every five uses",
+      "expected": {
+        "wikiCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-24",
+      "split": "holdout",
+      "scenario": "ENTRY_STALE",
+      "title": "A stale entry is not eligible for new Wiki or Graph selection",
+      "expected": {
+        "wikiCandidates": 0,
+        "graphCandidates": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-25",
+      "split": "holdout",
+      "scenario": "ACL_REPAIR_PRIORITY",
+      "title": "Source repair bypasses the new-work quota and gets priority",
+      "expected": {
+        "repairJobs": 1,
+        "repairPriority": 100,
+        "newDailySelections": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-26",
+      "split": "holdout",
+      "scenario": "SUMMARY_QUOTA_20",
+      "title": "Exactly twenty sources fit the daily source budget",
+      "expected": {
+        "selectedSummary": 20,
+        "remainingSummary": 0
+      }
+    },
+    {
+      "caseId": "EVOLUTION-27",
+      "split": "holdout",
+      "scenario": "SUMMARY_QUOTA_21",
+      "title": "A twenty-first source remains unselected",
+      "expected": {
+        "selectedSummary": 20,
+        "remainingSummary": 1
+      }
+    },
+    {
+      "caseId": "EVOLUTION-28",
+      "split": "holdout",
+      "scenario": "WIKI_QUOTA_11",
+      "title": "An eleventh Wiki remains unselected",
+      "expected": {
+        "selectedWiki": 10,
+        "remainingWiki": 1
+      }
+    },
+    {
+      "caseId": "EVOLUTION-29",
+      "split": "holdout",
+      "scenario": "GRAPH_QUOTA_11",
+      "title": "An eleventh Graph remains unselected",
+      "expected": {
+        "selectedGraph": 10,
+        "remainingGraph": 1
+      }
+    },
+    {
+      "caseId": "EVOLUTION-30",
+      "split": "holdout",
+      "scenario": "CONCURRENT_DAILY_QUOTAS",
+      "title": "Concurrent selectors and restart spend one daily allocation",
+      "expected": {
+        "selectedSummary": 20,
+        "selectedWiki": 10,
+        "selectedGraph": 10,
+        "selectedTotal": 40,
+        "restartSelections": 0
+      }
+    }
+  ],
+  "scope": "Native PostgreSQL mechanism matrix in separate retained schemas. Production repositories, completed-transfer callbacks and schedulers are exercised. Query, source and derived payloads are explicitly synthetic component fixtures. This is not model content quality, real browser transfer, elapsed thirty days, actual midnight or complete KB acceptance. No public business heat, status or task completion is manufactured. Gold is never sent to a model."
+}

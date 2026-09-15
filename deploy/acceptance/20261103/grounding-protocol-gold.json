@@ -1,0 +1,54 @@
+{
+  "boundary": "Independent synthetic protocol/semantic diagnostic. Not a reconstruction or retry of the failed procurement Summary task.",
+  "cases": [
+    {
+      "id": "positive",
+      "evidence": "验收合格且收到合法发票后，甲方应向乙方交付两台设备。",
+      "claim": "验收合格且收到合法发票后，甲方应向乙方交付两台设备。",
+      "expectedSupported": true
+    },
+    {
+      "id": "reversed_roles",
+      "evidence": "验收合格且收到合法发票后，甲方应向乙方交付两台设备。",
+      "claim": "验收合格且收到合法发票后，乙方应向甲方交付两台设备。",
+      "expectedSupported": false
+    },
+    {
+      "id": "negation",
+      "evidence": "验收合格且收到合法发票后，甲方应向乙方交付两台设备。",
+      "claim": "验收合格且收到合法发票后，甲方不得向乙方交付两台设备。",
+      "expectedSupported": false
+    },
+    {
+      "id": "conditions_omitted",
+      "evidence": "验收合格且收到合法发票后，甲方应向乙方交付两台设备。",
+      "claim": "甲方应向乙方交付两台设备。",
+      "expectedSupported": false
+    },
+    {
+      "id": "conjunction_weakened",
+      "evidence": "验收合格且收到合法发票后，甲方应向乙方交付两台设备。",
+      "claim": "验收合格或收到合法发票后，甲方应向乙方交付两台设备。",
+      "expectedSupported": false
+    },
+    {
+      "id": "unsupported_time",
+      "evidence": "验收合格且收到合法发票后，甲方应向乙方交付两台设备。",
+      "claim": "验收合格且收到合法发票后，甲方应在三十日内向乙方交付两台设备。",
+      "expectedSupported": false
+    },
+    {
+      "id": "wrong_contract",
+      "evidence": "仅合同HT-2026-A约定：验收合格且收到合法发票后，甲方向乙方支付120万元；本条没有涉及合同HT-2026-B。",
+      "claim": "合同HT-2026-B约定，验收合格且收到合法发票后，甲方向乙方支付120万元。",
+      "expectedSupported": false
+    },
+    {
+      "id": "superseded_version",
+      "evidence": "合同HT-2026-A原v1尾款期限为30日；已生效的v2补充协议将期限改为45日，其余验收和合法发票前提不变。",
+      "claim": "合同HT-2026-A当前生效的v2约定，验收合格且收到合法发票后30日内支付尾款。",
+      "expectedSupported": false
+    }
+  ],
+  "priorFixtureSha256": "5195fd1a17c6a6c6e43f38daad54c95698876db48a964cbc4b9a7b3277e79201"
+}

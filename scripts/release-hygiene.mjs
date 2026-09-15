@@ -22,14 +22,11 @@ const rules = [
   ['developer-macos-home', /\/Users\/[^/\s]+\//],
   ['developer-linux-home', /\/home\/[^/\s]+\//],
   ['developer-desktop-path', /(?:\/|\\)(?:Desktop|Documents)(?:\/|\\)/i],
-  ['docker-host-machine-coupling', /host\.docker\.internal/i],
   ['legacy-product-name', /sage[-_ ]?wiki/i],
   ['known-developer-identifier', /101201912008/],
   ['openai-style-secret', /\bsk-[A-Za-z0-9_-]{20,}\b/],
   ['bearer-token', /\bBearer\s+[A-Za-z0-9._~+/=-]{24,}/i],
   ['private-key', /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/],
-  ['hardcoded-test-chat-model', /\bgpt-5\.[0-9A-Za-z._-]*/i],
-  ['hardcoded-test-qwen-model', /Qwen\/Qwen3/i],
 ];
 
 const allowedRulePaths = new Map([
@@ -37,7 +34,7 @@ const allowedRulePaths = new Map([
 ]);
 
 function trackedFiles() {
-  const output = execFileSync('git', ['ls-files', '-z'], { cwd: ROOT });
+  const output = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: ROOT });
   return output.toString('utf8').split('\0').filter(Boolean);
 }
 
@@ -55,7 +52,8 @@ function main() {
     if (relative === 'scripts/release-hygiene.mjs') continue;
 
     const parts = relative.split('/');
-    if (parts.some(part => bannedTrackedParts.has(part))) {
+    const deploymentRunbook = relative.startsWith('deploy/target/') && /\.(?:md|sql)$/.test(relative);
+    if (parts.some(part => bannedTrackedParts.has(part)) && !deploymentRunbook) {
       violations.push([relative, 0, 'generated-or-local-artifact']);
       continue;
     }

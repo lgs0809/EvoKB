@@ -1,0 +1,13 @@
+services:
+  mysql:
+    mem_limit: 768m
+    cpus: 1.0
+  minio:
+    mem_limit: 512m
+    cpus: 1.0
+  opensearch:
+    mem_limit: 1024m
+    cpus: 1.5
+  neo4j:
+    mem_limit: 768m
+    cpus: 1.0
