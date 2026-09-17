@@ -25,4 +25,4 @@ compose-config:
 	$(COMPOSE) --env-file .env.example -f deploy/docker-compose.yml config -q
 
 docker-build:
-	$(DOCKER) build -f deploy/Dockerfile -t enterprise-knowledge-base:local .
+	$(DOCKER) build -f deploy/Dockerfile -t evokb:local .

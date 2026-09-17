@@ -62,11 +62,13 @@ jobs:
       - name: Validate Compose
         run: docker compose --env-file .env.example -f deploy/docker-compose.yml config -q
       - name: Build application image
-        run: docker build -f deploy/Dockerfile -t enterprise-knowledge-base:ci .
+        run: docker build -f deploy/Dockerfile -t evokb:ci .
 
   browser-smoke:
     runs-on: ubuntu-latest
     needs: [docker]
+    env:
+      EKB_MYSQL_DATABASE: enterprise_kb_ci_smoke
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

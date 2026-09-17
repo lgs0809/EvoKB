@@ -5,7 +5,7 @@ server:
 
 spring:
   application:
-    name: enterprise-knowledge-base
+    name: evokb
   datasource:
     url: ${EKB_JDBC_URL:jdbc:mysql://127.0.0.1:23316/enterprise_kb?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC}
     username: ${EKB_MYSQL_USER:ekb}
@@ -28,13 +28,10 @@ spring:
   flyway:
     enabled: false
   ai:
-    openai:
-      base-url: ${EKB_CHAT_BASE_URL}
-      api-key: ${EKB_CHAT_API_KEY}
     mcp:
       server:
         enabled: true
-        name: enterprise-knowledge-base
+        name: evokb
         version: 1.0.0
         protocol: STREAMABLE
         type: SYNC

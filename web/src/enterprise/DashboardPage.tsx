@@ -68,7 +68,7 @@ export function DashboardPage({ overview, documents, wikis, tasks, onNavigate }:
         <div class="mt-5 space-y-2">
           {popular.map((doc, i) => <div key={doc.version_id} class="flex items-center gap-3 rounded-xl border border-slate-100 px-3 py-3 dark:border-slate-800">
             <div class="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-100 text-xs font-semibold text-slate-500 dark:bg-slate-800">{i + 1}</div>
-            <div class="min-w-0 flex-1"><div class="truncate text-sm font-medium">{doc.logical_name}</div><div class="text-xs text-slate-400">v{doc.version_no} · {doc.company || doc.document_type || '企业资料'}</div></div>
+            <div class="min-w-0 flex-1"><div class="truncate text-sm font-medium">{doc.logical_name}</div><div class="text-xs text-slate-400">v{doc.version_no} · {doc.document_type || doc.source_department || '企业资料'}</div></div>
             <div class="text-right"><div class="text-sm font-semibold">{doc.effective_hits}</div><div class="text-[10px] text-slate-400">引用</div></div>
           </div>)}
           {popular.length === 0 && <EmptyState icon="activity" title="暂无热门资料" description="有实际引用后会在这里显示。" />}

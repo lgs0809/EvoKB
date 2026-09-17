@@ -78,7 +78,13 @@ public final class Neo4jGraphStoreAdapter implements GraphStore {
                     .encodeToString(
                         (user + ":" + (password == null ? "" : password))
                             .getBytes(StandardCharsets.UTF_8));
-    this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+    // Neo4j's transactional HTTP endpoint is HTTP/1.1. Explicitly pin the client version so a
+    // reused HTTP/2 stream cannot be reset while a relation batch is being encoded/decoded.
+    this.http =
+        HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_1_1)
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
     this.mapper = mapper;
     this.jdbc = jdbc;
     ensureSchema();
@@ -272,7 +278,6 @@ public final class Neo4jGraphStoreAdapter implements GraphStore {
     if (filters != null) {
       append(sql, args, "m.source_department=?", filters.sourceDepartment());
       append(sql, args, "m.material_category=?", filters.materialCategory());
-      append(sql, args, "m.company=?", filters.company());
       append(
           sql,
           args,

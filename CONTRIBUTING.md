@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢参与 Enterprise Knowledge Base。
+感谢参与 EvoKB。
 
 ## 开发环境
 

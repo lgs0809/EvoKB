@@ -6,6 +6,7 @@ import cn.lgs.knowledgebase.application.port.Ports.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.BufferedOutputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -16,6 +17,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -92,8 +94,9 @@ public final class ObjectStoreSourcePackageService implements SourcePackageServi
       group.evidenceIds.add(ref.evidenceId());
     }
     List<PackageVersion> versions = new ArrayList<>();
+    Set<String> usedNames = new LinkedHashSet<>();
     for (VersionGroup group : byVersion.values()) {
-      String archivePath = archivePath(group.ref);
+      String archivePath = uniqueFilename(group.ref.originalFilename(), usedNames);
       versions.add(
           new PackageVersion(
               group.ref.versionId(),
@@ -105,14 +108,89 @@ public final class ObjectStoreSourcePackageService implements SourcePackageServi
     }
     Instant generatedAt = clock.instant();
     PackageManifest manifest = new PackageManifest(generatedAt, requested, versions);
+    return publish(manifest, generatedAt);
+  }
+
+  @Override
+  public PublishedPackage packageGroupedSources(List<SourcePackageGroup> groups) {
+    List<SourcePackageGroup> requestedGroups =
+        groups == null
+            ? List.of()
+            : groups.stream()
+                .filter(group -> group != null && !group.evidenceIds().isEmpty())
+                .toList();
+    if (requestedGroups.isEmpty())
+      throw new IllegalArgumentException("at least one query source group is required");
+
+    List<String> requested = new ArrayList<>();
+    List<PackageVersion> versions = new ArrayList<>();
+    Set<String> usedFolders = new LinkedHashSet<>();
+    for (int i = 0; i < requestedGroups.size(); i++) {
+      SourcePackageGroup sourceGroup = requestedGroups.get(i);
+      List<String> evidenceIds =
+          sourceGroup.evidenceIds().stream()
+              .filter(v -> v != null && !v.isBlank())
+              .map(String::trim)
+              .distinct()
+              .toList();
+      if (evidenceIds.isEmpty()) continue;
+      requested.addAll(evidenceIds);
+      List<EvidenceSourceRef> refs = repository.evidenceSources(evidenceIds);
+      if (refs.size() != evidenceIds.size())
+        throw new IllegalStateException("one or more evidence IDs cannot be resolved");
+      Map<String, VersionGroup> byVersion = new LinkedHashMap<>();
+      for (EvidenceSourceRef ref : refs) {
+        VersionGroup group =
+            byVersion.computeIfAbsent(ref.versionId(), key -> new VersionGroup(ref));
+        group.evidenceIds.add(ref.evidenceId());
+      }
+      String folder = uniqueFolder(sourceGroup.folderName(), usedFolders);
+      Set<String> usedNames = new LinkedHashSet<>();
+      for (VersionGroup group : byVersion.values()) {
+        versions.add(
+            new PackageVersion(
+                group.ref.versionId(),
+                group.ref.documentId(),
+                group.ref.originalFilename(),
+                group.ref.objectKey(),
+                folder + "/" + uniqueFilename(group.ref.originalFilename(), usedNames),
+                List.copyOf(group.evidenceIds)));
+      }
+    }
+    if (versions.isEmpty())
+      throw new IllegalArgumentException("query source groups contain no evidence");
+    Instant generatedAt = clock.instant();
+    return publish(
+        new PackageManifest(generatedAt, List.copyOf(requested), List.copyOf(versions)),
+        generatedAt);
+  }
+
+  @Override
+  public PackageAccess accessPackage(String objectKey) {
+    if (objectKey == null || objectKey.isBlank())
+      throw new IllegalArgumentException("package object key is required");
+    String normalized = objectKey.trim();
+    objects.stat(normalized);
+    Instant expiresAt = clock.instant().plus(expiry);
+    return new PackageAccess(objects.presignGet(normalized, expiry), expiresAt);
+  }
+
+  @Override
+  public void deletePackage(String objectKey) {
+    if (objectKey == null || objectKey.isBlank()) return;
+    objects.delete(objectKey.trim());
+  }
+
+  private PublishedPackage publish(PackageManifest manifest, Instant generatedAt) {
     String packageId = UUID.randomUUID().toString();
     String objectKey = "packages/" + packageId + ".zip";
     Path temp = null;
     try {
       temp = Files.createTempFile("ekb-package-", ".zip");
       try (ZipOutputStream zip =
-          new ZipOutputStream(new BufferedOutputStream(Files.newOutputStream(temp)))) {
-        for (PackageVersion version : versions) {
+          new ZipOutputStream(
+              new BufferedOutputStream(Files.newOutputStream(temp)), StandardCharsets.UTF_8)) {
+        for (PackageVersion version : manifest.versions()) {
           zip.putNextEntry(new ZipEntry(version.archivePath()));
           StoredObject stored = objects.get(version.objectKey());
           try (InputStream input = stored.stream()) {
@@ -150,14 +228,25 @@ public final class ObjectStoreSourcePackageService implements SourcePackageServi
     return refs.get(0);
   }
 
-  private static String archivePath(EvidenceSourceRef ref) {
-    String filename = safeFilename(ref.originalFilename());
-    return "sources/"
-        + safeSegment(ref.documentId())
-        + "/"
-        + safeSegment(ref.versionId())
-        + "/"
-        + filename;
+  private static String uniqueFilename(String value, Set<String> used) {
+    String filename = safeFilename(value);
+    if (used.add(filename)) return filename;
+    int dot = filename.lastIndexOf('.');
+    String base = dot > 0 ? filename.substring(0, dot) : filename;
+    String suffix = dot > 0 ? filename.substring(dot) : "";
+    for (int i = 2; ; i++) {
+      String candidate = base + " (" + i + ")" + suffix;
+      if (used.add(candidate)) return candidate;
+    }
+  }
+
+  private static String uniqueFolder(String value, Set<String> used) {
+    String folder = safeFolder(value);
+    if (used.add(folder)) return folder;
+    for (int i = 2; ; i++) {
+      String candidate = folder + " (" + i + ")";
+      if (used.add(candidate)) return candidate;
+    }
   }
 
   private static String safeFilename(String value) {
@@ -168,9 +257,14 @@ public final class ObjectStoreSourcePackageService implements SourcePackageServi
     return normalized.isEmpty() ? "source.bin" : normalized;
   }
 
-  private static String safeSegment(String value) {
-    String v = value == null ? "unknown" : value.replaceAll("[^A-Za-z0-9._-]", "_");
-    return v.isEmpty() ? "unknown" : v;
+  private static String safeFolder(String value) {
+    String normalized = value == null ? "query" : value.trim();
+    normalized = normalized.replaceAll("[\\\\/:*?\"<>|\\r\\n\\x00-\\x1f]", "_");
+    normalized = normalized.replaceAll("\\s+", " ").trim();
+    while (normalized.endsWith(".")) normalized = normalized.substring(0, normalized.length() - 1);
+    if (normalized.isEmpty()) normalized = "query";
+    if (normalized.length() > 80) normalized = normalized.substring(0, 80).trim();
+    return normalized;
   }
 
   private static <T> T require(T value, String name) {

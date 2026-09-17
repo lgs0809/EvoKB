@@ -6,16 +6,27 @@ import cn.lgs.knowledgebase.application.compilation.*;
 import cn.lgs.knowledgebase.application.evaluation.ArtifactEvaluationApplicationService;
 import cn.lgs.knowledgebase.application.identity.IdentityApplicationService;
 import cn.lgs.knowledgebase.application.ingestion.ManagedIngestionApplicationService;
+import cn.lgs.knowledgebase.application.model.ModelConfigurationApplicationService;
+import cn.lgs.knowledgebase.application.model.ModelConfigurationApplicationService.EffectiveConfiguration;
+import cn.lgs.knowledgebase.application.operations.DocumentMetadataApplicationService;
 import cn.lgs.knowledgebase.application.operations.EnterpriseOperations;
 import cn.lgs.knowledgebase.application.port.Ports.*;
+import cn.lgs.knowledgebase.application.query.AsyncKnowledgeQueryService;
+import cn.lgs.knowledgebase.application.query.KnowledgeQueryOrchestrator;
+import cn.lgs.knowledgebase.application.query.QueryHistoryApplicationService;
+import cn.lgs.knowledgebase.application.raw.RawEmbeddingRebuildService;
 import cn.lgs.knowledgebase.application.raw.RawIngestionApplicationService;
 import cn.lgs.knowledgebase.application.retrieval.RetrievalApplicationService;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Quotas;
+import cn.lgs.knowledgebase.infrastructure.compilation.DurableCompilationWorker;
+import cn.lgs.knowledgebase.infrastructure.compilation.DurableEmbeddingRebuildWorker;
 import cn.lgs.knowledgebase.infrastructure.evidence.ObjectStoreSourcePackageService;
 import cn.lgs.knowledgebase.infrastructure.graph.GraphRetrievalLane;
 import cn.lgs.knowledgebase.infrastructure.graph.Neo4jGraphStoreAdapter;
 import cn.lgs.knowledgebase.infrastructure.ingestion.DurableIngestionWorker;
+import cn.lgs.knowledgebase.infrastructure.model.JdbcModelConfigurationStore;
 import cn.lgs.knowledgebase.infrastructure.model.OpenAiCompatibleModelServingAdapter;
+import cn.lgs.knowledgebase.infrastructure.model.AssistantEvidenceFallbackKnowledgeModel;
 import cn.lgs.knowledgebase.infrastructure.model.SpringAiAlibabaKnowledgeModel;
 import cn.lgs.knowledgebase.infrastructure.parser.JacksonParsedArtifactEncoder;
 import cn.lgs.knowledgebase.infrastructure.parser.MinerUPipelineAdapter;
@@ -37,8 +48,10 @@ import cn.lgs.knowledgebase.interfaces.mcp.EnterpriseMcpTools;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
-import org.springframework.ai.chat.client.ChatClient;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.tool.method.MethodToolCallbackProvider;
 import org.springframework.context.annotation.Bean;
@@ -104,6 +117,7 @@ public class EnterpriseConfiguration {
         required(env, "EKB_MINERU_URL"),
         mapper,
         Duration.ofMillis(integer(env, "EKB_MINERU_POLL_MS", 500)),
+        Duration.ofSeconds(integer(env, "EKB_MINERU_TASK_TIMEOUT_SECONDS", 14400)),
         value(env, "EKB_MINERU_PARSE_METHOD", "auto"),
         value(env, "EKB_MINERU_LANGUAGE", "ch"));
   }
@@ -125,18 +139,44 @@ public class EnterpriseConfiguration {
   }
 
   @Bean
-  OpenAiCompatibleModelServingAdapter modelServing(Environment env) {
+  JdbcModelConfigurationStore modelConfigurationStore(
+      JdbcTemplate jdbc, TransactionTemplate tx, Environment env) {
+    return new JdbcModelConfigurationStore(
+        jdbc,
+        tx,
+        new EffectiveConfiguration(
+            firstValue(env, "", "EKB_CHAT_BASE_URL", "EKB_ASK_BASE_URL", "EKB_LLM_BASE_URL"),
+            firstValue(env, "", "EKB_CHAT_API_KEY", "EKB_ASK_API_KEY", "EKB_LLM_API_KEY"),
+            firstValue(env, "", "EKB_SMALL_MODEL", "EKB_LLM_JUDGE_MODEL"),
+            firstValue(env, "", "EKB_LARGE_MODEL", "EKB_LLM_MODEL", "EKB_ASK_MODEL"),
+            integer(env, "EKB_CHAT_TIMEOUT_SECONDS", 120),
+            firstValue(env, "", "EKB_EMBEDDING_BASE_URL", "EKB_MODELS_URL"),
+            firstValue(env, "", "EKB_EMBEDDING_API_KEY", "EKB_MODELS_API_KEY"),
+            firstValue(env, "", "EKB_EMBEDDING_MODEL", "EKB_EMBED_MODEL"),
+            integer(env, "EKB_EMBED_DIMS", 1024),
+            integer(env, "EKB_EMBED_BATCH_SIZE", 16),
+            integer(env, "EKB_EMBED_TIMEOUT_SECONDS", 120),
+            firstValue(env, "", "EKB_RERANK_BASE_URL", "EKB_MODELS_URL"),
+            firstValue(env, "", "EKB_RERANK_API_KEY", "EKB_MODELS_API_KEY"),
+            value(env, "EKB_RERANK_MODEL", ""),
+            integer(env, "EKB_RERANK_TIMEOUT_SECONDS", 30),
+            Instant.EPOCH));
+  }
+
+  @Bean
+  ModelConfigurationApplicationService modelConfigurationApplicationService(
+      JdbcModelConfigurationStore store) {
+    return new ModelConfigurationApplicationService(store);
+  }
+
+  @Bean
+  OpenAiCompatibleModelServingAdapter modelServing(
+      JdbcModelConfigurationStore store, ObjectMapper mapper, Environment env) {
     return new OpenAiCompatibleModelServingAdapter(
-        required(env, "EKB_EMBEDDING_BASE_URL"),
-        value(env, "EKB_EMBEDDING_API_KEY", ""),
-        required(env, "EKB_EMBEDDING_MODEL"),
-        required(env, "EKB_RERANK_BASE_URL"),
-        value(env, "EKB_RERANK_API_KEY", ""),
-        required(env, "EKB_RERANK_MODEL"),
-        integer(env, "EKB_EMBED_DIMS", 1024),
-        integer(env, "EKB_EMBED_BATCH_SIZE", 16),
-        Duration.ofSeconds(integer(env, "EKB_EMBED_TIMEOUT_SECONDS", 120)),
-        Duration.ofSeconds(integer(env, "EKB_RERANK_TIMEOUT_SECONDS", 30)));
+        store,
+        mapper,
+        integer(env, "EKB_EMBED_MAX_CONCURRENCY", 1),
+        integer(env, "EKB_RERANK_MAX_CONCURRENCY", 1));
   }
 
   @Bean
@@ -162,8 +202,18 @@ public class EnterpriseConfiguration {
   }
 
   @Bean
-  JdbcEnterpriseOperations operations(JdbcTemplate jdbc, ObjectMapper mapper) {
-    return new JdbcEnterpriseOperations(jdbc, mapper);
+  JdbcEnterpriseOperations operations(
+      JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper) {
+    return new JdbcEnterpriseOperations(jdbc, tx, mapper);
+  }
+
+  @Bean
+  DocumentMetadataApplicationService documentMetadataApplicationService(
+      JdbcEnterpriseOperations operations,
+      JdbcIdentityRepository identity,
+      OpenSearchRawIndexAdapter rawIndex,
+      OpenSearchDerivedIndexAdapter derivedIndex) {
+    return new DocumentMetadataApplicationService(operations, identity, rawIndex, derivedIndex);
   }
 
   @Bean
@@ -198,9 +248,13 @@ public class EnterpriseConfiguration {
   }
 
   @Bean
-  SpringAiAlibabaKnowledgeModel knowledgeModel(ChatClient.Builder builder, Environment env) {
-    return new SpringAiAlibabaKnowledgeModel(
-        builder, required(env, "EKB_SMALL_MODEL"), required(env, "EKB_LARGE_MODEL"));
+  KnowledgeModel knowledgeModel(
+      JdbcModelConfigurationStore store, ObjectMapper mapper, Environment env) {
+    KnowledgeModel remote = new SpringAiAlibabaKnowledgeModel(store, mapper);
+    String stagingRoot = value(env, "EKB_STAGING_ROOT", "/var/lib/enterprise-kb/staging");
+    Path fallbackMarker = Path.of(stagingRoot).resolve(".assistant-evidence-fallback");
+    return new AssistantEvidenceFallbackKnowledgeModel(
+        remote, mapper, value(env, "EKB_ASSISTANT_FALLBACK", "disabled"), fallbackMarker);
   }
 
   @Bean
@@ -264,6 +318,49 @@ public class EnterpriseConfiguration {
   }
 
   @Bean
+  JdbcQuerySessionRepository querySessionRepository(
+      JdbcTemplate jdbc, TransactionTemplate tx, ObjectMapper mapper) {
+    return new JdbcQuerySessionRepository(jdbc, tx, mapper);
+  }
+
+  @Bean
+  QueryHistoryApplicationService queryHistoryApplicationService(
+      JdbcQuerySessionRepository sessions, ObjectStoreSourcePackageService packages) {
+    return new QueryHistoryApplicationService(sessions, sessions, packages);
+  }
+
+  @Bean
+  KnowledgeQueryOrchestrator knowledgeQueryOrchestrator(
+      RetrievalApplicationService retrieval,
+      AskApplicationService ask,
+      KnowledgeModel model,
+      JdbcQuerySessionRepository sessions,
+      JdbcKnowledgeRepository knowledge,
+      Environment env) {
+    return new KnowledgeQueryOrchestrator(
+        retrieval,
+        ask,
+        model,
+        sessions,
+        knowledge::resolveEvidence,
+        integer(env, "EKB_QUERY_MAX_RETRIEVAL_ROUNDS", 3),
+        integer(env, "EKB_QUERY_MAX_TOTAL_QUERIES", 8),
+        integer(env, "EKB_QUERY_MAX_QUERIES_PER_ROUND", 3),
+        integer(env, "EKB_QUERY_EVIDENCE_CONTEXT_CHARS", 12000));
+  }
+
+  @Bean(destroyMethod = "shutdown")
+  ExecutorService knowledgeQueryExecutor(Environment env) {
+    return Executors.newFixedThreadPool(integer(env, "EKB_QUERY_WORKER_THREADS", 2));
+  }
+
+  @Bean
+  AsyncKnowledgeQueryService asyncKnowledgeQueryService(
+      KnowledgeQueryOrchestrator orchestrator, ExecutorService knowledgeQueryExecutor) {
+    return new AsyncKnowledgeQueryService(orchestrator, knowledgeQueryExecutor);
+  }
+
+  @Bean
   RawIngestionApplicationService rawIngestionApplicationService(
       LocalFileSourceAdapter files,
       ObjectStore objects,
@@ -296,13 +393,16 @@ public class EnterpriseConfiguration {
       JdbcIngestionRepository uploads,
       RawIngestionApplicationService raw,
       LocalFileSourceAdapter files,
+      JdbcGenerationTaskRepository generationTasks,
       Environment env) {
     return new DurableIngestionWorker(
         uploads,
         raw,
         files,
+        generationTasks,
         Duration.ofMillis(integer(env, "EKB_INGEST_POLL_MS", 1000)),
-        integer(env, "EKB_INGEST_CLAIM_LIMIT", 1));
+        integer(env, "EKB_INGEST_CLAIM_LIMIT", 1),
+        integer(env, "EKB_INGEST_WORKERS", 3));
   }
 
   @Bean
@@ -319,6 +419,12 @@ public class EnterpriseConfiguration {
       OpenAiCompatibleModelServingAdapter embeddings,
       OpenSearchDerivedIndexAdapter derived) {
     return new SummaryCompilationService(repo, model, objects, embeddings, derived);
+  }
+
+  @Bean
+  ConceptCompilationService conceptCompilation(
+      CompilationContracts.CompilationRepository repo, KnowledgeModel model) {
+    return new ConceptCompilationService(repo, model);
   }
 
   @Bean
@@ -347,6 +453,60 @@ public class EnterpriseConfiguration {
       OpenAiCompatibleModelServingAdapter embeddings,
       OpenSearchDerivedIndexAdapter derived) {
     return new WikiCompilationService(repo, model, objects, embeddings, derived);
+  }
+
+  @Bean
+  JdbcGenerationTaskRepository generationTaskRepository(JdbcTemplate jdbc, TransactionTemplate tx) {
+    return new JdbcGenerationTaskRepository(jdbc, tx);
+  }
+
+  @Bean
+  KnowledgeGenerationApplicationService knowledgeGenerationApplicationService(
+      CompilationContracts.CompilationRepository compilation, JdbcGenerationTaskRepository tasks) {
+    return new KnowledgeGenerationApplicationService(compilation, tasks);
+  }
+
+  @Bean
+  EmbeddingRebuildCheckpointRepository embeddingRebuildCheckpointRepository(JdbcTemplate jdbc) {
+    return new JdbcEmbeddingRebuildCheckpointRepository(jdbc);
+  }
+
+  @Bean
+  RawEmbeddingRebuildService rawEmbeddingRebuildService(
+      CompilationContracts.CompilationRepository compilation,
+      OpenSearchRawIndexAdapter rawIndex,
+      OpenAiCompatibleModelServingAdapter models,
+      EmbeddingRebuildCheckpointRepository checkpoints) {
+    return new RawEmbeddingRebuildService(compilation, rawIndex, models, checkpoints);
+  }
+
+  @Bean
+  DurableEmbeddingRebuildWorker embeddingRebuildWorker(
+      JdbcGenerationTaskRepository tasks, RawEmbeddingRebuildService rebuild, Environment env) {
+    return new DurableEmbeddingRebuildWorker(
+        tasks, rebuild, Duration.ofMillis(integer(env, "EKB_EMBEDDING_REBUILD_POLL_MS", 1000)));
+  }
+
+  @Bean
+  DurableCompilationWorker compilationWorker(
+      JdbcGenerationTaskRepository tasks,
+      CompilationContracts.CompilationRepository compilation,
+      SummaryCompilationService summaries,
+      ConceptCompilationService concepts,
+      GraphCompilationService graph,
+      WikiCompilationService wiki,
+      WikiKeywordProjectionService projection,
+      Environment env) {
+    return new DurableCompilationWorker(
+        tasks,
+        compilation,
+        summaries,
+        concepts,
+        graph,
+        wiki,
+        projection,
+        Duration.ofMillis(integer(env, "EKB_COMPILATION_POLL_MS", 1000)),
+        integer(env, "EKB_COMPILATION_CLAIM_LIMIT", 1));
   }
 
   @Bean
@@ -427,6 +587,14 @@ public class EnterpriseConfiguration {
   private static String value(Environment env, String name, String fallback) {
     String v = env.getProperty(name);
     return v == null || v.isBlank() ? fallback : v.trim();
+  }
+
+  private static String firstValue(Environment env, String fallback, String... names) {
+    for (String name : names) {
+      String value = env.getProperty(name);
+      if (value != null && !value.isBlank()) return value.trim();
+    }
+    return fallback;
   }
 
   private static int integer(Environment env, String name, int fallback) {

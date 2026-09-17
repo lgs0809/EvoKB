@@ -1,5 +1,8 @@
 package cn.lgs.knowledgebase.infrastructure.persistence;
 
+import static cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.contextualEvidenceContent;
+import static cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.sha256;
+
 import cn.lgs.knowledgebase.application.port.Ports.KnowledgeRepository;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Document;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.DocumentVersion;
@@ -109,15 +112,16 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
   }
 
   @Override
-  public void resetFailedVersion(String versionId, Metadata metadata) {
+  public void resetFailedVersion(String versionId, Metadata metadata, boolean preserveParsed) {
     transactions.executeWithoutResult(
         status -> {
-          int rows =
-              jdbc.update(
-                  "UPDATE document_version SET lifecycle='PENDING',failure_code=NULL,failure_message=NULL,"
+          String sql =
+              preserveParsed
+                  ? "UPDATE document_version SET lifecycle='PENDING',failure_code=NULL,failure_message=NULL,activated_at=NULL WHERE version_id=? AND lifecycle IN ('FAILED','PENDING')"
+                  : "UPDATE document_version SET lifecycle='PENDING',failure_code=NULL,failure_message=NULL,"
                       + "markdown_object_key=NULL,structured_object_key=NULL,parser_name=NULL,parser_version=NULL,parsed_at=NULL,activated_at=NULL "
-                      + "WHERE version_id=? AND lifecycle='FAILED'",
-                  versionId);
+                      + "WHERE version_id=? AND lifecycle IN ('FAILED','PENDING')";
+          int rows = jdbc.update(sql, versionId);
           if (rows != 1) throw new IllegalStateException("version is not FAILED: " + versionId);
           jdbc.update("UPDATE evidence SET active=FALSE WHERE version_id=?", versionId);
           jdbc.update(
@@ -130,6 +134,30 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
               nullable(metadata.documentType()),
               versionId);
         });
+  }
+
+  @Override
+  public List<RawBlock> rawBlocks(String versionId) {
+    return jdbc.query(
+        "SELECT block_id,version_id,block_no,block_type,raw_content,normalized_content,heading_path,page_start,page_end,bbox_json,source_block_ids,content_hash,token_count "
+            + "FROM raw_block WHERE version_id=? ORDER BY block_no",
+        (rs, rowNum) ->
+            new RawBlock(
+                rs.getString(1),
+                rs.getString(2),
+                rs.getInt(3),
+                rs.getString(4),
+                rs.getString(5),
+                rs.getString(6),
+                strings(rs.getString(7)),
+                (Integer) rs.getObject(8),
+                (Integer) rs.getObject(9),
+                doubles(rs.getString(10)),
+                List.of(),
+                strings(rs.getString(11)),
+                rs.getString(12),
+                rs.getInt(13)),
+        versionId);
   }
 
   @Override
@@ -242,7 +270,7 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
     if (evidenceIds == null || evidenceIds.isEmpty()) return List.of();
     String placeholders = String.join(",", Collections.nCopies(evidenceIds.size(), "?"));
     String sql =
-        "SELECT e.evidence_id,e.document_id,e.version_id,e.block_id,e.object_key,e.raw_location,e.content_hash,b.raw_content "
+        "SELECT e.evidence_id,e.document_id,e.version_id,e.block_id,e.object_key,e.raw_location,e.content_hash,b.raw_content,b.heading_path "
             + "FROM evidence e JOIN raw_block b ON b.block_id=e.block_id WHERE e.active=TRUE AND e.evidence_id IN ("
             + placeholders
             + ")";
@@ -250,6 +278,7 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
     jdbc.query(
         sql,
         rs -> {
+          String content = contextualEvidenceContent(strings(rs.getString(9)), rs.getString(8));
           Evidence item =
               new Evidence(
                   rs.getString(1),
@@ -258,8 +287,8 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
                   rs.getString(4),
                   rs.getString(5),
                   map(rs.getString(6)),
-                  rs.getString(8),
-                  rs.getString(7));
+                  content,
+                  sha256(content));
           byId.put(item.id(), item);
         },
         evidenceIds.toArray());
@@ -297,6 +326,22 @@ public final class JdbcKnowledgeRepository implements KnowledgeRepository {
   private Map<String, Object> map(String json) {
     try {
       return mapper.readValue(json, new TypeReference<Map<String, Object>>() {});
+    } catch (JsonProcessingException e) {
+      throw new IllegalStateException("JSON parse failed", e);
+    }
+  }
+
+  private List<String> strings(String json) {
+    try {
+      return mapper.readValue(json, new TypeReference<List<String>>() {});
+    } catch (JsonProcessingException e) {
+      throw new IllegalStateException("JSON parse failed", e);
+    }
+  }
+
+  private List<Double> doubles(String json) {
+    try {
+      return mapper.readValue(json, new TypeReference<List<Double>>() {});
     } catch (JsonProcessingException e) {
       throw new IllegalStateException("JSON parse failed", e);
     }

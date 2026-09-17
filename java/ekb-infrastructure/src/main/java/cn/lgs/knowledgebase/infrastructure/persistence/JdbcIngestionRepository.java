@@ -314,13 +314,34 @@ public final class JdbcIngestionRepository implements UploadRepository {
   }
 
   @Override
+  public String parserTaskId(String fileId) {
+    String value =
+        jdbc.queryForObject(
+            "SELECT COALESCE(parser_task_id,'') FROM ingestion_file WHERE file_id=?",
+            String.class,
+            fileId);
+    return value == null ? "" : value.trim();
+  }
+
+  @Override
+  public void updateParserTaskId(String fileId, String parserTaskId, Instant now) {
+    int rows =
+        jdbc.update(
+            "UPDATE ingestion_file SET parser_task_id=?,updated_at=? WHERE file_id=?",
+            nullable(parserTaskId),
+            ts(now),
+            fileId);
+    if (rows == 0) throw new IllegalStateException("ingestion file not found: " + fileId);
+  }
+
+  @Override
   public void complete(String fileId, String documentId, String versionId, Instant now) {
     FileItem file =
         findFile(fileId).orElseThrow(() -> new IllegalStateException("ingestion file not found"));
     transactions.executeWithoutResult(
         status -> {
           jdbc.update(
-              "UPDATE ingestion_file SET status='SUCCEEDED',progress_stage='SUCCEEDED',document_id=?,version_id=?,error_code='',error_message=NULL,finished_at=?,updated_at=? WHERE file_id=?",
+              "UPDATE ingestion_file SET status='SUCCEEDED',progress_stage='SUCCEEDED',document_id=?,version_id=?,parser_task_id=NULL,error_code='',error_message=NULL,finished_at=?,updated_at=? WHERE file_id=?",
               documentId,
               versionId,
               ts(now),

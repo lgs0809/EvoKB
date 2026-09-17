@@ -55,9 +55,18 @@ public final class RawIngestionApplicationService {
   }
 
   public IngestResult ingest(IngestCommand command, Consumer<ProgressStage> progress) {
+    return ingest(command, progress, "", ignored -> {});
+  }
+
+  public IngestResult ingest(
+      IngestCommand command,
+      Consumer<ProgressStage> progress,
+      String resumeParserTaskId,
+      Consumer<String> parserTaskIdSink) {
     if (command == null) throw new IllegalArgumentException("ingest command is required");
     if (command.path() == null || command.path().isBlank())
       throw new IllegalArgumentException("path is required");
+    Consumer<String> taskSink = parserTaskIdSink == null ? ignored -> {} : parserTaskIdSink;
     SourceFile source = files.inspect(command.path());
     String logicalName =
         command.logicalName() == null || command.logicalName().isBlank()
@@ -92,8 +101,10 @@ public final class RawIngestionApplicationService {
               existing.structuredObjectKey(),
               List.of());
         }
-        if (existing.lifecycle() == VersionLifecycle.FAILED) retry = existing;
-        else
+        if (existing.lifecycle() == VersionLifecycle.FAILED
+            || existing.lifecycle() == VersionLifecycle.PENDING) {
+          retry = existing;
+        } else
           throw new IllegalStateException(
               "identical content already exists as version "
                   + existing.id()
@@ -101,6 +112,13 @@ public final class RawIngestionApplicationService {
                   + existing.lifecycle());
       }
     }
+    List<RawBlock> reusableBlocks = List.of();
+    boolean resumeParsed = false;
+    if (retry != null) {
+      reusableBlocks = metadata.rawBlocks(retry.id());
+      resumeParsed = !reusableBlocks.isEmpty();
+    }
+
     DocumentVersion previousActive = metadata.currentActiveVersion(document.id()).orElse(null);
     DocumentVersion version =
         retry == null
@@ -128,10 +146,10 @@ public final class RawIngestionApplicationService {
                 source.size(),
                 source.sha256(),
                 retry.originalObjectKey(),
-                "",
-                "",
-                "",
-                "");
+                retry.markdownObjectKey(),
+                retry.structuredObjectKey(),
+                retry.parserName(),
+                retry.parserVersion());
     String versionId = version.id();
     String originalKey =
         retry != null && retry.originalObjectKey() != null && !retry.originalObjectKey().isBlank()
@@ -164,76 +182,103 @@ public final class RawIngestionApplicationService {
 
     if (retry != null) {
       search.ensureIndex(embedder.dimensions());
-      search.deleteVersion(versionId);
-      metadata.resetFailedVersion(versionId, requestedMetadata);
+      // A parsed-but-failed retry may already have durable prefix chunks in the raw index.  Keep
+      // those documents so a model/container restart can resume from the checkpoint instead of
+      // throwing away hours of CPU work.  Parser retries without reusable blocks still start from
+      // a clean version.
+      if (!resumeParsed) search.deleteVersion(versionId);
+      metadata.resetFailedVersion(versionId, requestedMetadata, resumeParsed);
     } else {
       metadata.createPendingVersion(document, version, requestedMetadata);
     }
 
     final String finalOriginalKey = originalKey;
     try {
-      emit(progress, ProgressStage.PARSING);
-      ParsedDocument parsed;
-      var stored = objects.get(originalKey);
-      try (InputStream input = stored.stream()) {
-        parsed = parser.parse(source.filename(), input);
-      } catch (Exception e) {
-        throw failure(versionId, "PARSER_FAILED", wrap("parser failed", e));
-      }
-      if (parsed.parserName() == null
-          || parsed.parserName().isBlank()
-          || parsed.parserVersion() == null
-          || parsed.parserVersion().isBlank()) {
-        throw failure(
-            versionId,
-            "PARSER_IDENTITY_MISSING",
-            new IllegalStateException("parser name/version missing"));
-      }
-      byte[] markdown = parsed.markdown().getBytes(StandardCharsets.UTF_8);
-      objects.put(
-          markdownKey,
-          new ByteArrayInputStream(markdown),
-          markdown.length,
-          "text/markdown; charset=utf-8");
-      byte[] structured = artifactEncoder.structuredArtifact(parsed);
-      objects.put(
-          structuredKey,
-          new ByteArrayInputStream(structured),
-          structured.length,
-          "application/json");
+      List<RawBlock> blocks;
+      List<Evidence> evidence;
+      if (resumeParsed) {
+        emit(progress, ProgressStage.EVIDENCE);
+        blocks = reusableBlocks;
+        evidence = RawKnowledgeBuilder.evidence(document.id(), finalOriginalKey, blocks);
+      } else {
+        emit(progress, ProgressStage.PARSING);
+        ParsedDocument parsed;
+        var stored = objects.get(originalKey);
+        try (InputStream input = stored.stream()) {
+          parsed = parser.parse(source.filename(), input, resumeParserTaskId, taskSink);
+        } catch (Exception e) {
+          throw failure(versionId, "PARSER_FAILED", wrap("parser failed", e));
+        }
+        if (parsed.parserName() == null
+            || parsed.parserName().isBlank()
+            || parsed.parserVersion() == null
+            || parsed.parserVersion().isBlank()) {
+          throw failure(
+              versionId,
+              "PARSER_IDENTITY_MISSING",
+              new IllegalStateException("parser name/version missing"));
+        }
+        byte[] markdown = parsed.markdown().getBytes(StandardCharsets.UTF_8);
+        objects.put(
+            markdownKey,
+            new ByteArrayInputStream(markdown),
+            markdown.length,
+            "text/markdown; charset=utf-8");
+        byte[] structured = artifactEncoder.structuredArtifact(parsed);
+        objects.put(
+            structuredKey,
+            new ByteArrayInputStream(structured),
+            structured.length,
+            "application/json");
 
-      emit(progress, ProgressStage.EVIDENCE);
-      List<RawBlock> blocks = RawKnowledgeBuilder.rawBlocks(versionId, parsed.blocks());
-      List<Evidence> evidence =
-          RawKnowledgeBuilder.evidence(document.id(), finalOriginalKey, blocks);
-      metadata.saveParsed(
-          versionId,
-          markdownKey,
-          structuredKey,
-          parsed.parserName(),
-          parsed.parserVersion(),
-          blocks,
-          evidence);
+        emit(progress, ProgressStage.EVIDENCE);
+        blocks = RawKnowledgeBuilder.rawBlocks(versionId, parsed.blocks());
+        evidence = RawKnowledgeBuilder.evidence(document.id(), finalOriginalKey, blocks);
+        metadata.saveParsed(
+            versionId,
+            markdownKey,
+            structuredKey,
+            parsed.parserName(),
+            parsed.parserVersion(),
+            blocks,
+            evidence);
+        taskSink.accept("");
+      }
 
       emit(progress, ProgressStage.EMBEDDING);
       List<RawKnowledgeBuilder.ChunkDraft> chunks =
           RawKnowledgeBuilder.smartChunks(document.id(), versionId, requestedMetadata, blocks);
-      List<String> texts = chunks.stream().map(RawKnowledgeBuilder.ChunkDraft::content).toList();
-      List<List<Float>> vectors = embedder.embed(texts);
-      if (vectors.size() != chunks.size()) {
-        throw failure(
-            versionId,
-            "EMBEDDING_COUNT_MISMATCH",
-            new IllegalStateException(
-                "embedding count " + vectors.size() + " != chunks " + chunks.size()));
-      }
-
-      emit(progress, ProgressStage.INDEXING);
       search.ensureIndex(embedder.dimensions());
-      search.indexRaw(
-          document.id(),
-          versionId,
-          RawKnowledgeBuilder.toIndexDocuments(chunks, evidence, vectors));
+      // The embedding request must receive the complete chunk.  The raw chunk is the semantic
+      // unit used for retrieval; do not truncate, summarize, or replace its content with a
+      // head/tail approximation.  Index each completed batch before asking for the next one so a
+      // model restart leaves a durable checkpoint that can be resumed on retry.
+      int batchSize = Math.max(1, Math.min(embedder.preferredBatchSize(), 256));
+      int from = 0;
+      if (retry != null && resumeParsed && !chunks.isEmpty()) {
+        int indexed = search.indexedChunkCount(versionId);
+        if (indexed > 0 && indexed <= chunks.size()) from = indexed;
+      }
+      emit(progress, ProgressStage.INDEXING);
+      while (from < chunks.size()) {
+        int to = Math.min(chunks.size(), from + batchSize);
+        List<RawKnowledgeBuilder.ChunkDraft> batchChunks = chunks.subList(from, to);
+        List<String> texts =
+            batchChunks.stream().map(RawKnowledgeBuilder.ChunkDraft::content).toList();
+        List<List<Float>> vectors = embedder.embed(texts);
+        if (vectors.size() != batchChunks.size()) {
+          throw failure(
+              versionId,
+              "EMBEDDING_COUNT_MISMATCH",
+              new IllegalStateException(
+                  "embedding count " + vectors.size() + " != chunks " + batchChunks.size()));
+        }
+        search.indexRaw(
+            document.id(),
+            versionId,
+            RawKnowledgeBuilder.toIndexDocuments(batchChunks, evidence, vectors));
+        from = to;
+      }
 
       emit(progress, ProgressStage.ACTIVATING);
       try {

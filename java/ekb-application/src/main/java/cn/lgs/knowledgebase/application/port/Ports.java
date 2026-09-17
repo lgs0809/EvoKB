@@ -1,6 +1,8 @@
 package cn.lgs.knowledgebase.application.port;
 
 import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.Entity;
+import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTask;
+import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.GenerationTaskType;
 import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.Relation;
 import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.SummaryArtifact;
 import cn.lgs.knowledgebase.domain.compilation.CompilationDomain.WikiPage;
@@ -15,6 +17,12 @@ import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Evidence;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.Metadata;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.RawBlock;
 import cn.lgs.knowledgebase.domain.knowledge.KnowledgeDomain.SearchFilters;
+import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryEvidenceRef;
+import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryGroup;
+import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryPackage;
+import cn.lgs.knowledgebase.domain.query.QueryDomain.QuerySession;
+import cn.lgs.knowledgebase.domain.query.QueryDomain.QueryTurn;
+import cn.lgs.knowledgebase.domain.query.QueryDomain.RetrievalRound;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.Candidate;
 import cn.lgs.knowledgebase.domain.retrieval.RetrievalDomain.LaneType;
 import java.io.InputStream;
@@ -23,6 +31,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 public final class Ports {
   private Ports() {}
@@ -118,6 +127,10 @@ public final class Ports {
         cn.lgs.knowledgebase.domain.ingestion.IngestionDomain.ProgressStage stage,
         Instant now);
 
+    String parserTaskId(String fileId);
+
+    void updateParserTaskId(String fileId, String parserTaskId, Instant now);
+
     void complete(String fileId, String documentId, String versionId, Instant now);
 
     void fail(String fileId, String errorCode, String errorMessage, Instant now);
@@ -131,6 +144,8 @@ public final class Ports {
     ObjectInfo stat(String key);
 
     String presignGet(String key, Duration expiry);
+
+    void delete(String key);
   }
 
   public record StoredObject(InputStream stream, long size, String contentType) {}
@@ -139,6 +154,11 @@ public final class Ports {
 
   public interface ParserPort {
     ParsedDocument parse(String filename, InputStream source);
+
+    default ParsedDocument parse(
+        String filename, InputStream source, String resumeTaskId, Consumer<String> taskIdSink) {
+      return parse(filename, source);
+    }
   }
 
   public record ParsedDocument(
@@ -165,6 +185,50 @@ public final class Ports {
     int dimensions();
 
     List<List<Float>> embed(List<String> texts);
+
+    /**
+     * Preferred durable ingestion batch size. Implementations may expose the runtime model
+     * configuration; test and lightweight implementations can keep the conservative default.
+     */
+    default int preferredBatchSize() {
+      return 16;
+    }
+  }
+
+  /**
+   * Durable evidence-bound checkpoints for raw embedding rebuilds.
+   *
+   * <p>A checkpoint is only reusable when the deterministic chunk content and the complete set of
+   * source evidence IDs still match. This intentionally avoids treating a file offset or a chunk
+   * count as proof that a vector is safe to reuse.
+   */
+  public interface EmbeddingRebuildCheckpointRepository {
+    List<EmbeddingRebuildCheckpoint> find(String versionId);
+
+    void markSucceeded(List<EmbeddingRebuildCheckpoint> checkpoints);
+  }
+
+  public record EmbeddingRebuildCheckpoint(
+      String versionId,
+      String chunkId,
+      String contentHash,
+      String evidenceFingerprint,
+      String evidenceIds,
+      String strategyKey) {
+    public EmbeddingRebuildCheckpoint {
+      versionId = requireText(versionId, "version id");
+      chunkId = requireText(chunkId, "chunk id");
+      contentHash = requireText(contentHash, "content hash");
+      evidenceFingerprint = requireText(evidenceFingerprint, "evidence fingerprint");
+      evidenceIds = requireText(evidenceIds, "evidence ids");
+      strategyKey = requireText(strategyKey, "strategy key");
+    }
+
+    private static String requireText(String value, String name) {
+      if (value == null || value.isBlank())
+        throw new IllegalArgumentException(name + " is required");
+      return value.trim();
+    }
   }
 
   public interface RerankerPort {
@@ -182,7 +246,9 @@ public final class Ports {
 
     void createPendingVersion(Document document, DocumentVersion version, Metadata metadata);
 
-    void resetFailedVersion(String versionId, Metadata metadata);
+    void resetFailedVersion(String versionId, Metadata metadata, boolean preserveParsed);
+
+    List<RawBlock> rawBlocks(String versionId);
 
     void saveParsed(
         String versionId,
@@ -222,11 +288,39 @@ public final class Ports {
 
     void indexRaw(String documentId, String versionId, List<RawIndexDocument> chunks);
 
+    /**
+     * Index rebuilt vectors while retaining the active flag of an existing document. This keeps an
+     * active version searchable until the complete rebuild has succeeded; adapters may fall back to
+     * the ordinary inactive write when they cannot preserve that flag.
+     */
+    default void indexRawRebuild(
+        String documentId, String versionId, List<RawIndexDocument> chunks) {
+      indexRaw(documentId, versionId, chunks);
+    }
+
+    /**
+     * Return the number of chunks already durably indexed for a non-active version. This is used
+     * only to resume a parsed-but-failed embedding run; adapters that cannot inspect their index
+     * safely return zero and the caller will re-index from the beginning.
+     */
+    default int indexedChunkCount(String versionId) {
+      return 0;
+    }
+
+    /**
+     * Remove stale chunks for a version after a successful rebuild while retaining the newly
+     * indexed chunk IDs. Implementations that cannot do this safely may leave the default no-op;
+     * callers still keep the previous active index until the rebuild succeeds.
+     */
+    default void deleteVersionExcept(String versionId, java.util.Set<String> keepChunkIds) {}
+
     void activateVersion(String documentId, String versionId);
 
     void deactivateVersion(String versionId);
 
     void deleteVersion(String versionId);
+
+    void updateMetadata(String versionId, Metadata metadata);
 
     List<Candidate> searchBm25(String query, SearchFilters filters, int limit);
 
@@ -293,6 +387,8 @@ public final class Ports {
 
     List<Candidate> searchWikiVector(List<Float> vector, SearchFilters filters, int limit);
 
+    void updateMetadata(String versionId, Metadata metadata);
+
     void deactivateVersion(String versionId);
   }
 
@@ -322,9 +418,12 @@ public final class Ports {
 
   public enum ModelTask {
     ASK,
+    QUERY_UNDERSTANDING,
+    EVIDENCE_SUFFICIENCY,
     CLASSIFY_UNIT,
     SUMMARY,
     SUMMARY_JUDGE,
+    CONCEPT_EXTRACT,
     RELATION_EXTRACT,
     RELATION_REPAIR,
     WIKI_WRITE,
@@ -346,6 +445,91 @@ public final class Ports {
         String systemPrompt,
         String userPrompt,
         Class<T> outputType);
+  }
+
+  public interface QuerySessionRepository {
+    void createSession(QuerySession session);
+
+    void updateSession(QuerySession session);
+
+    Optional<QuerySession> findSession(String sessionId);
+
+    List<QuerySession> listSessions(String userId, int limit);
+
+    void appendTurn(QueryTurn turn);
+
+    List<QueryTurn> listTurns(String sessionId);
+
+    void saveRound(RetrievalRound round);
+
+    List<RetrievalRound> listRounds(String sessionId);
+
+    void addEvidence(QueryEvidenceRef evidence);
+
+    List<QueryEvidenceRef> listEvidence(String sessionId);
+
+    void saveFeedback(
+        String feedbackId,
+        String sessionId,
+        String userId,
+        String rating,
+        String category,
+        String comment,
+        Instant createdAt);
+  }
+
+  public interface QueryHistoryRepository {
+    void renameSession(String userId, String sessionId, String name, Instant now);
+
+    void softDeleteSession(String userId, String sessionId, Instant now);
+
+    QueryGroup createGroup(QueryGroup group);
+
+    Optional<QueryGroup> findGroup(String userId, String groupId);
+
+    List<QueryGroup> listGroups(String userId);
+
+    Optional<QueryGroup> groupForSession(String userId, String sessionId);
+
+    void moveSessionToGroup(String userId, String sessionId, String groupId, Instant now);
+
+    void removeSessionFromGroup(String userId, String sessionId, Instant now);
+
+    QueryGroup renameGroup(String userId, String groupId, String name, Instant now);
+
+    void dissolveGroup(String userId, String groupId, Instant now);
+
+    List<String> softDeleteGroupAndSessions(String userId, String groupId, Instant now);
+
+    void savePackage(QueryPackage queryPackage);
+
+    void markPackageStatus(String packageId, String status, Instant deletedAt);
+
+    Optional<QueryPackage> latestPackage(String userId, String ownerType, String ownerId);
+
+    List<QueryPackage> packagesForOwner(String userId, String ownerType, String ownerId);
+  }
+
+  public interface GenerationTaskRepository {
+    GenerationTask queue(
+        String versionId, GenerationTaskType taskType, String subjectId, Instant now);
+
+    List<GenerationTask> claimPending(int limit, Instant now);
+
+    /** Claim only durable raw-embedding rebuild tasks so they cannot starve compilation tasks. */
+    default List<GenerationTask> claimPendingEmbeddingRebuild(int limit, Instant now) {
+      return List.of();
+    }
+
+    void complete(GenerationTask task, String outputHash, Instant now);
+
+    void completeConceptAndQueueDerived(GenerationTask task, String outputHash, Instant now);
+
+    void fail(String taskId, String errorCode, String errorMessage, Instant now);
+
+    void retry(String taskId, Instant now);
+
+    void resetInterrupted(Instant now);
   }
 
   public interface KnowledgeGenerationRecommendationRepository {
@@ -379,8 +563,24 @@ public final class Ports {
 
     PublishedPackage packageSources(List<String> evidenceIds);
 
+    PublishedPackage packageGroupedSources(List<SourcePackageGroup> groups);
+
+    PackageAccess accessPackage(String objectKey);
+
+    void deletePackage(String objectKey);
+
     StoredObject openOriginal(String evidenceId);
   }
+
+  public record SourcePackageGroup(String folderName, List<String> evidenceIds) {
+    public SourcePackageGroup {
+      if (folderName == null || folderName.isBlank())
+        throw new IllegalArgumentException("source package folder name is required");
+      evidenceIds = evidenceIds == null ? List.of() : List.copyOf(evidenceIds);
+    }
+  }
+
+  public record PackageAccess(String downloadUrl, Instant expiresAt) {}
 
   public record EvidenceSource(
       String evidenceId,

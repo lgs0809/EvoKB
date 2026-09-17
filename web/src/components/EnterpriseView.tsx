@@ -27,6 +27,7 @@ import { LoginPage } from '../enterprise/LoginPage';
 import { Icon, LoadingBlock, SecondaryButton } from '../enterprise/ui';
 
 const AskPage = lazy(() => import('../enterprise/AskPage').then(module => ({ default: module.AskPage })));
+const QueryHistoryPage = lazy(() => import('../enterprise/QueryHistoryPage').then(module => ({ default: module.QueryHistoryPage })));
 const SearchPage = lazy(() => import('../enterprise/SearchPage').then(module => ({ default: module.SearchPage })));
 const DocumentsPage = lazy(() => import('../enterprise/DocumentsPage').then(module => ({ default: module.DocumentsPage })));
 const WikiPage = lazy(() => import('../enterprise/WikiPage').then(module => ({ default: module.WikiPage })));
@@ -34,12 +35,14 @@ const GraphPage = lazy(() => import('../enterprise/GraphPage').then(module => ({
 const EvidencePage = lazy(() => import('../enterprise/EvidencePage').then(module => ({ default: module.EvidencePage })));
 const IngestionHistoryPage = lazy(() => import('../enterprise/IngestionHistoryPage').then(module => ({ default: module.IngestionHistoryPage })));
 const TasksPage = lazy(() => import('../enterprise/TasksPage').then(module => ({ default: module.TasksPage })));
+const QualityPage = lazy(() => import('../enterprise/QualityPage').then(module => ({ default: module.QualityPage })));
+const ModelConfigurationPage = lazy(() => import('../enterprise/ModelConfigurationPage').then(module => ({ default: module.ModelConfigurationPage })));
 const AuditPage = lazy(() => import('../enterprise/AuditPage').then(module => ({ default: module.AuditPage })));
 const AdminPage = lazy(() => import('../enterprise/AdminPage').then(module => ({ default: module.AdminPage })));
 const EvidenceSourceViewer = lazy(() => import('../enterprise/EvidenceSourceViewer').then(module => ({ default: module.EvidenceSourceViewer })));
 
-const sections: EnterpriseSection[] = ['dashboard', 'ask', 'search', 'documents', 'wiki', 'graph', 'evidence', 'ingestion', 'tasks', 'audit', 'admin'];
-const adminSections = new Set<EnterpriseSection>(['dashboard', 'search', 'tasks', 'audit', 'admin']);
+const sections: EnterpriseSection[] = ['dashboard', 'ask', 'history', 'search', 'documents', 'wiki', 'graph', 'evidence', 'ingestion', 'tasks', 'quality', 'models', 'audit', 'admin'];
+const adminSections = new Set<EnterpriseSection>(['dashboard', 'search', 'tasks', 'quality', 'models', 'audit', 'admin']);
 
 export function EnterpriseView() {
   const [section, setSection] = useState<EnterpriseSection>(() => sectionFromPath(window.location.pathname));
@@ -160,16 +163,24 @@ export function EnterpriseView() {
   if (authChecking) return <div class="flex min-h-screen items-center justify-center bg-[#f4f7fb] text-slate-400 dark:bg-slate-950"><div class="flex items-center gap-3 text-sm"><Icon name="refresh" size={18} class="animate-spin"/>正在检查登录状态…</div></div>;
   if (!user) return <LoginPage setupRequired={Boolean(authStatus?.setup_required)} onAuthenticated={nextUser => void authenticated(nextUser)}/>;
 
+  const openQuerySession = (sessionId: string) => {
+    localStorage.setItem('enterprise-kb-active-query-session', sessionId);
+    navigate('ask');
+  };
+
   const page = <Suspense fallback={<PageFallback/>}>
     {section === 'dashboard' && <DashboardPage overview={overview} documents={documents} wikis={wikis} tasks={tasks} onNavigate={navigate}/>}
     {section === 'ask' && <AskPage onOpenEvidence={setEvidence} onError={setError}/>}
+    {section === 'history' && <QueryHistoryPage onOpenSession={openQuerySession} onError={setError}/>}
     {section === 'search' && <SearchPage onOpenEvidence={setEvidence} onError={setError}/>}
-    {section === 'documents' && <DocumentsPage onNavigate={navigate} onError={setError} canUpload={Boolean(access?.can_upload)} isAdmin={user.role === 'ADMIN'} onChanged={() => void loadShellData(user)}/>}
+    {section === 'documents' && <DocumentsPage onNavigate={navigate} onOpenEvidence={setEvidence} onError={setError} canUpload={Boolean(access?.can_upload)} isAdmin={user.role === 'ADMIN'} onChanged={() => void loadShellData(user)}/>}
     {section === 'wiki' && <WikiPage onOpenEvidence={setEvidence} onError={setError}/>}
     {section === 'graph' && <GraphPage onOpenEvidence={setEvidence} onError={setError}/>}
     {section === 'evidence' && <EvidencePage overview={overview} onOpenEvidence={setEvidence} onError={setError}/>}
-    {section === 'ingestion' && <IngestionHistoryPage isAdmin={user.role === 'ADMIN'} onNavigate={navigate} onError={setError}/>}
+    {section === 'ingestion' && <IngestionHistoryPage isAdmin={user.role === 'ADMIN'} canUpload={Boolean(access?.can_upload)} onNavigate={navigate} onError={setError}/>}
     {section === 'tasks' && user.role === 'ADMIN' && <TasksPage onError={setError}/>}
+    {section === 'quality' && user.role === 'ADMIN' && <QualityPage onNavigate={navigate} onOpenEvidence={setEvidence} onError={setError}/>}
+    {section === 'models' && user.role === 'ADMIN' && <ModelConfigurationPage onError={setError}/>}
     {section === 'audit' && user.role === 'ADMIN' && <AuditPage onError={setError}/>}
     {section === 'admin' && user.role === 'ADMIN' && <AdminPage capabilities={capabilities} currentUser={user} access={access} onAccessChanged={setAccess} onError={setError}/>}
   </Suspense>;
@@ -202,6 +213,7 @@ function EvidenceDrawer({ evidence, onClose, onViewSource }: { evidence: Enterpr
     <aside class="h-full w-full max-w-2xl overflow-y-auto border-l border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-900" onClick={event => event.stopPropagation()}>
       <div class="sticky top-0 z-10 flex items-center justify-between gap-4 border-b border-slate-100 bg-white/95 px-5 py-4 backdrop-blur dark:border-slate-800 dark:bg-slate-900/95"><h2 class="text-lg font-semibold">参考资料</h2><button onClick={onClose} class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800" aria-label="关闭"><Icon name="close" size={17}/></button></div>
       <div class="space-y-5 p-5 sm:p-6">
+        <div class="flex min-w-0 items-center gap-2 rounded-xl bg-slate-50 px-3 py-2.5 text-sm font-semibold text-slate-700 dark:bg-slate-950/60 dark:text-slate-200"><Icon name="file" size={15} class="shrink-0 text-slate-400"/><span class="truncate">{evidence.source_filename || '未知文件'}</span></div>
         <div class="flex flex-wrap gap-2"><button onClick={onViewSource} class="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm shadow-blue-600/15 transition hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-400"><Icon name="file" size={15}/>查看原文件</button><SecondaryButton onClick={() => void copyContent()} icon={copied ? 'check' : 'link'}>{copied ? '已复制' : '复制原文'}</SecondaryButton></div>
         <div><div class="mb-2 text-xs font-semibold text-slate-400">原文内容</div><pre class="whitespace-pre-wrap break-words rounded-2xl border border-slate-200 bg-[#fafbfc] p-4 text-sm leading-7 text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200">{evidence.raw_content || '—'}</pre></div>
         <details class="rounded-xl border border-slate-200 p-4 dark:border-slate-800"><summary class="cursor-pointer text-sm font-medium text-slate-600 dark:text-slate-300">详细信息</summary><div class="mt-4 grid gap-3 sm:grid-cols-2"><EvidenceInfo label="资料编号" value={evidence.document_id}/><EvidenceInfo label="版本编号" value={evidence.version_id}/><EvidenceInfo label="证据编号" value={evidence.evidence_id}/></div><div class="mt-4"><div class="mb-2 text-xs font-semibold text-slate-400">原文位置</div><pre class="overflow-x-auto rounded-xl bg-slate-50 p-3 text-xs leading-6 text-slate-600 dark:bg-slate-950/60 dark:text-slate-300">{JSON.stringify(evidence.raw_location || {}, null, 2)}</pre></div></details>

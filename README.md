@@ -1,4 +1,4 @@
-# Enterprise Knowledge Base
+# EvoKB
 
 面向企业资料管理、可信查询与知识生成的自托管知识平台。
 
@@ -46,8 +46,8 @@ Spring Boot / REST / MCP
 ## 快速开始
 
 ```bash
-git clone <repository-url> enterprise-knowledge-base
-cd enterprise-knowledge-base
+git clone <repository-url> evokb
+cd evokb
 cp .env.example .env
 ```
 
@@ -81,7 +81,7 @@ http://127.0.0.1:18080/enterprise
 
 ## 配置
 
-部署配置统一使用 `EKB_*` 环境变量。常用配置：
+基础设施与启动配置使用 `EKB_*` 环境变量。LLM、Embedding、Rerank 也可以在管理员“模型配置”页面维护；页面保存值会持久化并优先用于后续模型调用，因此模型参数不再是首次启动的硬前置条件。常用配置：
 
 | 配置 | 用途 |
 | --- | --- |

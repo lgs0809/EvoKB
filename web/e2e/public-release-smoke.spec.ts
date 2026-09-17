@@ -29,7 +29,7 @@ test('fresh deployment supports the core product journey on desktop and narrow s
   await page.getByRole('button', { name: '创建管理员并进入' }).click();
 
   await expect(page.getByRole('heading', { name: '首页', level: 1 })).toBeVisible();
-  await expect(page.getByText('企业知识平台', { exact: true })).toBeVisible();
+  await expect(page.getByText('EvoKB', { exact: true })).toBeVisible();
 
   const desktopSections = ['知识查询', '企业百科', '关系图谱', '资料管理', '入库记录', '知识生成', '检索测试', '审计日志', '用户与系统'];
   for (const section of desktopSections) {

@@ -31,16 +31,11 @@ public final class EnterpriseMcpTools {
       @ToolParam(description = "Natural-language query") String query,
       @ToolParam(description = "Optional source department") String sourceDepartment,
       @ToolParam(description = "Optional material category") String materialCategory,
-      @ToolParam(description = "Optional company") String company,
       @ToolParam(description = "Optional document type") String documentType,
       @ToolParam(description = "Maximum final results, normally 1-20") Integer limit) {
     SearchFilters filters =
         new SearchFilters(
-            blank(sourceDepartment),
-            blank(materialCategory),
-            blank(company),
-            blank(documentType),
-            List.of());
+            blank(sourceDepartment), blank(materialCategory), blank(documentType), List.of());
     var result = retrieval.search(query, filters, limit == null ? 10 : limit);
     recommendations.recordDeliveredSearch(query, filters, result);
     var items =

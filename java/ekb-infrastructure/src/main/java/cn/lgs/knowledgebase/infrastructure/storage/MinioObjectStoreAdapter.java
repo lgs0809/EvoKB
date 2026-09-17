@@ -9,6 +9,7 @@ import io.minio.GetPresignedObjectUrlArgs;
 import io.minio.MakeBucketArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
+import io.minio.RemoveObjectArgs;
 import io.minio.StatObjectArgs;
 import io.minio.StatObjectResponse;
 import io.minio.http.Method;
@@ -117,6 +118,16 @@ public final class MinioObjectStoreAdapter implements ObjectStore {
               .build());
     } catch (Exception e) {
       throw new IllegalStateException("minio presign failed: " + key, e);
+    }
+  }
+
+  @Override
+  public void delete(String key) {
+    try {
+      client.removeObject(
+          RemoveObjectArgs.builder().bucket(bucket).object(require(key, "object key")).build());
+    } catch (Exception e) {
+      throw new IllegalStateException("minio delete failed: " + key, e);
     }
   }
 

@@ -177,6 +177,46 @@ public final class CompilationDomain {
     }
   }
 
+  public enum GenerationTaskType {
+    SUMMARY,
+    CONCEPT,
+    GRAPH,
+    WIKI,
+    /** Rebuild raw vectors from the durable RawBlock/Evidence source without re-uploading files. */
+    EMBEDDING_REBUILD
+  }
+
+  public enum GenerationTaskStatus {
+    PENDING,
+    RUNNING,
+    SUCCEEDED,
+    FAILED,
+    CANCELLED
+  }
+
+  public record GenerationTask(
+      String taskId,
+      String versionId,
+      GenerationTaskType taskType,
+      String subjectId,
+      GenerationTaskStatus status,
+      int attempt,
+      String errorCode,
+      String errorMessage,
+      Instant createdAt) {
+    public GenerationTask {
+      require(taskId, "generation task id");
+      require(versionId, "generation task version id");
+      Objects.requireNonNull(taskType, "taskType");
+      subjectId = subjectId == null ? "" : subjectId.trim();
+      Objects.requireNonNull(status, "status");
+      if (attempt < 0) throw new IllegalArgumentException("generation task attempt must be >= 0");
+      errorCode = errorCode == null ? "" : errorCode.trim();
+      errorMessage = errorMessage == null ? "" : errorMessage;
+      Objects.requireNonNull(createdAt, "createdAt");
+    }
+  }
+
   private static void require(String value, String name) {
     if (value == null || value.isBlank()) throw new IllegalArgumentException(name + " is required");
   }

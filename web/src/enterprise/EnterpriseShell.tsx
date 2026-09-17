@@ -1,29 +1,38 @@
 import type { ComponentChildren } from 'preact';
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import type { EnterpriseUser } from '../lib/api';
 import { Icon, type IconName } from './ui';
 
-export type EnterpriseSection = 'dashboard' | 'ask' | 'search' | 'documents' | 'wiki' | 'graph' | 'evidence' | 'ingestion' | 'tasks' | 'audit' | 'admin';
+export type EnterpriseSection = 'dashboard' | 'ask' | 'history' | 'search' | 'documents' | 'wiki' | 'graph' | 'evidence' | 'ingestion' | 'tasks' | 'quality' | 'models' | 'audit' | 'admin';
 
 type NavigationItem = { id: EnterpriseSection; label: string; icon: IconName; adminOnly?: boolean; userOnly?: boolean };
 
 const navigationItems: NavigationItem[] = [
   { id: 'dashboard', label: '首页', icon: 'dashboard', adminOnly: true },
-  { id: 'ask', label: '知识查询', icon: 'search' },
+  { id: 'ask', label: '知识查询', icon: 'chat' },
+  { id: 'history', label: '查询记录', icon: 'history' },
+  { id: 'documents', label: '资料管理', icon: 'documents' },
   { id: 'wiki', label: '企业百科', icon: 'wiki' },
   { id: 'graph', label: '关系图谱', icon: 'graph' },
-  { id: 'documents', label: '资料管理', icon: 'documents' },
-  { id: 'ingestion', label: '上传记录', icon: 'tasks', userOnly: true },
-  { id: 'ingestion', label: '入库记录', icon: 'tasks', adminOnly: true },
-  { id: 'tasks', label: '知识生成', icon: 'sparkles', adminOnly: true },
-  { id: 'search', label: '检索测试', icon: 'search', adminOnly: true },
-  { id: 'audit', label: '审计日志', icon: 'shield', adminOnly: true },
-  { id: 'admin', label: '用户与系统', icon: 'admin', adminOnly: true },
+  { id: 'ingestion', label: '上传记录', icon: 'upload', userOnly: true },
+  { id: 'ingestion', label: '入库记录', icon: 'upload', adminOnly: true },
 ];
+
+const adminNavigationItems: NavigationItem[] = [
+  { id: 'tasks', label: '知识生成', icon: 'sparkles', adminOnly: true },
+  { id: 'quality', label: '知识质量', icon: 'quality', adminOnly: true },
+  { id: 'search', label: '检索测试', icon: 'test', adminOnly: true },
+  { id: 'models', label: '模型配置', icon: 'models', adminOnly: true },
+  { id: 'audit', label: '审计日志', icon: 'audit', adminOnly: true },
+  { id: 'admin', label: '用户与系统', icon: 'users', adminOnly: true },
+];
+
+const adminNavigationSections = new Set<EnterpriseSection>(adminNavigationItems.map(item => item.id));
 
 const pageMeta: Record<EnterpriseSection, { title: string; description: string }> = {
   dashboard: { title: '首页', description: '查看知识资产、任务和质量概况。' },
   ask: { title: '知识查询', description: '查询企业知识并查看引用来源。' },
+  history: { title: '查询记录', description: '管理历史查询、查询组和已打包的引用资料。' },
   search: { title: '检索测试', description: '测试检索结果与排序效果。' },
   documents: { title: '资料管理', description: '管理资料及其版本。' },
   wiki: { title: '企业百科', description: '按主题浏览企业知识。' },
@@ -31,6 +40,8 @@ const pageMeta: Record<EnterpriseSection, { title: string; description: string }
   evidence: { title: '证据查看', description: '查看引用原文和资料位置。' },
   ingestion: { title: '入库记录', description: '查看资料上传与入库进度。' },
   tasks: { title: '知识生成', description: '查看摘要、关系和百科的生成进度。' },
+  quality: { title: '知识质量', description: '定位 Grounding、Coverage、实体、关系与百科质量问题。' },
+  models: { title: '模型配置', description: '配置 LLM、Embedding 与 Rerank，并让后续调用即时生效。' },
   audit: { title: '审计日志', description: '查看关键操作记录。' },
   admin: { title: '用户与系统', description: '管理用户、权限和系统状态。' },
 };
@@ -48,8 +59,9 @@ export function EnterpriseShell({ section, onNavigate, children, error, busy, on
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
+  const [managementOpen, setManagementOpen] = useState(() => adminNavigationSections.has(section));
   const [darkMode, setDarkMode] = useState(() => {
-    const stored = localStorage.getItem('enterprise-knowledge-base-theme');
+    const stored = localStorage.getItem('evokb-theme') ?? localStorage.getItem('enterprise-knowledge-base-theme');
     const initialDark = stored === 'dark' || (stored !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
     document.documentElement.classList.toggle('dark', initialDark);
     return initialDark;
@@ -58,6 +70,11 @@ export function EnterpriseShell({ section, onNavigate, children, error, busy, on
     ? { title: '上传记录', description: '查看我的资料上传与处理进度。' }
     : pageMeta[section];
   const visibleItems = navigationItems.filter(item => (!item.adminOnly || user.role === 'ADMIN') && (!item.userOnly || user.role !== 'ADMIN'));
+  const visibleAdminItems = user.role === 'ADMIN' ? adminNavigationItems : [];
+
+  useEffect(() => {
+    if (adminNavigationSections.has(section)) setManagementOpen(true);
+  }, [section]);
 
   const navigate = (next: EnterpriseSection) => {
     onNavigate(next);
@@ -67,7 +84,7 @@ export function EnterpriseShell({ section, onNavigate, children, error, busy, on
   const toggleTheme = () => {
     const nextDark = !darkMode;
     document.documentElement.classList.toggle('dark', nextDark);
-    localStorage.setItem('enterprise-knowledge-base-theme', nextDark ? 'dark' : 'light');
+    localStorage.setItem('evokb-theme', nextDark ? 'dark' : 'light');
     setDarkMode(nextDark);
   };
 
@@ -76,17 +93,19 @@ export function EnterpriseShell({ section, onNavigate, children, error, busy, on
     <aside class={`fixed inset-y-0 left-0 z-40 flex w-[236px] flex-col border-r border-slate-200/80 bg-white transition-transform dark:border-slate-800 dark:bg-slate-900 lg:translate-x-0 ${mobileOpen ? 'translate-x-0' : '-translate-x-full'}`}>
       <div class="flex h-20 items-center gap-3 border-b border-slate-100 px-5 dark:border-slate-800">
         <div class="flex h-10 w-10 items-center justify-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-600/20 dark:bg-blue-500"><Icon name="layers" size={21} /></div>
-        <div class="min-w-0"><div class="truncate text-sm font-semibold tracking-tight">企业知识平台</div><div class="mt-0.5 text-[11px] text-slate-400">知识管理与查询</div></div>
+        <div class="min-w-0"><div class="truncate text-sm font-semibold tracking-tight">EvoKB</div><div class="mt-0.5 text-[11px] text-slate-400">企业知识管理与查询</div></div>
       </div>
 
       <nav class="flex-1 overflow-y-auto px-3 py-4">
-        <div class="space-y-1">{visibleItems.map(item => {
-          const active = item.id === section;
-          return <button key={`${item.id}-${item.label}`} onClick={() => navigate(item.id)} class={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium transition ${active ? 'bg-blue-600 text-white shadow-sm shadow-blue-600/15 dark:bg-blue-500' : 'text-slate-600 hover:bg-blue-50 hover:text-blue-700 dark:text-slate-300 dark:hover:bg-blue-950/30 dark:hover:text-blue-300'}`}>
-            <Icon name={item.icon} size={17} class={active ? 'opacity-90' : 'text-slate-400'} />
-            <span>{item.label}</span>
-          </button>;
-        })}</div>
+        <div class="space-y-1">{visibleItems.map(item => <NavigationButton key={`${item.id}-${item.label}`} item={item} active={item.id === section} onClick={() => navigate(item.id)} />)}</div>
+        {visibleAdminItems.length > 0 && <div class="mt-4 border-t border-slate-100 pt-3 dark:border-slate-800">
+          <button onClick={() => setManagementOpen(value => !value)} class={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium transition ${adminNavigationSections.has(section) ? 'text-blue-700 dark:text-blue-300' : 'text-slate-500 hover:bg-slate-50 dark:text-slate-400 dark:hover:bg-slate-800/60'}`}>
+            <Icon name="settings" size={17} class="text-slate-400" />
+            <span class="flex-1">管理</span>
+            <Icon name="chevron" size={15} class={`transition-transform ${managementOpen ? 'rotate-90' : ''}`} />
+          </button>
+          {managementOpen && <div class="mt-1 space-y-1 pl-2">{visibleAdminItems.map(item => <NavigationButton key={`${item.id}-${item.label}`} item={item} active={item.id === section} onClick={() => navigate(item.id)} compact />)}</div>}
+        </div>}
       </nav>
     </aside>
 
@@ -118,4 +137,11 @@ export function EnterpriseShell({ section, onNavigate, children, error, busy, on
       <main class="mx-auto max-w-[1500px] p-4 sm:p-6 lg:p-8">{children}</main>
     </div>
   </div>;
+}
+
+function NavigationButton({ item, active, onClick, compact = false }: { item: NavigationItem; active: boolean; onClick: () => void; compact?: boolean }) {
+  return <button onClick={onClick} class={`flex w-full items-center gap-3 rounded-xl ${compact ? 'px-3 py-2' : 'px-3 py-2.5'} text-left text-sm font-medium transition ${active ? 'bg-blue-600 text-white shadow-sm shadow-blue-600/15 dark:bg-blue-500' : 'text-slate-600 hover:bg-blue-50 hover:text-blue-700 dark:text-slate-300 dark:hover:bg-blue-950/30 dark:hover:text-blue-300'}`}>
+    <Icon name={item.icon} size={17} class={active ? 'opacity-90' : 'text-slate-400'} />
+    <span>{item.label}</span>
+  </button>;
 }

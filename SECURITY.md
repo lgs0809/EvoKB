@@ -1,6 +1,6 @@
 # Security Policy
 
-Enterprise Knowledge Base does not ship default credentials and does not require secrets to be committed to the repository.
+EvoKB does not ship default credentials and does not require secrets to be committed to the repository.
 
 For deployment hardening, secret handling, network exposure, upload limits and data-layer guidance, see [docs/SECURITY.md](docs/SECURITY.md).
 

@@ -2,7 +2,6 @@ import type { EnterpriseFacets, EnterpriseSearchFilters } from '../lib/api';
 import { Icon } from './ui';
 
 const fields: Array<{ key: keyof EnterpriseSearchFilters; label: string; empty: string; facet: keyof EnterpriseFacets }> = [
-  { key: 'company', label: '公司', empty: '全部公司', facet: 'companies' },
   { key: 'source_department', label: '来源部门', empty: '全部部门', facet: 'source_departments' },
   { key: 'document_type', label: '文档类型', empty: '全部类型', facet: 'document_types' },
   { key: 'material_category', label: '材料分类', empty: '全部分类', facet: 'material_categories' },
@@ -19,17 +18,20 @@ export function KnowledgeScope({ facets, filters, onChange, mode = 'compact' }: 
     .filter(item => Boolean(item.value));
   const summary = active.length === 0 ? '全部资料' : active.map(item => `${item.label}：${item.value}`).join(' · ');
 
-  const content = <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+  const content = <div class="grid gap-3 sm:grid-cols-3">
     {fields.map(field => <label key={field.key} class="text-xs font-medium text-slate-500 dark:text-slate-400">
       <span class="mb-1.5 block">{field.label}</span>
-      <select
-        value={(filters[field.key] as string) || ''}
-        onChange={event => onChange({ ...filters, [field.key]: (event.target as HTMLSelectElement).value || undefined })}
-        class="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-700 outline-none transition focus:border-blue-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
-      >
-        <option value="">{field.empty}</option>
-        {(facets[field.facet] || []).map(value => <option value={value} key={value}>{value}</option>)}
-      </select>
+      <div class="relative">
+        <select
+          value={(filters[field.key] as string) || ''}
+          onChange={event => onChange({ ...filters, [field.key]: (event.target as HTMLSelectElement).value || undefined })}
+          class="w-full appearance-none rounded-xl border border-slate-200 bg-white py-2.5 pl-3 pr-10 text-sm text-slate-700 outline-none transition focus:border-blue-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+        >
+          <option value="">{field.empty}</option>
+          {(facets[field.facet] || []).map(value => <option value={value} key={value}>{value}</option>)}
+        </select>
+        <Icon name="chevron" size={13} class="pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 rotate-90 text-slate-400"/>
+      </div>
     </label>)}
   </div>;
 

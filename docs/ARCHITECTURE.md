@@ -2,7 +2,7 @@
 
 ## 总体边界
 
-Enterprise Knowledge Base 采用 Java DDD 模块化单体。业务能力与基础设施通过应用端口隔离，HTTP/MCP/Web 只作为入口适配器存在。
+EvoKB 采用 Java DDD 模块化单体。业务能力与基础设施通过应用端口隔离，HTTP/MCP/Web 只作为入口适配器存在。
 
 ```text
 interfaces

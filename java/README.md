@@ -1,6 +1,6 @@
 # Java backend
 
-Enterprise Knowledge Base 后端采用 Java 17 + Spring Boot 的 DDD 模块化结构。
+EvoKB 后端采用 Java 17 + Spring Boot 的 DDD 模块化结构。
 
 ```text
 ekb-domain          领域模型与领域规则
@@ -19,7 +19,7 @@ mvn -f java/pom.xml clean test package
 最终可执行文件：
 
 ```text
-java/ekb-bootstrap/target/enterprise-knowledge-base.jar
+java/ekb-bootstrap/target/evokb.jar
 ```
 
 运行时配置统一使用 `EKB_*` 环境变量，完整说明见 `../docs/CONFIGURATION.md`。

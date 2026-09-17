@@ -2,12 +2,7 @@
 
 ## 1. 准备外部服务
 
-部署应用之前准备：
-
-- MinerU Pipeline endpoint
-- Chat endpoint
-- Embedding endpoint
-- Rerank endpoint
+部署应用之前至少准备 MinerU Pipeline endpoint。Chat、Embedding、Rerank 可以提前通过环境变量提供，也可以在系统首次启动、创建管理员后进入“模型配置”页面补齐。
 
 这些服务可以部署在同一台机器、局域网或云端，只要应用容器能够访问。仓库不内置指定模型服务。
 
@@ -17,18 +12,7 @@
 cp .env.example .env
 ```
 
-修改 `.env`：
-
-- 所有 `[REDACTED_SECRET]`
-- `EKB_MINERU_URL`
-- `EKB_CHAT_BASE_URL`
-- `EKB_SMALL_MODEL`
-- `EKB_LARGE_MODEL`
-- `EKB_EMBEDDING_BASE_URL`
-- `EKB_EMBEDDING_MODEL`
-- `EKB_EMBED_DIMS`
-- `EKB_RERANK_BASE_URL`
-- `EKB_RERANK_MODEL`
+修改 `.env`，至少补齐基础设施密码/凭据和 `EKB_MINERU_URL`。如果希望应用启动后立即具备模型能力，也可以预先填写 Chat、Embedding、Rerank 的 `EKB_*` 配置；否则登录后在管理员“模型配置”页面保存即可。
 
 不要把 `.env` 提交到 Git。
 
@@ -138,7 +122,7 @@ npm ci
 npm run build
 cd ..
 mvn -f java/pom.xml clean package
-java -jar java/ekb-bootstrap/target/enterprise-knowledge-base.jar
+java -jar java/ekb-bootstrap/target/evokb.jar
 ```
 
 默认前端静态目录为 `web/dist`。

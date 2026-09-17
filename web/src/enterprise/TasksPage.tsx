@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
-import { fetchEnterpriseTasks, type EnterpriseTask } from '../lib/api';
+import { fetchEnterpriseTasks, retryEnterpriseGenerationTask, type EnterpriseTask } from '../lib/api';
 import { EmptyState, Icon, LoadingBlock, SectionTitle, StatusBadge, formatDate, shortID } from './ui';
 
 export function TasksPage({ onError }: { onError: (message: string) => void }) {
@@ -9,6 +9,7 @@ export function TasksPage({ onError }: { onError: (message: string) => void }) {
   const [status, setStatus] = useState('ALL');
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(true);
+  const [retrying, setRetrying] = useState('');
   const pageSize = 30;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
 
@@ -24,6 +25,19 @@ export function TasksPage({ onError }: { onError: (message: string) => void }) {
       onError(String(err instanceof Error ? err.message : err));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const retry = async (task: EnterpriseTask) => {
+    setRetrying(task.task_id);
+    try {
+      await retryEnterpriseGenerationTask(task.task_id);
+      await load(page, status);
+      onError('');
+    } catch (err) {
+      onError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setRetrying('');
     }
   };
 
@@ -53,6 +67,7 @@ export function TasksPage({ onError }: { onError: (message: string) => void }) {
           <div class="text-xs text-slate-400"><div>开始 {formatDate(task.started_at)}</div><div class="mt-1">完成 {formatDate(task.finished_at)}</div></div>
         </div>
         {task.error_message && <div class="mt-4 flex gap-2 rounded-xl border border-rose-100 bg-rose-50 px-3 py-2.5 text-xs leading-5 text-rose-700 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-300"><Icon name="warning" size={14} class="mt-0.5 shrink-0"/><div>{task.error_message}</div></div>}
+        {task.source === 'COMPILE' && task.status === 'FAILED' && <div class="mt-3 flex justify-end"><button onClick={() => void retry(task)} disabled={retrying === task.task_id} class="rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700 transition hover:border-blue-400 disabled:opacity-50 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-300">{retrying === task.task_id ? '重新排队中…' : '重试此阶段'}</button></div>}
       </article>)}
       {!loading && tasks.length === 0 && <EmptyState icon="sparkles" title="暂无知识生成记录" description="生成摘要、关系或企业百科后会显示在这里。" />}
     </section>
@@ -61,7 +76,7 @@ export function TasksPage({ onError }: { onError: (message: string) => void }) {
 }
 
 function statusLabel(value: string) {
-  const labels: Record<string, string> = { ALL: '全部', QUEUED: '已排队', PENDING: '等待处理', RUNNING: '生成中', SUCCEEDED: '已完成', FAILED: '失败', CANCELLED: '已取消' };
+  const labels: Record<string, string> = { ALL: '全部', QUEUED: '排队中', PENDING: '等待处理', RUNNING: '生成中', SUCCEEDED: '已完成', FAILED: '失败', CANCELLED: '已取消' };
   return labels[value] || value;
 }
 
@@ -76,7 +91,7 @@ function generationLabel(value: string) {
 
 function generationStageLabel(value: string) {
   const labels: Record<string, string> = {
-    QUEUED: '已排队', PENDING: '等待处理', RUNNING: '生成中', SUCCEEDED: '已完成', FAILED: '失败', CANCELLED: '已取消',
+    QUEUED: '排队中', PENDING: '等待处理', RUNNING: '生成中', SUCCEEDED: '已完成', FAILED: '失败', CANCELLED: '已取消',
     SUMMARY: '生成摘要', GRAPH: '生成关系', WIKI: '生成百科', ENTITY: '实体归一',
   };
   return labels[(value || '').toUpperCase()] || generationLabel(value);

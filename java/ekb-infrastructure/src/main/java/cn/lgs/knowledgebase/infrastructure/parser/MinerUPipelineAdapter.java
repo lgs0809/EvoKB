@@ -13,15 +13,18 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import org.springframework.core.io.InputStreamResource;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.MultipartBodyBuilder;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClient;
 
 public final class MinerUPipelineAdapter implements ParserPort {
   private final RestClient client;
   private final ObjectMapper mapper;
   private final Duration pollInterval;
+  private final Duration taskTimeout;
   private final String parseMethod;
   private final String language;
 
@@ -31,18 +34,80 @@ public final class MinerUPipelineAdapter implements ParserPort {
       Duration pollInterval,
       String parseMethod,
       String language) {
+    this(baseUrl, mapper, pollInterval, Duration.ofMinutes(45), parseMethod, language);
+  }
+
+  public MinerUPipelineAdapter(
+      String baseUrl,
+      ObjectMapper mapper,
+      Duration pollInterval,
+      Duration taskTimeout,
+      String parseMethod,
+      String language) {
     this.client = RestClient.builder().baseUrl(trimSlash(baseUrl)).build();
     this.mapper = mapper;
-    this.pollInterval =
-        pollInterval == null || pollInterval.isNegative() || pollInterval.isZero()
-            ? Duration.ofMillis(500)
-            : pollInterval;
+    this.pollInterval = positive(pollInterval, Duration.ofMillis(500));
+    this.taskTimeout = positive(taskTimeout, Duration.ofMinutes(45));
     this.parseMethod = blankTo(parseMethod, "auto");
     this.language = blankTo(language, "ch");
   }
 
   @Override
   public ParsedDocument parse(String filename, InputStream source) {
+    return parse(filename, source, "", ignored -> {});
+  }
+
+  @Override
+  public ParsedDocument parse(
+      String filename, InputStream source, String resumeTaskId, Consumer<String> taskIdSink) {
+    Consumer<String> sink = taskIdSink == null ? ignored -> {} : taskIdSink;
+    String taskId = resumeTaskId == null ? "" : resumeTaskId.trim();
+    if (taskId.isEmpty()) {
+      taskId = submit(filename, source, sink);
+    }
+
+    long startedNanos = System.nanoTime();
+    boolean resubmittedMissingTask = false;
+    while (true) {
+      if (System.nanoTime() - startedNanos >= taskTimeout.toNanos()) {
+        throw new IllegalStateException(
+            "mineru task " + taskId + " timed out after " + taskTimeout.toSeconds() + " seconds");
+      }
+      TaskStatus status;
+      try {
+        status = client.get().uri("/tasks/{id}", taskId).retrieve().body(TaskStatus.class);
+      } catch (HttpClientErrorException.NotFound missing) {
+        // A persisted task can disappear when the external MinerU service is restarted or
+        // expires its task-retention window.  The source stream is still untouched while a
+        // resume task id is being polled, so recover exactly once by submitting that same
+        // staged file and persisting the new id.  Do not resubmit a task that still exists.
+        if (resubmittedMissingTask) {
+          throw new IllegalStateException(
+              "mineru task " + taskId + " not found after recovery", missing);
+        }
+        sink.accept("");
+        taskId = submit(filename, source, sink);
+        resubmittedMissingTask = true;
+        continue;
+      }
+      if (status == null) throw new IllegalStateException("mineru status returned empty response");
+      String state = blankTo(status.status(), "").toLowerCase();
+      if (List.of("completed", "succeeded", "success").contains(state)) return result(taskId);
+      if (List.of("failed", "error", "cancelled", "canceled").contains(state)) {
+        sink.accept("");
+        throw new IllegalStateException(
+            "mineru task " + taskId + " " + state + ": " + status.error());
+      }
+      try {
+        Thread.sleep(pollInterval.toMillis());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException("mineru polling interrupted", e);
+      }
+    }
+  }
+
+  private String submit(String filename, InputStream source, Consumer<String> sink) {
     MultipartBodyBuilder body = new MultipartBodyBuilder();
     body.part("files", new NamedInputStreamResource(source, filename));
     body.part("backend", "pipeline");
@@ -63,24 +128,9 @@ public final class MinerUPipelineAdapter implements ParserPort {
     if (submitted == null || submitted.taskId() == null || submitted.taskId().isBlank()) {
       throw new IllegalStateException("mineru submit returned empty task_id");
     }
-    while (true) {
-      TaskStatus status =
-          client.get().uri("/tasks/{id}", submitted.taskId()).retrieve().body(TaskStatus.class);
-      if (status == null) throw new IllegalStateException("mineru status returned empty response");
-      String state = blankTo(status.status(), "").toLowerCase();
-      if (List.of("completed", "succeeded", "success").contains(state))
-        return result(submitted.taskId());
-      if (List.of("failed", "error", "cancelled", "canceled").contains(state)) {
-        throw new IllegalStateException(
-            "mineru task " + submitted.taskId() + " " + state + ": " + status.error());
-      }
-      try {
-        Thread.sleep(pollInterval.toMillis());
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw new IllegalStateException("mineru polling interrupted", e);
-      }
-    }
+    String taskId = submitted.taskId().trim();
+    sink.accept(taskId);
+    return taskId;
   }
 
   private ParsedDocument result(String taskId) {
@@ -212,6 +262,10 @@ public final class MinerUPipelineAdapter implements ParserPort {
     public long contentLength() {
       return -1;
     }
+  }
+
+  private static Duration positive(Duration value, Duration fallback) {
+    return value == null || value.isZero() || value.isNegative() ? fallback : value;
   }
 
   private static String blankTo(String value, String fallback) {
