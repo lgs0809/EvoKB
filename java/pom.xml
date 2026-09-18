@@ -24,7 +24,7 @@
         <spring-boot.version>3.5.8</spring-boot.version>
         <spring-ai.version>1.1.2</spring-ai.version>
         <spring-ai-alibaba.version>1.1.2.2</spring-ai-alibaba.version>
-        <archunit.version>1.4.1</archunit.version>
+        <archunit.version>1.5.0</archunit.version>
     </properties>
 
     <dependencyManagement>
