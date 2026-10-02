@@ -11,7 +11,7 @@ COPY java ./java
 RUN mvn -f java/pom.xml -DskipTests package \
     && cp java/ekb-bootstrap/target/evokb.jar /out.jar
 
-FROM eclipse-temurin:17-jre-jammy
+FROM eclipse-temurin:22-jre-jammy
 WORKDIR /app
 RUN useradd --system --uid 10001 --create-home ekb \
     && mkdir -p /app/web /var/lib/enterprise-kb/staging \
