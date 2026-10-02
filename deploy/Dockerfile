@@ -5,7 +5,7 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM maven:3.9.11-eclipse-temurin-17 AS java-build
+FROM maven:3-eclipse-temurin-24 AS java-build
 WORKDIR /src
 COPY java ./java
 RUN mvn -f java/pom.xml -DskipTests package \
