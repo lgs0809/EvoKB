@@ -17,7 +17,7 @@
     "marked": "18.0.14",
     "marked-cjk-friendly": "0.1.2",
     "pdfjs-dist": "^6.2.108",
-    "preact": "^10.29.1"
+    "preact": "^11.0.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
