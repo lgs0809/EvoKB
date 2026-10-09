@@ -116,7 +116,7 @@ jobs:
         run: python3 scripts/collect-browser-smoke-diagnostics.py --project evokb-ci-${{ github.run_id }} --env-file .env.ci.private --output ci-diagnostics
       - name: Preserve browser and deployment evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: browser-smoke-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
